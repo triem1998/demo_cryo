@@ -14,7 +14,6 @@ Invoked via main.py  (local or SLURM):
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import mrcfile
@@ -22,9 +21,9 @@ import numpy as np
 import torch
 from deepinv.distributed import DistributedContext, distribute
 
-from base_config import RunEIBaseConfig, _build_physics
-from dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
-from utils.utils import (
+from ..base_config import RunEIBaseConfig, _build_physics
+from ..dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
+from ..utils.utils import (
     GpuFSC,
     _find_mrc,
     _read_mrc_vol_size,
@@ -36,21 +35,20 @@ from utils.utils import (
     ensure_dir,
     seed_everything,
 )
-from utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
+from ..utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
 
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-@dataclass
 class RunEIFullInferenceConfig(RunEIBaseConfig):
     # ── Checkpoint ──────────────────────────────────────────────────────────
-    checkpoint_path: str = ""           # required: path to the .pth checkpoint
+    checkpoint_path: str = ""
 
     # ── Data ────────────────────────────────────────────────────────────────
     output_dir: str = "./runs/inference_full"
-    max_infer_vols: int = 5             # number of val volumes to evaluate
+    max_infer_vols: int = 5
     target_shape: tuple[int, int, int] | None = None
 
     # ── DataLoader ──────────────────────────────────────────────────────────
@@ -70,6 +68,10 @@ class RunEIFullInferenceConfig(RunEIBaseConfig):
 
     # ── Output options ───────────────────────────────────────────────────────
     save_recon_mrc: bool = False
+
+    @classmethod
+    def from_yaml(cls, conf: dict) -> "RunEIFullInferenceConfig":
+        return cls.model_validate(cls._flat_from_yaml(conf, "demo-cryo-ei-inference"))
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +116,7 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
 
     output_dir = ensure_dir(cfg.output_dir)
     images_dir = ensure_dir(output_dir / "inference_images")
-    dump_config_json(output_dir / "config.json", asdict(cfg))
+    dump_config_json(output_dir / "config.json", cfg.model_dump())
 
     if not cfg.checkpoint_path:
         raise ValueError("checkpoint_path must be set in the config.")

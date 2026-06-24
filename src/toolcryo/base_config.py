@@ -1,18 +1,18 @@
-"""Shared base config and physics builder — imported by run.py and inference modules.
-
-Kept in a separate file to avoid the circular import that would arise if inference
-modules (imported by run.py) also imported from run.py.
-"""
+"""Shared base config and physics builder — imported by run.py and inference modules."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import datetime as dt
+from pathlib import Path
 
-from physics import MissingWedge
+from pydantic import BaseModel, ConfigDict
+
+from .physics import MissingWedge
 
 
-@dataclass
-class RunEIBaseConfig:
-    """Fields shared and identical between full-volume and patch training."""
+class RunEIBaseConfig(BaseModel):
+    """Fields shared across all training and inference configs."""
+    model_config = ConfigDict(extra="ignore")
+
     # ── Data ────────────────────────────────────────────────────────────────
     input_dir: str = "./dataset/empiar-11058"
     max_train_vols: int | None = None
@@ -32,7 +32,7 @@ class RunEIBaseConfig:
 
     # ── EI loss ─────────────────────────────────────────────────────────────
     eq_weight: float = 2.0
-    loss_type: str = "icecream"   # "icecream" | "custom"
+    loss_type: str = "icecream"
 
     # ── Training ────────────────────────────────────────────────────────────
     learning_rate: float = 1e-4
@@ -57,6 +57,21 @@ class RunEIBaseConfig:
 
     # ── Pretrained init ──────────────────────────────────────────────────────
     pretrained_ckpt: str | None = None
+
+    @classmethod
+    def _flat_from_yaml(cls, conf: dict, default_run_name: str) -> dict:
+        """Flatten all YAML sections into a single dict and compute output_dir."""
+        flat: dict = {}
+        for section in conf.values():
+            if isinstance(section, dict):
+                flat.update(section)
+        general     = conf.get("general", {})
+        slurm       = conf.get("slurm", {})
+        timestamp   = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_name    = general.get("run_name", slurm.get("job_name", default_run_name))
+        output_root = general.get("output_root", "./runs")
+        flat["output_dir"] = str(Path(output_root) / f"{run_name}_{timestamp}")
+        return flat
 
 
 def _build_physics(cfg: RunEIBaseConfig, crop_size: int, device) -> MissingWedge:

@@ -1,9 +1,9 @@
-# demo_cyo
+# demo_cryo
 
 Self-supervised cryo-ET denoising using **Equivariant Imaging (EI)** with missing-wedge physics and cube-symmetry rotations. 
 
 Two training modes:
-- **patch** — crop-based, fast,
+- **patch** — crop-based, fast
 - **full** — whole-tomogram tiled, slow
 
 ---
@@ -18,16 +18,17 @@ Two training modes:
 # 1. Load the PyTorch module (provides torch, numpy, scipy, etc.)
 module load pytorch-gpu/py3/2.7.0
 
-# 2. Install extra dependencies not bundled in the module
-pip install --user mrcfile
-
-# deepinv must be installed from this PR (not the PyPI release):
+# 2. Install deepinv from PR #1088 (not the PyPI release):
 #   https://github.com/deepinv/deepinv/pull/1088
 git clone https://github.com/deepinv/deepinv.git
 cd deepinv && git fetch origin pull/1088/head:pr-1088 && git checkout pr-1088
-pip install --user -e . && cd ..
+pip install --user -e .
+cd ..
 
-# 3. Submit a job (set execution_mode: submitit in the config)
+# 3. Install this repo (also installs mrcfile, pydantic, and other missing deps)
+pip install --user -e /path/to/demo_cryo
+
+# 4. Submit a job (set execution_mode: submitit in the config)
 python main.py --config configs/conf_equivariant_patch.yml
 python main.py --config configs/conf_equivariant_full.yml
 ```
@@ -41,28 +42,30 @@ python main.py --config configs/conf_equivariant_full.yml
 
 ```
 main.py                      # CLI launcher (local + SLURM via submitit)
+pyproject.toml               # dependencies + build config (install with uv sync)
 configs/
   conf_equivariant_patch.yml # patch training config
   conf_equivariant_full.yml  # full-volume training config
 src/
-  base_config.py             # RunEIBaseConfig (shared fields)
-  run.py                     # RunEIFullConfig, RunEIPatchConfig, run_full, run_patch
-  trainer.py                 # BaseTrainer, EIFullTrainer, EIPatchTrainer
-  physics.py                 # MissingWedge (missing-wedge forward operator)
-  transform.py               # Rotate3D (cube-symmetry group)
-  losses/
-    losses.py                # ObsLoss, EqLoss (icecream-based)
-    losses_custom.py         # ObsLoss, EqLoss (direct torch.fft, no icecream dependency)
-  dataset/
-    dataset_full.py          # full-volume dataset + dataloaders
-    dataset_patch.py         # patch dataset + dataloaders
-  inference/
-    infer_full.py            # standalone inference for full-volume checkpoints
-    infer_patch.py           # standalone + post-training inference for patch checkpoints
-  utils/
-    utils.py                 # GpuFSC, build_ei_model, MRC I/O, metrics helpers
-    plot.py                  # slice figures, FSC plots, metrics plots
-  icecream_orig/             # vendored IceCream UNet3D — do not modify
+  toolcryo/                  # installable package
+    base_config.py           # RunEIBaseConfig (shared fields)
+    run.py                   # RunEIFullConfig, RunEIPatchConfig, run_full, run_patch
+    trainer.py               # BaseTrainer, EIFullTrainer, EIPatchTrainer
+    physics.py               # MissingWedge (missing-wedge forward operator)
+    transform.py             # Rotate3D (cube-symmetry group)
+    losses/
+      losses.py              # ObsLoss, EqLoss (icecream-based)
+      losses_custom.py       # ObsLoss, EqLoss (direct torch.fft, no icecream dependency)
+    dataset/
+      dataset_full.py        # full-volume dataset + dataloaders
+      dataset_patch.py       # patch dataset + dataloaders
+    inference/
+      infer_full.py          # standalone inference for full-volume checkpoints
+      infer_patch.py         # standalone + post-training inference for patch checkpoints
+    utils/
+      utils.py               # GpuFSC, build_ei_model, MRC I/O, metrics helpers
+      plot.py                # slice figures, FSC plots, metrics plots
+    icecream_orig/           # vendored IceCream UNet3D — do not modify
 ```
 
 ---

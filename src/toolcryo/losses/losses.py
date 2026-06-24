@@ -25,8 +25,8 @@ import torch
 import torch.nn as nn
 from deepinv.loss import Loss
 
-from transform import Rotate3D
-from icecream_orig.utils.utils import (
+from ..transform import Rotate3D
+from ..icecream_orig.utils.utils import (
     fourier_loss as _ic_fourier_loss,
     fourier_loss_batch as _ic_fourier_loss_batch,
     get_measurement as _ic_get_measurement,
@@ -113,7 +113,7 @@ def _apply_wedge(x: torch.Tensor, wedge: torch.Tensor) -> torch.Tensor:
 
 def _symmetrize_and_binarize(w: torch.Tensor) -> torch.Tensor:
     """Matches icecream's get_real_binary_filter: symmetrize_3D + average + binarize."""
-    from icecream_orig.utils.utils import symmetrize_3D
+    from ..icecream_orig.utils.utils import symmetrize_3D
     w_sym = symmetrize_3D(w)
     w = (w + w_sym) / 2.0
     w[w > 0.1] = 1.0

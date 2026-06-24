@@ -90,8 +90,8 @@ def build_ei_model(
 ) -> tuple[torch.nn.Module, str]:
     """Build IceCreamUNetWrapper (unet) or DRUNetWrapper (drunet) on *device*."""
     import deepinv as dinv
-    from icecream_orig.models import IceCreamUNetWrapper
-    from icecream_orig.models.unet3d_bf import UNet3D as _IceCreamUNet3D
+    from ..icecream_orig.models import IceCreamUNetWrapper
+    from ..icecream_orig.models.unet3d_bf import UNet3D as _IceCreamUNet3D
 
     if model_type == "unet":
         _inner = _IceCreamUNet3D(

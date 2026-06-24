@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Ruff cache
+.ruff_cache/
+
+# Run outputs
+runs/
+
+# Dataset (large binary files)
+dataset/
+
+# Jupyter
+.ipynb_checkpoints/
