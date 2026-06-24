@@ -23,7 +23,7 @@ import mrcfile
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
-from utils.utils import EIDataBundle, _discover_pairs, _resolve_tlt_ranges, _split_pairs
+from ..utils.utils import EIDataBundle, _discover_pairs, _resolve_tlt_ranges, _split_pairs
 
 # ---------------------------------------------------------------------------
 # Config

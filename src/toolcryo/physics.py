@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import deepinv as dinv
 
-from icecream_orig.utils.utils import symmetrize_3D
+from .icecream_orig.utils.utils import symmetrize_3D
 
 
 class MissingWedge(dinv.physics.LinearPhysics):

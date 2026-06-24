@@ -1,22 +1,21 @@
 """EI training entry-points: patch-based and full-volume variants."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
 from deepinv.distributed import DistributedContext, distribute
 
-from base_config import RunEIBaseConfig, _build_physics
-from dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
-from dataset.dataset_patch import EIPatchDataConfig, build_ei_patch_dataloaders
-from inference.infer_patch import run_post_training_inference
-from losses.losses import EqLoss, ObsLoss
-from losses.losses_custom import EqLoss as EqLossCustom, ObsLoss as ObsLossCustom
-from trainer import EIFullTrainer, EIPatchTrainer
-from transform import Rotate3D
-from utils.plot import plot_metrics
-from utils.utils import (
+from .base_config import RunEIBaseConfig, _build_physics
+from .dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
+from .dataset.dataset_patch import EIPatchDataConfig, build_ei_patch_dataloaders
+from .inference.infer_patch import run_post_training_inference
+from .losses.losses import EqLoss, ObsLoss
+from .losses.losses_custom import EqLoss as EqLossCustom, ObsLoss as ObsLossCustom
+from .trainer import EIFullTrainer, EIPatchTrainer
+from .transform import Rotate3D
+from .utils.plot import plot_metrics
+from .utils.utils import (
     _read_mrc_vol_size, _read_pixel_sizes,
     build_ei_model, dump_config_json, ensure_dir, seed_everything,
 )
@@ -26,7 +25,6 @@ from utils.utils import (
 # Configs
 # ---------------------------------------------------------------------------
 
-@dataclass
 class RunEIFullConfig(RunEIBaseConfig):
     # ── Data ────────────────────────────────────────────────────────────────
     output_dir: str = "./runs/demo_cryo_ei_full"
@@ -51,8 +49,11 @@ class RunEIFullConfig(RunEIBaseConfig):
     # ── Evaluation ──────────────────────────────────────────────────────────
     eval_fsc: bool = True
 
+    @classmethod
+    def from_yaml(cls, conf: dict) -> "RunEIFullConfig":
+        return cls.model_validate(cls._flat_from_yaml(conf, "demo-cryo-ei-full"))
 
-@dataclass
+
 class RunEIPatchConfig(RunEIBaseConfig):
     # ── Data ────────────────────────────────────────────────────────────────
     output_dir: str = "./runs/demo_cryo_ei_patch"
@@ -80,6 +81,10 @@ class RunEIPatchConfig(RunEIBaseConfig):
 
     # ── Evaluation ──────────────────────────────────────────────────────────
     eval_fsc: bool = False
+
+    @classmethod
+    def from_yaml(cls, conf: dict) -> "RunEIPatchConfig":
+        return cls.model_validate(cls._flat_from_yaml(conf, "demo-cryo-ei-patch"))
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +139,7 @@ def run_full(cfg: RunEIFullConfig) -> None:
     seed_everything(int(cfg.seed))
 
     output_dir = ensure_dir(cfg.output_dir)
-    dump_config_json(output_dir / "config.json", asdict(cfg))
+    dump_config_json(output_dir / "config.json", cfg.model_dump())
 
     data_cfg = EIFullDataConfig(
         input_dir=cfg.input_dir,
@@ -247,7 +252,7 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
     seed_everything(int(cfg.seed))
 
     output_dir = ensure_dir(cfg.output_dir)
-    dump_config_json(output_dir / "config.json", asdict(cfg))
+    dump_config_json(output_dir / "config.json", cfg.model_dump())
 
     data_cfg = EIPatchDataConfig(
         input_dir=cfg.input_dir,

@@ -16,8 +16,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
-from utils.utils import GpuFSC, PerfProbe, append_metrics_row, fsc_shell, half_set_recon
+from .utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
+from .utils.utils import GpuFSC, PerfProbe, append_metrics_row, fsc_shell, half_set_recon
 
 
 def _znorm_np(arr: np.ndarray) -> np.ndarray:

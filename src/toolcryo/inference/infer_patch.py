@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import mrcfile
@@ -19,11 +18,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from base_config import RunEIBaseConfig
-from dataset.dataset_patch import EIPatchDataConfig, build_ei_patch_dataloaders
-from physics import MissingWedge
-from losses.losses import _initialize_window, _symmetrize_and_binarize
-from utils.utils import (
+from ..base_config import RunEIBaseConfig
+from ..dataset.dataset_patch import EIPatchDataConfig, build_ei_patch_dataloaders
+from ..physics import MissingWedge
+from ..losses.losses import _initialize_window, _symmetrize_and_binarize
+from ..utils.utils import (
     GpuFSC,
     _find_mrc,
     _read_pixel_sizes,
@@ -35,14 +34,13 @@ from utils.utils import (
     ensure_dir,
     seed_everything,
 )
-from utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
+from ..utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
 
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-@dataclass
 class RunEIPatchInferenceConfig(RunEIBaseConfig):
     # ── Checkpoint ──────────────────────────────────────────────────────────
     checkpoint_path: str = ""
@@ -50,7 +48,7 @@ class RunEIPatchInferenceConfig(RunEIBaseConfig):
     # ── Data ────────────────────────────────────────────────────────────────
     output_dir: str = "./runs/inference_patch"
     max_infer_vols: int = 5
-    normalize: bool = True              # must match training config
+    normalize: bool = True
 
     # ── DataLoader ──────────────────────────────────────────────────────────
     num_workers: int = 1
@@ -58,9 +56,9 @@ class RunEIPatchInferenceConfig(RunEIBaseConfig):
 
     # ── Patch inference (must match training config) ─────────────────────────
     crop_size: int = 72
-    stride: int = 36                    # icecream default: crop_size // 2
-    infer_batch_size: int = 4           # crops processed in parallel on GPU
-    infer_downsample: int = 1           # spatial avg-pool factor before inference
+    stride: int = 36
+    infer_batch_size: int = 4
+    infer_downsample: int = 1
     pre_pad: bool = True
 
     # ── Comparison globs ─────────────────────────────────────────────────────
@@ -70,6 +68,10 @@ class RunEIPatchInferenceConfig(RunEIBaseConfig):
 
     # ── Output ───────────────────────────────────────────────────────────────
     save_recon_mrc: bool = False
+
+    @classmethod
+    def from_yaml(cls, conf: dict) -> "RunEIPatchInferenceConfig":
+        return cls.model_validate(cls._flat_from_yaml(conf, "demo-cryo-ei-patch-inference"))
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +490,7 @@ def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
 
     output_dir = ensure_dir(cfg.output_dir)
     images_dir = ensure_dir(output_dir / "inference_images")
-    dump_config_json(output_dir / "config.json", asdict(cfg))
+    dump_config_json(output_dir / "config.json", cfg.model_dump())
 
     if not cfg.checkpoint_path:
         raise ValueError("checkpoint_path must be set.")

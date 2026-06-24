@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from deepinv.loss import Loss
 
-from transform import Rotate3D
+from ..transform import Rotate3D
 
 
 # ---------------------------------------------------------------------------
