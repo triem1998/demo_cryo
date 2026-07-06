@@ -1,7 +1,7 @@
 """Shared utilities for cryo-ET training.
 
 Covers: seeding, directory helpers, CSV logging, model building, timing (PerfProbe),
-dataset discovery (_discover_pairs, _split_pairs), MRC I/O, volume preprocessing,
+dataset discovery (_discover_pairs, select_train_val_by_name), MRC I/O, volume preprocessing,
 and visualisation helpers (save_slice_figure, GpuFSC, FSC curves).
 """
 from __future__ import annotations
@@ -232,34 +232,57 @@ def _discover_pairs(
     return evn_paths, odd_paths, tlt_paths
 
 
-def _split_pairs(
+def select_train_val_by_name(
     evn_paths: list[Path],
     odd_paths: list[Path | None],
     n_val: int,
     seed: int,
     max_train: int | None,
+    train_names: list[str] | None = None,
+    val_names: list[str] | None = None,
     extra: list | None = None,
 ) -> tuple[list, list, list, list, list, list]:
-    """Shuffle and split (evn, odd, extra) lists into train / val.
+    """Select train / val volumes by name, falling back to a random split by count.
 
-    ``extra`` is any parallel list (e.g. tilt_ranges); ``None`` values are
-    fine.  Returns ``(train_evn, train_odd, val_evn, val_odd, train_extra, val_extra)``.
+    Per set, independently: use the named tomo dirs (matched on
+    ``evn_path.parent.name``) when provided, otherwise draw a random subset
+    (``max_val`` / ``max_train``) from the pool of tomos not claimed by name.
+    Named tomos never overlap, and the random draws come from the remaining
+    pool so train and val stay disjoint.  With both name lists empty this is
+    a plain random split by ``n_val`` / ``max_train``.
     """
-    rng = random.Random(seed)
-    indices = list(range(len(evn_paths)))
-    rng.shuffle(indices)
-    n_val = max(0, min(n_val, len(indices) - 1))
-    val_idx   = indices[:n_val]
-    train_idx = indices[n_val:]
-    if max_train is not None:
-        train_idx = train_idx[:max_train]
+    train_set = set(train_names or [])
+    val_set   = set(val_names or [])
+    names     = [p.parent.name for p in evn_paths]
+    for nm in train_set | val_set:
+        if nm not in names:
+            print(f"[ei-data] WARNING: tomo '{nm}' not found, skipping.")
+
+    pinned_train = [i for i, n in enumerate(names) if n in train_set]
+    pinned_val   = [i for i, n in enumerate(names) if n in val_set]
+    pinned       = set(pinned_train) | set(pinned_val)
+    pool         = [i for i in range(len(evn_paths)) if i not in pinned]
+    random.Random(seed).shuffle(pool)
+
+    if val_set:
+        val_idx = pinned_val
+    else:
+        n_val   = max(0, n_val)
+        val_idx = pool[:n_val]
+        pool    = pool[n_val:]
+
+    if train_set:
+        train_idx = pinned_train
+    else:
+        train_idx = pool if max_train is None else pool[:max_train]
+
     _extra = extra if extra is not None else [None] * len(evn_paths)
-    train_evn   = [evn_paths[i] for i in train_idx]
-    train_odd   = [odd_paths[i] for i in train_idx]
-    train_extra = [_extra[i] for i in train_idx]
-    val_evn     = [evn_paths[i] for i in val_idx]
-    val_odd     = [odd_paths[i] for i in val_idx]
-    val_extra   = [_extra[i] for i in val_idx]
+    def _take(idx):
+        return ([evn_paths[i] for i in idx],
+                [odd_paths[i] for i in idx],
+                [_extra[i] for i in idx])
+    train_evn, train_odd, train_extra = _take(train_idx)
+    val_evn,   val_odd,   val_extra   = _take(val_idx)
     return train_evn, train_odd, val_evn, val_odd, train_extra, val_extra
 
 
@@ -391,6 +414,45 @@ def half_set_recon(
 ) -> "torch.Tensor":
     """Self-supervised reconstruction: 0.5 * (f(A(f_evn)) + f(A(f_odd)))."""
     return 0.5 * (model(physics.A(f_evn)) + model(physics.A(f_odd)))
+
+
+# ---------------------------------------------------------------------------
+# Patch forward helper — f(A(f(.))), shared by inference and training probes
+# ---------------------------------------------------------------------------
+
+def _apply_wedge_batch(x: "torch.Tensor", wedge: "torch.Tensor") -> "torch.Tensor":
+    """Apply wedge mask via FFT  (B, D, H, W) → (B, D, H, W)."""
+    B, D, H, W = x.shape
+    mask_shape = tuple(wedge.shape)
+    X = torch.fft.fftshift(torch.fft.fftn(x, s=mask_shape, dim=(-3, -2, -1)), dim=(-3, -2, -1))
+    X = X * wedge
+    out = torch.fft.ifftn(torch.fft.ifftshift(X, dim=(-3, -2, -1)), dim=(-3, -2, -1)).real
+    return out[..., :D, :H, :W]
+
+
+def denoise_patches(
+    crops: "torch.Tensor",
+    model: "torch.nn.Module",
+    wedge: "torch.Tensor",
+    device: "torch.device",
+) -> "torch.Tensor":
+    """Run ``f(A(f(.)))`` on a batch of crops — mirrors the inference forward.
+
+    :param crops: (B, D, H, W) float tensor of ``crop_size³`` patches.
+    :param wedge: wedge mask (mask_size³) applied between the two model passes.
+    :returns: (B, D, H, W) float32 CPU tensor.  The model's train/eval mode is
+        left unchanged — the caller manages it.
+    """
+    use_amp = device.type == "cuda"
+    wedge_dev = wedge.to(device)
+    batch = crops.to(device)
+    with torch.no_grad():
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            out = model(batch[:, None])[:, 0]
+        out = _apply_wedge_batch(out.float(), wedge_dev)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            out = model(out[:, None])[:, 0]
+    return out.float().cpu()
 
 
 

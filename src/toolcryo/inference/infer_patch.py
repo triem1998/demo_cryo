@@ -24,6 +24,7 @@ from ..physics import MissingWedge
 from ..losses.losses import _initialize_window, _symmetrize_and_binarize
 from ..utils.utils import (
     GpuFSC,
+    _apply_wedge_batch,
     _find_mrc,
     _read_pixel_sizes,
     _save_mrc,
@@ -168,16 +169,6 @@ def patch_inference(
         vol_est_np = vol_est_np[pre_pad_size:, pre_pad_size:, pre_pad_size:]
 
     return vol_est_np
-
-
-def _apply_wedge_batch(x: torch.Tensor, wedge: torch.Tensor) -> torch.Tensor:
-    """Apply wedge mask via FFT  (B, D, H, W) → (B, D, H, W)."""
-    B, D, H, W = x.shape
-    mask_shape = tuple(wedge.shape)
-    X = torch.fft.fftshift(torch.fft.fftn(x, s=mask_shape, dim=(-3, -2, -1)), dim=(-3, -2, -1))
-    X = X * wedge
-    out = torch.fft.ifftn(torch.fft.ifftshift(X, dim=(-3, -2, -1)), dim=(-3, -2, -1)).real
-    return out[..., :D, :H, :W]
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +501,7 @@ def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
         max_train_vols=0,
         max_val_vols=int(cfg.max_infer_vols),
         seed=int(cfg.seed),
+        val_names=cfg.val_names,
         normalize=bool(cfg.normalize),
         fallback_tilt_min=cfg.tilt_min,
         fallback_tilt_max=cfg.tilt_max,

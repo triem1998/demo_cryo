@@ -5,8 +5,9 @@ general:
   output_root: ./runs
   run_name: demo-cryo-ei-full
   execution_mode: submitit   # change to 'local' to run without SLURM
-  max_train_vols: 4 # null = all non-val volumes
-  max_val_vols: 4
+  train_names: ["tomo_001"]   # empty = random split by max_train_vols
+  max_train_vols: 1 # null = all non-val volumes
+  max_val_vols: 0
   seed: 0
   target_shape: null
 
@@ -69,7 +70,7 @@ slurm:
   ntasks_per_node: 4
   cpus_per_task: 24
   time: "02:00:00"
-  account: # your account here
+  account:  # your account here
   constraint: "h100"
   qos: "qos_gpu_h100-dev"
   stderr_to_stdout: true

@@ -8,9 +8,11 @@ from deepinv.distributed import DistributedContext, distribute
 
 from .base_config import RunEIBaseConfig, _build_physics
 from .dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
-from .dataset.dataset_patch import EIPatchDataConfig, build_ei_patch_dataloaders
+from .dataset.dataset_patch import (
+    EIPatchDataConfig, build_ei_patch_dataloaders, extract_patches_at_positions,
+)
 from .inference.infer_patch import run_post_training_inference
-from .losses.losses import EqLoss, ObsLoss
+from .losses.losses import EqLoss, ObsLoss, _symmetrize_and_binarize
 from .losses.losses_custom import EqLoss as EqLossCustom, ObsLoss as ObsLossCustom
 from .trainer import EIFullTrainer, EIPatchTrainer
 from .transform import Rotate3D
@@ -44,7 +46,6 @@ class RunEIFullConfig(RunEIBaseConfig):
     # ── Training ────────────────────────────────────────────────────────────
     num_epochs: int = 10
     grad_accumulation_steps: int = 4
-    log_every_n_epochs: int = 1
 
     # ── Evaluation ──────────────────────────────────────────────────────────
     eval_fsc: bool = True
@@ -66,10 +67,13 @@ class RunEIPatchConfig(RunEIBaseConfig):
     prefetch_factor: int = 1
     normalize: bool = True
 
+    # Crop origins [d, h, w] to evaluate every log interval on the val (fallback
+    # train) volumes; empty = no probe. Saved under runs/.../patch_probe/.
+    patch_positions: list[list[int]] = []
+
     # ── Training ────────────────────────────────────────────────────────────
     num_epochs: int = 100
     grad_accumulation_steps: int = 1
-    log_every_n_epochs: int = 100
 
     # ── Inference (post-training sliding-window) ─────────────────────────────
     infer_stride: int = 36
@@ -116,7 +120,7 @@ def _configure_trainer(
 ) -> None:
     trainer._init_trainer_state()
     trainer._is_rank0           = (rank == 0)
-    trainer._log_every_n_epochs = int(cfg.log_every_n_epochs)
+    trainer._log_every_n_epochs = int(cfg.eval_interval)
     trainer._train_sampler      = train_sampler
     trainer._metrics_dir        = ensure_dir(output_dir / "metrics")
     trainer._images_dir         = ensure_dir(output_dir / images_subdir) if rank == 0 else None
@@ -150,6 +154,8 @@ def run_full(cfg: RunEIFullConfig) -> None:
         max_train_vols=cfg.max_train_vols,
         max_val_vols=int(cfg.max_val_vols),
         seed=int(cfg.seed),
+        train_names=cfg.train_names,
+        val_names=cfg.val_names,
         target_shape=cfg.target_shape,
         fallback_tilt_min=cfg.tilt_min,
         fallback_tilt_max=cfg.tilt_max,
@@ -266,6 +272,8 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
         max_train_vols=cfg.max_train_vols,
         max_val_vols=int(cfg.max_val_vols),
         seed=int(cfg.seed),
+        train_names=cfg.train_names,
+        val_names=cfg.val_names,
         normalize=bool(cfg.normalize),
         fallback_tilt_min=cfg.tilt_min,
         fallback_tilt_max=cfg.tilt_max,
@@ -323,6 +331,28 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
         _configure_trainer(trainer, cfg, output_dir, rank,
                            images_subdir="train_images",
                            train_sampler=data_bundle.train_sampler)
+
+        # ── Patch-position probe: pre-extract fixed crops once (rank 0) ──────
+        # Evaluated on val volumes, falling back to train when val is empty.
+        if cfg.patch_positions and rank == 0:
+            positions = [tuple(int(v) for v in p) for p in cfg.patch_positions]
+            probe_ds = data_bundle.val_loader.dataset
+            if len(probe_ds.evn_paths) == 0:
+                probe_ds = data_bundle.train_loader.dataset
+            probes = []
+            for ep, op in zip(probe_ds.evn_paths, probe_ds.odd_paths):
+                evn_crops, odd_crops, used = extract_patches_at_positions(
+                    ep, op, positions, int(cfg.crop_size), bool(cfg.normalize),
+                )
+                probes.append((ep.parent.name, evn_crops, odd_crops, used))
+            if probes:
+                trainer._patch_probes = probes
+                trainer._patch_probe_wedge = _symmetrize_and_binarize(
+                    physics.mask[:-1, :-1, :-1]
+                ).cpu()
+                trainer._patch_probe_dir = ensure_dir(output_dir / "patch_probe")
+                print(f"[ei-patch] patch probe: {len(probes)} tomo(s) × "
+                      f"{len(positions)} position(s)", flush=True)
 
         trainer.train()
 

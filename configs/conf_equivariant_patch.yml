@@ -5,18 +5,19 @@ general:
   output_root: ./runs
   run_name: demo-cryo-ei-patch
   execution_mode: submitit   # change to 'local' to run locally
-  max_train_vols: 4         # null = all non-val volumes
-  max_val_vols: 4
+  train_names: ["tomo_001"]   # empty = random split by max_train_vols
+  max_train_vols: 1         # null = all non-val volumes
+  max_val_vols: 0
+  
   seed: 0
 
 training:
-  num_epochs: 1000
+  num_epochs: 2000
   learning_rate: 1.0e-4
   grad_clip: 1.0
   ckp_interval: 5000
-  eval_interval: 500
+  eval_interval: 500 # print loss summary every N epochs
   grad_accumulation_steps: 1
-  log_every_n_epochs: 100   # print loss summary every N epochs
   infer_stride: 36         # icecream default stride for sliding-window inference
   infer_batch_size: 0      # 0 = same as training batch_size
   infer_downsample: 1      # spatial downsample factor before inference (1 = no downsampling)
@@ -39,6 +40,10 @@ patch:
   prefetch_factor: 1
   persistent_workers: true
   normalize: true            # whole-volume zero-mean, unit-std (matches icecream's load_volume normalization)
+  # Crop origins [d, h, w] evaluated on the val set every log interval; saved to runs/.../patch_probe/
+  patch_positions:
+    - [0, 0, 0]
+    - [100, 100, 50]
 
 equivariant:
   tilt_max: 60.0
@@ -58,14 +63,13 @@ slurm:
   nodes: 1
   gpus_per_node: 2
   ntasks_per_node: 2   # one task per GPU 
-  cpus_per_task: 24    
+  cpus_per_task: 10    
   time: "02:00:00"
-  account: # your account here
-  constraint: "h100"
-  qos: "qos_gpu_h100-dev"
+  account:  # your account here
+  constraint: "v100-32g"
+  qos: "qos_gpu-dev"
   stderr_to_stdout: true
   setup:
     - "module purge"
-    - "module load arch/h100"
     - "module load pytorch-gpu/py3/2.7.0"
     - "export NCCL_DEBUG=INFO"
