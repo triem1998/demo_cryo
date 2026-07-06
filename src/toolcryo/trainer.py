@@ -60,6 +60,7 @@ class BaseTrainer(dinv.Trainer):
         self._val_resolutions: list = []
         self._val_vol_idx: int = 0
         self._val_fsc_epoch = None
+        self._fsc_tomo_names: list[str] = []
         # figure tracking
         self._train_slice_epoch = None
         self._train_vol_idx: int = 0
@@ -249,16 +250,18 @@ class EIFullTrainer(BaseTrainer):
             with torch.no_grad():
                 recon_t = half_set_recon(self.model, physics, f_evn_t, f_odd_t)
             if self._images_dir is not None:
-                save_fsc_figure(self._images_dir, epoch, f"vol{vol_idx:02d}.png",
-                                fsc_curve, k, res, f"Epoch {epoch} | Vol {vol_idx}",
+                name = (self._fsc_tomo_names[vol_idx] if vol_idx < len(self._fsc_tomo_names)
+                        else f"vol{vol_idx:02d}")
+                save_fsc_figure(self._images_dir, epoch, f"{name}.png",
+                                fsc_curve, k, res, f"Epoch {epoch} | {name}",
                                 self._fsc_threshold, vol_size=D, pixel_size=px)
                 save_slice_figure(
                     self._images_dir, epoch, vol_idx,
                     [x.squeeze().cpu().numpy(), y.squeeze().cpu().numpy(),
                      _znorm_np(recon_t.squeeze().cpu().numpy())],
                     labels=["EVN", "ODD", "recon"],
-                    title=f"Epoch {epoch} | Vol {vol_idx} — inference recon",
-                    fname=f"vol{vol_idx:02d}_recon.png",
+                    title=f"Epoch {epoch} | {name} — inference recon",
+                    fname=f"{name}_recon.png",
                 )
 
             self._val_vol_idx += 1

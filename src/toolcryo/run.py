@@ -7,7 +7,7 @@ import torch
 from deepinv.distributed import DistributedContext, distribute
 
 from .base_config import RunEIBaseConfig, _build_physics
-from .dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
+from .dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders, _make_full_loader
 from .dataset.dataset_patch import (
     EIPatchDataConfig, build_ei_patch_dataloaders, extract_patches_at_positions,
 )
@@ -209,10 +209,22 @@ def run_full(cfg: RunEIFullConfig) -> None:
         losses    = _build_losses(cfg, physics, transform)
         optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.learning_rate))
 
+        # FSC eval targets val volumes; if none are paired (val empty/unpaired),
+        # fall back to running it on the train volumes instead.
+        val_ds       = data_bundle.val_loader.dataset
+        n_paired_val = sum(1 for p in val_ds.odd_paths if p is not None)
+        if n_paired_val > 0:
+            fsc_loader, fsc_ds, fsc_label = data_bundle.val_loader, val_ds, "val"
+        else:
+            fsc_ds     = data_bundle.train_loader.dataset
+            fsc_loader = _make_full_loader(fsc_ds, shuffle=False, cfg=data_cfg)
+            fsc_label  = "train"
+        n_paired_fsc = sum(1 for p in fsc_ds.odd_paths if p is not None)
+
         trainer = EIFullTrainer(
             model=model, physics=physics, optimizer=optimizer,
             train_dataloader=data_bundle.train_loader,
-            eval_dataloader=data_bundle.val_loader if len(data_bundle.val_loader.dataset) > 0 else None,
+            eval_dataloader=fsc_loader if n_paired_fsc > 0 else None,
             epochs=int(cfg.num_epochs), losses=losses, metrics=[],
             online_measurements=False, device=ctx.device, save_path=None,
             ckp_interval=int(cfg.ckp_interval), eval_interval=int(cfg.eval_interval),
@@ -221,24 +233,24 @@ def run_full(cfg: RunEIFullConfig) -> None:
             log_train_batch=False, optimizer_step_multi_dataset=False,
         )
         _configure_trainer(trainer, cfg, output_dir, rank,
-                           images_subdir="val_images", train_images_subdir="train_images")
+                           images_subdir=f"{fsc_label}_fsc_images" if fsc_label == "train" else "val_images",
+                           train_images_subdir="train_images")
+        trainer._fsc_tomo_names = [p.parent.name for p in fsc_ds.evn_paths]
 
-        val_ds          = data_bundle.val_loader.dataset
-        val_pixel_sizes = _read_pixel_sizes(val_ds.evn_paths, fallback=cfg.pixel_size_angstrom)
-        n_paired_val    = sum(1 for p in val_ds.odd_paths if p is not None)
+        fsc_pixel_sizes = _read_pixel_sizes(fsc_ds.evn_paths, fallback=cfg.pixel_size_angstrom)
         if rank == 0:
-            print(f"[fsc-eval] val pixel sizes (Å/px): {[f'{v:.2f}' for v in val_pixel_sizes]}", flush=True)
+            print(f"[fsc-eval] {fsc_label} pixel sizes (Å/px): {[f'{v:.2f}' for v in fsc_pixel_sizes]}", flush=True)
 
-        if cfg.eval_fsc and n_paired_val > 0:
-            trainer._val_pixel_sizes = val_pixel_sizes
+        if cfg.eval_fsc and n_paired_fsc > 0:
+            trainer._val_pixel_sizes = fsc_pixel_sizes
             trainer._fsc_threshold   = float(cfg.fsc_threshold)
             if rank == 0:
-                print(f"[fsc-eval] enabled for {n_paired_val} paired val volumes  thr={cfg.fsc_threshold}", flush=True)
+                print(f"[fsc-eval] enabled for {n_paired_fsc} paired {fsc_label} volumes  thr={cfg.fsc_threshold}", flush=True)
         else:
             trainer._val_pixel_sizes = []
             trainer._fsc_threshold   = float(cfg.fsc_threshold)
             if rank == 0:
-                msg = "disabled (eval_fsc=False)" if not cfg.eval_fsc else "disabled — no paired ODD val volumes"
+                msg = "disabled (eval_fsc=False)" if not cfg.eval_fsc else f"disabled — no paired ODD {fsc_label} volumes"
                 print(f"[fsc-eval] {msg}", flush=True)
 
         trainer.train()

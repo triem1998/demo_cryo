@@ -12,7 +12,7 @@ general:
   seed: 0
 
 training:
-  num_epochs: 2000
+  num_epochs: 1000
   learning_rate: 1.0e-4
   grad_clip: 1.0
   ckp_interval: 5000
