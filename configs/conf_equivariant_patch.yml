@@ -63,13 +63,14 @@ slurm:
   nodes: 1
   gpus_per_node: 2
   ntasks_per_node: 2   # one task per GPU 
-  cpus_per_task: 10    
+  cpus_per_task: 20    
   time: "02:00:00"
   account:  # your account here
-  constraint: "v100-32g"
-  qos: "qos_gpu-dev"
+  constraint: "h100"
+  qos: "qos_gpu_h100-dev"
   stderr_to_stdout: true
   setup:
     - "module purge"
+    - "module load arch/h100"
     - "module load pytorch-gpu/py3/2.7.0"
     - "export NCCL_DEBUG=INFO"

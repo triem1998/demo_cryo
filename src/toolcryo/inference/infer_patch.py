@@ -468,12 +468,6 @@ def run_post_training_inference(
             )
             del cols
 
-    # Volume counts may not divide evenly across ranks (e.g. fewer volumes than
-    # GPUs) — some ranks finish early and would otherwise race ahead to the next
-    # collective while others are still reconstructing. Reconvene here first.
-    if world_size > 1:
-        torch.distributed.barrier()
-
     if rank == 0:
         print(f"[ei-patch] Inference images saved to {images_dir}", flush=True)
 

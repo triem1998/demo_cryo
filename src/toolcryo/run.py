@@ -379,34 +379,34 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
             print(f"[ckpt] saved final {ckpt_path}", flush=True)
             plot_metrics(output_dir, save=output_dir / "metrics" / "summary.png")
 
-        # ── Post-training sliding-window inference ───────────────────────────
-        infer_datasets = []
-        train_ds = data_bundle.train_loader.dataset
-        val_ds   = data_bundle.val_loader.dataset
-        if cfg.infer_train and len(train_ds.evn_vols) > 0:
-            infer_datasets.append(("train", train_ds))
-        if cfg.infer_val and len(val_ds.evn_vols) > 0:
-            infer_datasets.append(("val", val_ds))
+    # ── Post-training sliding-window inference ───────────────────────────────
+    infer_datasets = []
+    train_ds = data_bundle.train_loader.dataset
+    val_ds   = data_bundle.val_loader.dataset
+    if cfg.infer_train and len(train_ds.evn_vols) > 0:
+        infer_datasets.append(("train", train_ds))
+    if cfg.infer_val and len(val_ds.evn_vols) > 0:
+        infer_datasets.append(("val", val_ds))
 
-        if infer_datasets:
-            infer_bs = int(cfg.infer_batch_size) if cfg.infer_batch_size > 0 else int(cfg.batch_size)
-            run_post_training_inference(
-                datasets=infer_datasets,
-                raw_model=raw_model,
-                physics=physics,
-                ctx=ctx,
-                output_dir=output_dir,
-                crop_size=int(cfg.crop_size),
-                stride=max(1, int(cfg.infer_stride)),
-                infer_batch_size=infer_bs,
-                infer_downsample=max(1, int(cfg.infer_downsample)),
-                tilt_min=float(cfg.tilt_min),
-                tilt_max=float(cfg.tilt_max),
-                use_spherical_support=bool(cfg.use_spherical_support),
-                wedge_double_size=bool(cfg.wedge_double_size),
-                wedge_low_support=float(cfg.wedge_low_support),
-                ref_wedge_support=float(cfg.ref_wedge_support),
-                fsc_threshold=float(cfg.fsc_threshold),
-                pixel_size_angstrom=cfg.pixel_size_angstrom,
-                save_mrc=bool(cfg.save_mrc),
-            )
+    if infer_datasets:
+        infer_bs = int(cfg.infer_batch_size) if cfg.infer_batch_size > 0 else int(cfg.batch_size)
+        run_post_training_inference(
+            datasets=infer_datasets,
+            raw_model=raw_model,
+            physics=physics,
+            ctx=ctx,
+            output_dir=output_dir,
+            crop_size=int(cfg.crop_size),
+            stride=max(1, int(cfg.infer_stride)),
+            infer_batch_size=infer_bs,
+            infer_downsample=max(1, int(cfg.infer_downsample)),
+            tilt_min=float(cfg.tilt_min),
+            tilt_max=float(cfg.tilt_max),
+            use_spherical_support=bool(cfg.use_spherical_support),
+            wedge_double_size=bool(cfg.wedge_double_size),
+            wedge_low_support=float(cfg.wedge_low_support),
+            ref_wedge_support=float(cfg.ref_wedge_support),
+            fsc_threshold=float(cfg.fsc_threshold),
+            pixel_size_angstrom=cfg.pixel_size_angstrom,
+            save_mrc=bool(cfg.save_mrc),
+        )
