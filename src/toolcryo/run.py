@@ -7,10 +7,12 @@ import torch
 from deepinv.distributed import DistributedContext, distribute
 
 from .base_config import RunEIBaseConfig, _build_physics
-from .dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
-from .dataset.dataset_patch import EIPatchDataConfig, build_ei_patch_dataloaders
+from .dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders, _make_full_loader
+from .dataset.dataset_patch import (
+    EIPatchDataConfig, build_ei_patch_dataloaders, extract_patches_at_positions,
+)
 from .inference.infer_patch import run_post_training_inference
-from .losses.losses import EqLoss, ObsLoss
+from .losses.losses import EqLoss, ObsLoss, _symmetrize_and_binarize
 from .losses.losses_custom import EqLoss as EqLossCustom, ObsLoss as ObsLossCustom
 from .trainer import EIFullTrainer, EIPatchTrainer
 from .transform import Rotate3D
@@ -44,7 +46,6 @@ class RunEIFullConfig(RunEIBaseConfig):
     # ── Training ────────────────────────────────────────────────────────────
     num_epochs: int = 10
     grad_accumulation_steps: int = 4
-    log_every_n_epochs: int = 1
 
     # ── Evaluation ──────────────────────────────────────────────────────────
     eval_fsc: bool = True
@@ -66,10 +67,13 @@ class RunEIPatchConfig(RunEIBaseConfig):
     prefetch_factor: int = 1
     normalize: bool = True
 
+    # Crop origins [d, h, w] to evaluate every log interval on the val (fallback
+    # train) volumes; empty = no probe. Saved under runs/.../patch_probe/.
+    patch_positions: list[list[int]] = []
+
     # ── Training ────────────────────────────────────────────────────────────
     num_epochs: int = 100
     grad_accumulation_steps: int = 1
-    log_every_n_epochs: int = 100
 
     # ── Inference (post-training sliding-window) ─────────────────────────────
     infer_stride: int = 36
@@ -116,7 +120,7 @@ def _configure_trainer(
 ) -> None:
     trainer._init_trainer_state()
     trainer._is_rank0           = (rank == 0)
-    trainer._log_every_n_epochs = int(cfg.log_every_n_epochs)
+    trainer._log_every_n_epochs = int(cfg.eval_interval)
     trainer._train_sampler      = train_sampler
     trainer._metrics_dir        = ensure_dir(output_dir / "metrics")
     trainer._images_dir         = ensure_dir(output_dir / images_subdir) if rank == 0 else None
@@ -150,6 +154,8 @@ def run_full(cfg: RunEIFullConfig) -> None:
         max_train_vols=cfg.max_train_vols,
         max_val_vols=int(cfg.max_val_vols),
         seed=int(cfg.seed),
+        train_names=cfg.train_names,
+        val_names=cfg.val_names,
         target_shape=cfg.target_shape,
         fallback_tilt_min=cfg.tilt_min,
         fallback_tilt_max=cfg.tilt_max,
@@ -203,10 +209,22 @@ def run_full(cfg: RunEIFullConfig) -> None:
         losses    = _build_losses(cfg, physics, transform)
         optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.learning_rate))
 
+        # FSC eval targets val volumes; if none are paired (val empty/unpaired),
+        # fall back to running it on the train volumes instead.
+        val_ds       = data_bundle.val_loader.dataset
+        n_paired_val = sum(1 for p in val_ds.odd_paths if p is not None)
+        if n_paired_val > 0:
+            fsc_loader, fsc_ds, fsc_label = data_bundle.val_loader, val_ds, "val"
+        else:
+            fsc_ds     = data_bundle.train_loader.dataset
+            fsc_loader = _make_full_loader(fsc_ds, shuffle=False, cfg=data_cfg)
+            fsc_label  = "train"
+        n_paired_fsc = sum(1 for p in fsc_ds.odd_paths if p is not None)
+
         trainer = EIFullTrainer(
             model=model, physics=physics, optimizer=optimizer,
             train_dataloader=data_bundle.train_loader,
-            eval_dataloader=data_bundle.val_loader if len(data_bundle.val_loader.dataset) > 0 else None,
+            eval_dataloader=fsc_loader if n_paired_fsc > 0 else None,
             epochs=int(cfg.num_epochs), losses=losses, metrics=[],
             online_measurements=False, device=ctx.device, save_path=None,
             ckp_interval=int(cfg.ckp_interval), eval_interval=int(cfg.eval_interval),
@@ -215,24 +233,24 @@ def run_full(cfg: RunEIFullConfig) -> None:
             log_train_batch=False, optimizer_step_multi_dataset=False,
         )
         _configure_trainer(trainer, cfg, output_dir, rank,
-                           images_subdir="val_images", train_images_subdir="train_images")
+                           images_subdir=f"{fsc_label}_fsc_images" if fsc_label == "train" else "val_images",
+                           train_images_subdir="train_images")
+        trainer._fsc_tomo_names = [p.parent.name for p in fsc_ds.evn_paths]
 
-        val_ds          = data_bundle.val_loader.dataset
-        val_pixel_sizes = _read_pixel_sizes(val_ds.evn_paths, fallback=cfg.pixel_size_angstrom)
-        n_paired_val    = sum(1 for p in val_ds.odd_paths if p is not None)
+        fsc_pixel_sizes = _read_pixel_sizes(fsc_ds.evn_paths, fallback=cfg.pixel_size_angstrom)
         if rank == 0:
-            print(f"[fsc-eval] val pixel sizes (Å/px): {[f'{v:.2f}' for v in val_pixel_sizes]}", flush=True)
+            print(f"[fsc-eval] {fsc_label} pixel sizes (Å/px): {[f'{v:.2f}' for v in fsc_pixel_sizes]}", flush=True)
 
-        if cfg.eval_fsc and n_paired_val > 0:
-            trainer._val_pixel_sizes = val_pixel_sizes
+        if cfg.eval_fsc and n_paired_fsc > 0:
+            trainer._val_pixel_sizes = fsc_pixel_sizes
             trainer._fsc_threshold   = float(cfg.fsc_threshold)
             if rank == 0:
-                print(f"[fsc-eval] enabled for {n_paired_val} paired val volumes  thr={cfg.fsc_threshold}", flush=True)
+                print(f"[fsc-eval] enabled for {n_paired_fsc} paired {fsc_label} volumes  thr={cfg.fsc_threshold}", flush=True)
         else:
             trainer._val_pixel_sizes = []
             trainer._fsc_threshold   = float(cfg.fsc_threshold)
             if rank == 0:
-                msg = "disabled (eval_fsc=False)" if not cfg.eval_fsc else "disabled — no paired ODD val volumes"
+                msg = "disabled (eval_fsc=False)" if not cfg.eval_fsc else f"disabled — no paired ODD {fsc_label} volumes"
                 print(f"[fsc-eval] {msg}", flush=True)
 
         trainer.train()
@@ -266,6 +284,8 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
         max_train_vols=cfg.max_train_vols,
         max_val_vols=int(cfg.max_val_vols),
         seed=int(cfg.seed),
+        train_names=cfg.train_names,
+        val_names=cfg.val_names,
         normalize=bool(cfg.normalize),
         fallback_tilt_min=cfg.tilt_min,
         fallback_tilt_max=cfg.tilt_max,
@@ -324,6 +344,28 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
                            images_subdir="train_images",
                            train_sampler=data_bundle.train_sampler)
 
+        # ── Patch-position probe: pre-extract fixed crops once (rank 0) ──────
+        # Evaluated on val volumes, falling back to train when val is empty.
+        if cfg.patch_positions and rank == 0:
+            positions = [tuple(int(v) for v in p) for p in cfg.patch_positions]
+            probe_ds = data_bundle.val_loader.dataset
+            if len(probe_ds.evn_paths) == 0:
+                probe_ds = data_bundle.train_loader.dataset
+            probes = []
+            for ep, op in zip(probe_ds.evn_paths, probe_ds.odd_paths):
+                evn_crops, odd_crops, used = extract_patches_at_positions(
+                    ep, op, positions, int(cfg.crop_size), bool(cfg.normalize),
+                )
+                probes.append((ep.parent.name, evn_crops, odd_crops, used))
+            if probes:
+                trainer._patch_probes = probes
+                trainer._patch_probe_wedge = _symmetrize_and_binarize(
+                    physics.mask[:-1, :-1, :-1]
+                ).cpu()
+                trainer._patch_probe_dir = ensure_dir(output_dir / "patch_probe")
+                print(f"[ei-patch] patch probe: {len(probes)} tomo(s) × "
+                      f"{len(positions)} position(s)", flush=True)
+
         trainer.train()
 
         raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
@@ -337,34 +379,34 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
             print(f"[ckpt] saved final {ckpt_path}", flush=True)
             plot_metrics(output_dir, save=output_dir / "metrics" / "summary.png")
 
-        # ── Post-training sliding-window inference ───────────────────────────
-        infer_datasets = []
-        train_ds = data_bundle.train_loader.dataset
-        val_ds   = data_bundle.val_loader.dataset
-        if cfg.infer_train and len(train_ds.evn_vols) > 0:
-            infer_datasets.append(("train", train_ds))
-        if cfg.infer_val and len(val_ds.evn_vols) > 0:
-            infer_datasets.append(("val", val_ds))
+    # ── Post-training sliding-window inference ───────────────────────────────
+    infer_datasets = []
+    train_ds = data_bundle.train_loader.dataset
+    val_ds   = data_bundle.val_loader.dataset
+    if cfg.infer_train and len(train_ds.evn_vols) > 0:
+        infer_datasets.append(("train", train_ds))
+    if cfg.infer_val and len(val_ds.evn_vols) > 0:
+        infer_datasets.append(("val", val_ds))
 
-        if infer_datasets:
-            infer_bs = int(cfg.infer_batch_size) if cfg.infer_batch_size > 0 else int(cfg.batch_size)
-            run_post_training_inference(
-                datasets=infer_datasets,
-                raw_model=raw_model,
-                physics=physics,
-                ctx=ctx,
-                output_dir=output_dir,
-                crop_size=int(cfg.crop_size),
-                stride=max(1, int(cfg.infer_stride)),
-                infer_batch_size=infer_bs,
-                infer_downsample=max(1, int(cfg.infer_downsample)),
-                tilt_min=float(cfg.tilt_min),
-                tilt_max=float(cfg.tilt_max),
-                use_spherical_support=bool(cfg.use_spherical_support),
-                wedge_double_size=bool(cfg.wedge_double_size),
-                wedge_low_support=float(cfg.wedge_low_support),
-                ref_wedge_support=float(cfg.ref_wedge_support),
-                fsc_threshold=float(cfg.fsc_threshold),
-                pixel_size_angstrom=cfg.pixel_size_angstrom,
-                save_mrc=bool(cfg.save_mrc),
-            )
+    if infer_datasets:
+        infer_bs = int(cfg.infer_batch_size) if cfg.infer_batch_size > 0 else int(cfg.batch_size)
+        run_post_training_inference(
+            datasets=infer_datasets,
+            raw_model=raw_model,
+            physics=physics,
+            ctx=ctx,
+            output_dir=output_dir,
+            crop_size=int(cfg.crop_size),
+            stride=max(1, int(cfg.infer_stride)),
+            infer_batch_size=infer_bs,
+            infer_downsample=max(1, int(cfg.infer_downsample)),
+            tilt_min=float(cfg.tilt_min),
+            tilt_max=float(cfg.tilt_max),
+            use_spherical_support=bool(cfg.use_spherical_support),
+            wedge_double_size=bool(cfg.wedge_double_size),
+            wedge_low_support=float(cfg.wedge_low_support),
+            ref_wedge_support=float(cfg.ref_wedge_support),
+            fsc_threshold=float(cfg.fsc_threshold),
+            pixel_size_angstrom=cfg.pixel_size_angstrom,
+            save_mrc=bool(cfg.save_mrc),
+        )

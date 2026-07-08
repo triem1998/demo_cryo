@@ -17,7 +17,9 @@ import torch
 import torch.nn as nn
 
 from .utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
-from .utils.utils import GpuFSC, PerfProbe, append_metrics_row, fsc_shell, half_set_recon
+from .utils.utils import (
+    GpuFSC, PerfProbe, append_metrics_row, denoise_patches, fsc_shell, half_set_recon,
+)
 
 
 def _znorm_np(arr: np.ndarray) -> np.ndarray:
@@ -58,10 +60,15 @@ class BaseTrainer(dinv.Trainer):
         self._val_resolutions: list = []
         self._val_vol_idx: int = 0
         self._val_fsc_epoch = None
+        self._fsc_tomo_names: list[str] = []
         # figure tracking
         self._train_slice_epoch = None
         self._train_vol_idx: int = 0
         self._train_batch_counter: int = 0
+        # patch-position probe (EIPatchTrainer)
+        self._patch_probes: list | None = None
+        self._patch_probe_wedge = None
+        self._patch_probe_dir: Path | None = None
 
     # ------------------------------------------------------------------
     # EI forward pass — f(EVN) and f(ODD) independently
@@ -243,16 +250,18 @@ class EIFullTrainer(BaseTrainer):
             with torch.no_grad():
                 recon_t = half_set_recon(self.model, physics, f_evn_t, f_odd_t)
             if self._images_dir is not None:
-                save_fsc_figure(self._images_dir, epoch, f"vol{vol_idx:02d}.png",
-                                fsc_curve, k, res, f"Epoch {epoch} | Vol {vol_idx}",
+                name = (self._fsc_tomo_names[vol_idx] if vol_idx < len(self._fsc_tomo_names)
+                        else f"vol{vol_idx:02d}")
+                save_fsc_figure(self._images_dir, epoch, f"{name}.png",
+                                fsc_curve, k, res, f"Epoch {epoch} | {name}",
                                 self._fsc_threshold, vol_size=D, pixel_size=px)
                 save_slice_figure(
                     self._images_dir, epoch, vol_idx,
                     [x.squeeze().cpu().numpy(), y.squeeze().cpu().numpy(),
                      _znorm_np(recon_t.squeeze().cpu().numpy())],
                     labels=["EVN", "ODD", "recon"],
-                    title=f"Epoch {epoch} | Vol {vol_idx} — inference recon",
-                    fname=f"vol{vol_idx:02d}_recon.png",
+                    title=f"Epoch {epoch} | {name} — inference recon",
+                    fname=f"{name}_recon.png",
                 )
 
             self._val_vol_idx += 1
@@ -309,19 +318,35 @@ class EIPatchTrainer(BaseTrainer):
     """Patch trainer. Val: loss evaluation via base. Train: slice figures."""
 
     def _save_train_figures(self, x, y, epoch, physics) -> None:
-        if self._images_dir is None:
+        """Once per log-interval epoch (first batch): denoise the fixed probe
+        crops and save an EVN / ODD / predict figure per (tomo, position)."""
+        if self._patch_probe_dir is None or not self._patch_probes:
             return
         if epoch != self._train_slice_epoch:
             self._train_slice_epoch = epoch
             self._train_batch_counter = 0
-        if self._train_batch_counter == 0 and epoch % self._log_every_n_epochs == 0:
-            save_slice_figure(
-                self._images_dir, epoch, 0,
-                [x[0].squeeze().cpu().numpy(), y[0].squeeze().cpu().numpy(),
-                 self._last_train_ynet.detach()[0].squeeze().cpu().numpy(),
-                 self._last_train_xnet.detach()[0].squeeze().cpu().numpy()],
-                labels=["Input EVN", "Input ODD", "f(EVN)", "f(ODD)"],
-                title=f"Train Epoch {epoch} | Batch 0",
-                fname="batch0000_raw.png",
-            )
+        first = self._train_batch_counter == 0
         self._train_batch_counter += 1
+        if not first or epoch % self._log_every_n_epochs != 0:
+            return
+
+        model = self.model.module if isinstance(
+            self.model, nn.parallel.DistributedDataParallel) else self.model
+        was_training = model.training
+        model.eval()
+        epoch_dir = self._patch_probe_dir / f"epoch{epoch:04d}"
+        for tomo_name, evn_crops, odd_crops, origins in self._patch_probes:
+            recon_evn = denoise_patches(evn_crops, model, self._patch_probe_wedge, self.device)
+            recon_odd = denoise_patches(odd_crops, model, self._patch_probe_wedge, self.device)
+            recon = 0.5 * (recon_evn + recon_odd)
+            for j, (d0, h0, w0) in enumerate(origins):
+                save_slice_figure(
+                    epoch_dir, epoch, j,
+                    [evn_crops[j].cpu().numpy(), odd_crops[j].cpu().numpy(), recon[j].numpy()],
+                    labels=["EVN", "ODD", "predict"],
+                    title=f"{tomo_name} | pos ({d0},{h0},{w0}) | epoch {epoch}",
+                    subdir=".",
+                    fname=f"{tomo_name}_pos{d0}-{h0}-{w0}.png",
+                )
+        if was_training:
+            model.train()

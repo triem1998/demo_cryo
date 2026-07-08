@@ -26,7 +26,9 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from ..utils.utils import EIDataBundle, _discover_pairs, _resolve_tlt_ranges, _split_pairs
+from ..utils.utils import (
+    EIDataBundle, _discover_pairs, _resolve_tlt_ranges, select_train_val_by_name,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +48,8 @@ class EIPatchDataConfig:
     max_train_vols: int | None = None
     max_val_vols: int = 5
     seed: int = 0
+    train_names: list[str] | None = None   # select train vols by name; None = split
+    val_names: list[str] | None = None     # select val vols by name; None = split
     normalize: bool = True             # zero-mean, unit-std per patch
     # Glob patterns — same as CryoEIFullDataset
     evn_glob: str = "vol*split1*.mrc"
@@ -232,6 +236,52 @@ class CryoEIPatchDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
+# Targeted patch extraction (fixed positions) — used by training probes
+# ---------------------------------------------------------------------------
+
+def extract_patches_at_positions(
+    evn_path: Path,
+    odd_path: Path | None,
+    positions: list[tuple[int, int, int]],
+    crop_size: int,
+    normalize: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int, int]]]:
+    """Extract ``crop_size³`` EVN/ODD patches at the given (d, h, w) origins.
+
+    The whole volume is loaded and globally normalised first (matching the
+    inference-time loading), then each patch is sliced out.  Each origin is
+    clamped so a **full** ``crop_size³`` window fits inside the volume — the
+    model always receives a full-size crop.  The clamped origins are returned.
+
+    :returns: ``(evn_crops, odd_crops, used_origins)`` where crops are
+        (N, crop_size, crop_size, crop_size) tensors.
+    """
+    _, evn_vol = _open_mrc_mmap(str(evn_path))
+    evn_t = torch.from_numpy(np.ascontiguousarray(evn_vol))
+    if odd_path is not None:
+        _, odd_vol = _open_mrc_mmap(str(odd_path))
+        odd_t = torch.from_numpy(np.ascontiguousarray(odd_vol))
+    else:
+        odd_t = evn_t
+
+    if normalize:
+        evn_t = (evn_t - evn_t.mean()) / (evn_t.std() + 1e-8)
+        odd_t = evn_t if odd_path is None else (odd_t - odd_t.mean()) / (odd_t.std() + 1e-8)
+
+    D, H, W = evn_t.shape
+    cs = crop_size
+    evn_crops, odd_crops, used = [], [], []
+    for d0, h0, w0 in positions:
+        d0 = int(min(max(0, d0), max(0, D - cs)))
+        h0 = int(min(max(0, h0), max(0, H - cs)))
+        w0 = int(min(max(0, w0), max(0, W - cs)))
+        evn_crops.append(evn_t[d0:d0 + cs, h0:h0 + cs, w0:w0 + cs])
+        odd_crops.append(odd_t[d0:d0 + cs, h0:h0 + cs, w0:w0 + cs])
+        used.append((d0, h0, w0))
+    return torch.stack(evn_crops), torch.stack(odd_crops), used
+
+
+# ---------------------------------------------------------------------------
 # DataLoader builder
 # ---------------------------------------------------------------------------
 
@@ -265,8 +315,9 @@ def build_ei_patch_dataloaders(cfg: EIPatchDataConfig, rank: int = 0, world_size
 
     all_tilt_ranges = _resolve_tlt_ranges(all_tlt)
 
-    train_evn, train_odd, val_evn, val_odd, train_tlt, val_tlt = _split_pairs(
+    train_evn, train_odd, val_evn, val_odd, train_tlt, val_tlt = select_train_val_by_name(
         all_evn, all_odd, cfg.max_val_vols, cfg.seed, cfg.max_train_vols,
+        train_names=cfg.train_names, val_names=cfg.val_names,
         extra=all_tilt_ranges,
     )
 

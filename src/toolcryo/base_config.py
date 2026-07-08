@@ -18,6 +18,10 @@ class RunEIBaseConfig(BaseModel):
     max_train_vols: int | None = None
     max_val_vols: int = 5
     seed: int = 0
+    # Select train / val volumes by tomo dir name (e.g. ["tomo_001"]).
+    # Empty = fall back to the random split by max_train_vols / max_val_vols.
+    train_names: list[str] = []
+    val_names: list[str] = []
 
     # ── DataLoader (shared defaults) ─────────────────────────────────────────
     pin_memory: bool = True

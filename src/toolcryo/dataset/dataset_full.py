@@ -23,7 +23,9 @@ import mrcfile
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
-from ..utils.utils import EIDataBundle, _discover_pairs, _resolve_tlt_ranges, _split_pairs
+from ..utils.utils import (
+    EIDataBundle, _discover_pairs, _resolve_tlt_ranges, select_train_val_by_name,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -39,6 +41,8 @@ class EIFullDataConfig:
     max_train_vols: int | None = None
     max_val_vols: int = 5
     seed: int = 0
+    train_names: list[str] | None = None   # select train vols by name; None = split
+    val_names: list[str] | None = None     # select val vols by name; None = split
     # If set, volumes are trilinearly resampled to this (D, H, W) shape after
     # loading — same semantics as supervised CryoDataConfig.target_shape.
     target_shape: tuple[int, int, int] | None = None
@@ -191,8 +195,9 @@ def build_ei_full_dataloaders(cfg: EIFullDataConfig) -> EIDataBundle:
 
     all_tilt_ranges = _resolve_tlt_ranges(all_tlt)
 
-    train_evn, train_odd, val_evn, val_odd, train_tlt_ranges, val_tlt_ranges = _split_pairs(
+    train_evn, train_odd, val_evn, val_odd, train_tlt_ranges, val_tlt_ranges = select_train_val_by_name(
         all_evn, all_odd, cfg.max_val_vols, cfg.seed, cfg.max_train_vols,
+        train_names=cfg.train_names, val_names=cfg.val_names,
         extra=all_tilt_ranges,
     )
 
