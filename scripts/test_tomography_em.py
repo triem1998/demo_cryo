@@ -286,7 +286,7 @@ def run(
     torch.cuda.empty_cache()
 
     split1_ts = load_tilt_series(split1_ts_path).to(DEVICE)
-    reference_fbp_vol = load_native_volume(split1_fbp_path).to(DEVICE)
+    reference_fbp_vol = load_native_volume(split1_fbp_path)  # stays on CPU: only used for comparison
     check_backward(op, reference_fbp_vol, split1_ts, save_fig=True)
 
     del split1_ts, reference_fbp_vol, op

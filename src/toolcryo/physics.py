@@ -370,7 +370,15 @@ class TomographyEM(dinv.physics.LinearPhysics):
     def fbp(self, y: torch.Tensor, **kwargs) -> torch.Tensor:
         """Filtered back-projection reconstruction: sinogram -> native volume.
 
+        The sinogram is centred before filtering.  deepinv's ramp filter zero-pads
+        each detector line to twice its length; cryo-ET sinograms carry a large DC
+        pedestal (mean >> std), so zero-padding manufactures a step edge that the
+        ramp filter amplifies into stripe artifacts of amplitude comparable to the
+        signal itself.  Centring removes the step.  The volume's absolute DC level
+        is not recoverable from a limited-angle tilt series anyway.
+
         :param torch.Tensor y: Sinogram of shape (B, C, V, A, N).
         :return: Volume of shape (B, C, *volume_shape).
         """
-        return self._from_astra(self.xray.fbp(y))
+        out = self.xray.fbp(y - y.mean(dim=(-3, -2, -1), keepdim=True))
+        return self._from_astra(out)
