@@ -56,7 +56,7 @@ slurm:
   ntasks_per_node: 4
   cpus_per_task: 20
   time: "02:00:00"
-  account: "fio@h100"
+  account: #
   constraint: "h100"
   qos: "qos_gpu_h100-dev"
   stderr_to_stdout: true
