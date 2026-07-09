@@ -1,0 +1,68 @@
+
+method: ei_inference
+
+general:
+  execution_mode: submitit 
+  input_dir: /lustre/fswork/projects/rech/fio/commun/cryolithe/empiar-11830
+  output_root: ./runs
+  run_name: demo-cryo-ei-inference
+  train_names: ["tomo_001"]   # empty = random split by max_train_vols
+  max_infer_vols: 1
+  seed: 0                 # must match training seed to reproduce the same val split
+
+distributed:
+  patch_size: [80, 80, 80]
+  overlap: [24, 24, 24]
+  max_batch_size: 4
+  checkpoint_batches: "auto"
+
+inference:
+  checkpoint_path: #
+  # DataLoader
+  num_workers: 1
+  pin_memory: true
+  prefetch_factor: 1
+  persistent_workers: true
+
+  # Model (must match training config)
+  model_type: unet        # "icecream" or "deepinv"
+  unet_dropout: 0.1
+
+  # Physics (must match training config)
+  tilt_max: 60.0
+  tilt_min: -60.0
+  use_spherical_support: true
+  wedge_double_size: false
+  wedge_low_support: 0.0
+  ref_wedge_support: 1.0
+
+  # FSC
+  fsc_threshold: 0.143
+  pixel_size_angstrom: 7.84  # null = read from MRC header
+
+  # Comparison volume globs (searched inside each tomo_* directory)
+  icecream_glob: "vol_*[Ii]cecream*"
+  isonet_glob: "vol_*[Ii]so[Nn]et*"
+  isonet_fallback_glob: "vol_*DDW*"
+
+  # Output
+  save_recon_mrc: false
+
+
+slurm:
+  job_name: demo-cryo-ei-inference
+  nodes: 1
+  gpus_per_node: 4
+  ntasks_per_node: 4
+  cpus_per_task: 20
+  time: "02:00:00"
+  account: "fio@h100"
+  constraint: "h100"
+  qos: "qos_gpu_h100-dev"
+  stderr_to_stdout: true
+  setup:
+    - "module purge"
+    - "module load arch/h100"
+    - "module load pytorch-gpu/py3/2.7.0"
+    - "export NCCL_DEBUG=INFO"
+

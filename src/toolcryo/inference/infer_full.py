@@ -281,13 +281,13 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
                     labels=list(valid_labels),
                     title=f"{tomo_name} | method comparison",
                     subdir=".",
-                    fname=f"vol{vol_idx:02d}_methods.png",
+                    fname=f"{tomo_name}_methods.png",
                 )
 
                 # ── FSC figure ────────────────────────────────────────────────
                 save_fsc_figure(
                     images_dir, epoch=0,
-                    fname=f"vol{vol_idx:02d}_fsc.png",
+                    fname=f"{tomo_name}_fsc.png",
                     fsc_curve=fsc_curve, res_shell=k, res_angstrom=res,
                     title=f"{tomo_name} | FSC  {res:.1f} Å",
                     threshold=cfg.fsc_threshold,
@@ -296,7 +296,7 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
 
                 # ── Optional: save recon MRC ──────────────────────────────────
                 if cfg.save_recon_mrc:
-                    recon_mrc_path = images_dir / f"vol{vol_idx:02d}_recon.mrc"
+                    recon_mrc_path = images_dir / f"{tomo_name}_recon.mrc"
                     _save_mrc(recon_mrc_path, recon_np)
                     print(f"  [recon mrc] saved {recon_mrc_path.name}", flush=True)
 

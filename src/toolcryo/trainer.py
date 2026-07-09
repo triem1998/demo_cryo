@@ -191,12 +191,6 @@ class BaseTrainer(dinv.Trainer):
             self._val_probe = PerfProbe()
             self._val_probe.__enter__()
             self._val_batch_count = 0
-        else:
-            if self._val_probe is not None and step % self._log_every_n_epochs == 0:
-                self._val_probe.__exit__(None, None, None)
-                t, n = self._val_probe.elapsed_s, max(1, self._val_batch_count)
-                print(f"[val   ep={step}]  total={t:.1f}s  per_img={t/n:.2f}s  n={n}", flush=True)
-            self._val_probe = None
 
             if self._ckpt_dir is not None and step % self.ckp_interval == 0:
                 self._ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -207,6 +201,12 @@ class BaseTrainer(dinv.Trainer):
                 }
                 torch.save(state, self._ckpt_dir / f"ckp_{step:04d}.pth")
                 print(f"[ckpt] saved ckp_{step:04d}.pth", flush=True)
+        else:
+            if self._val_probe is not None and step % self._log_every_n_epochs == 0:
+                self._val_probe.__exit__(None, None, None)
+                t, n = self._val_probe.elapsed_s, max(1, self._val_batch_count)
+                print(f"[val   ep={step}]  total={t:.1f}s  per_img={t/n:.2f}s  n={n}", flush=True)
+            self._val_probe = None
 
     def _enable_mixed_precision(self, device_type: str = "cuda") -> None:
         self._scaler = torch.amp.GradScaler(device_type)

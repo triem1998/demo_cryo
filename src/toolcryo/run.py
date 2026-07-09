@@ -313,6 +313,17 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
             cfg.model_type, cfg.unet_dropout, cfg.drunet_sigma, ctx.device,
         )
 
+        if cfg.pretrained_ckpt is not None:
+            ckpt = torch.load(cfg.pretrained_ckpt, map_location=ctx.device, weights_only=True)
+            state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
+            if any(k.startswith("processor.") for k in state):
+                state = {k.removeprefix("processor."): v for k, v in state.items()}
+                if rank == 0:
+                    print("[ei-patch] stripped 'processor.' prefix from checkpoint keys", flush=True)
+            model.load_state_dict(state, strict=True)
+            if rank == 0:
+                print(f"[ei-patch] loaded pretrained weights from {cfg.pretrained_ckpt}", flush=True)
+
         if ctx.world_size > 1:
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[ctx.local_rank])
             if rank == 0:

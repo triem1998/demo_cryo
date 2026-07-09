@@ -287,18 +287,18 @@ def _infer_one_volume(
             images_dir, epoch=0, vol_idx=vol_idx,
             cols=list(vcols), labels=list(vlabels),
             title=f"{tomo_name} | method comparison | {fsc_str}",
-            subdir=".", fname=f"vol{vol_idx:02d}_methods.png",
+            subdir=".", fname=f"{tomo_name}_methods.png",
         )
 
     save_fsc_figure(
-        images_dir, epoch=0, fname=f"vol{vol_idx:02d}_fsc.png",
+        images_dir, epoch=0, fname=f"{tomo_name}_fsc.png",
         fsc_curve=fsc_curve, res_shell=k, res_angstrom=res,
         title=f"{tomo_name} | FSC {res:.1f} Å",
         threshold=cfg.fsc_threshold, vol_size=D, pixel_size=px,
     )
 
     if cfg.save_recon_mrc:
-        mrc_path = images_dir / f"vol{vol_idx:02d}_recon.mrc"
+        mrc_path = images_dir / f"{tomo_name}_recon.mrc"
         _save_mrc(mrc_path, recon_np)
         print(f"  saved {mrc_path.name}", flush=True)
 

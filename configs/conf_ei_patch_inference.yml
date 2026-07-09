@@ -1,0 +1,69 @@
+method: ei_patch_inference
+
+general:
+  input_dir: /lustre/fswork/projects/rech/fio/commun/cryolithe/empiar-11830
+  output_root: ./runs
+  run_name: demo-cryo-ei-patch-inference
+  execution_mode: submitit
+  max_infer_vols: 1
+  train_names: ["tomo_001"]   # empty = random split by max_train_vols
+  seed: 0                
+
+inference:
+  checkpoint_path: ""     # required: path to a .pth checkpoint
+
+  # DataLoader
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 1
+  persistent_workers: true
+  normalize: true          # must match training config
+
+  # Model (must match training config)
+  model_type: unet        # "unet" | "drunet"
+  unet_dropout: 0.1
+  drunet_sigma: 0.0
+
+  # Sliding-window inference (crop_size must match training config)
+  crop_size: 72
+  stride: 36              # icecream default: crop_size // 2
+  infer_batch_size: 8     # crops processed in parallel on GPU
+  infer_downsample: 1     # spatial avg-pool factor before inference (1 = no downsampling)
+  pre_pad: true
+
+  # Physics (must match training config)
+  tilt_max: 60.0
+  tilt_min: -60.0
+  use_spherical_support: true
+  wedge_double_size: true
+  wedge_low_support: 0.0
+  ref_wedge_support: 1.0
+
+  # FSC
+  fsc_threshold: 0.143
+  pixel_size_angstrom: 7.84  # null = read from MRC header
+
+  # Comparison volume globs (searched inside each tomo_* directory)
+  icecream_glob: "vol_*[Ii]cecream*"
+  isonet_glob: "vol_*[Ii]so[Nn]et*"
+  isonet_fallback_glob: "vol_*DDW*"
+
+  # Output
+  save_recon_mrc: false
+
+slurm:
+  job_name: demo-cryo-ei-patch-inference
+  nodes: 1
+  gpus_per_node: 1
+  ntasks_per_node: 1
+  cpus_per_task: 20
+  time: "02:00:00"
+  account: "fio@h100"
+  constraint: "h100"
+  qos: "qos_gpu_h100-dev"
+  stderr_to_stdout: true
+  setup:
+    - "module purge"
+    - "module load arch/h100"
+    - "module load pytorch-gpu/py3/2.7.0"
+    - "export NCCL_DEBUG=INFO"
