@@ -29,7 +29,7 @@ from ..utils.utils import (
     _read_mrc_vol_size,
     _read_pixel_sizes,
     _save_mrc,
-    fsc_shell,
+    fsc_resolution,
     build_ei_model,
     dump_config_json,
     ensure_dir,
@@ -165,6 +165,10 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
 
         ckpt = torch.load(str(ckpt_path), map_location=ctx.device, weights_only=True)
         state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
+        if any(k.startswith("module.") for k in state):
+            state = {k.removeprefix("module."): v for k, v in state.items()}
+            if rank == 0:
+                print("[inference] stripped 'module.' prefix from checkpoint keys", flush=True)
         if any(k.startswith("processor.") for k in state):
             state = {k.removeprefix("processor."): v for k, v in state.items()}
             if rank == 0:
@@ -220,13 +224,12 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
 
             # ── FSC ───────────────────────────────────────────────────────────
             if gpu_fsc is None:
-                gpu_fsc = GpuFSC(f_evn_t.shape[-1], device=f_evn_t.device)
+                gpu_fsc = GpuFSC(device=f_evn_t.device)
 
             fsc_curve = gpu_fsc(f_evn_t, f_odd_t)
-            D   = int(f_evn_t.shape[-1])
             px  = pixel_sizes[vol_idx] if vol_idx < len(pixel_sizes) else 1.0
-            k   = fsc_shell(fsc_curve, cfg.fsc_threshold)
-            res = D * px / max(k, 1)
+            k, res, D = fsc_resolution(fsc_curve, f_evn_t.squeeze().shape,
+                                       px, cfg.fsc_threshold)
             resolutions.append(res)
 
             tomo_name = val_ds.evn_paths[vol_idx].parent.name

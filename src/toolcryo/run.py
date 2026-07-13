@@ -184,6 +184,10 @@ def run_full(cfg: RunEIFullConfig) -> None:
         if cfg.pretrained_ckpt is not None:
             ckpt = torch.load(cfg.pretrained_ckpt, map_location=ctx.device, weights_only=True)
             state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
+            if any(k.startswith("module.") for k in state):
+                state = {k.removeprefix("module."): v for k, v in state.items()}
+                if rank == 0:
+                    print("[ei-full] stripped 'module.' prefix from checkpoint keys", flush=True)
             if any(k.startswith("processor.") for k in state):
                 state = {k.removeprefix("processor."): v for k, v in state.items()}
                 if rank == 0:
@@ -316,6 +320,10 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
         if cfg.pretrained_ckpt is not None:
             ckpt = torch.load(cfg.pretrained_ckpt, map_location=ctx.device, weights_only=True)
             state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
+            if any(k.startswith("module.") for k in state):
+                state = {k.removeprefix("module."): v for k, v in state.items()}
+                if rank == 0:
+                    print("[ei-patch] stripped 'module.' prefix from checkpoint keys", flush=True)
             if any(k.startswith("processor.") for k in state):
                 state = {k.removeprefix("processor."): v for k, v in state.items()}
                 if rank == 0:

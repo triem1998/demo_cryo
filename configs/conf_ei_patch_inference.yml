@@ -6,17 +6,15 @@ general:
   run_name: demo-cryo-ei-patch-inference
   execution_mode: submitit
   max_infer_vols: 1
-  train_names: ["tomo_001"]   # empty = random split by max_train_vols
+  val_names: ["tomo_001"]   # empty = random split by max_train_vols
   seed: 0                
 
 inference:
-  checkpoint_path: ""     # required: path to a .pth checkpoint
+  # required: one or more .pth checkpoints; each is evaluated in turn
+  checkpoint_paths:
+    - /lustre/fswork/projects/rech/fio/commun/Results_cryo/runs/demo-cryo-ei-patch_4_samples_2000_epochs_unet/slurm-662139/checkpoints/ckp_0000.pth 
+    - /lustre/fswork/projects/rech/fio/commun/Results_cryo/runs/demo-cryo-ei-patch_4_samples_2000_epochs_unet/slurm-662139/checkpoints/ckp_final.pth
 
-  # DataLoader
-  num_workers: 4
-  pin_memory: true
-  prefetch_factor: 1
-  persistent_workers: true
   normalize: true          # must match training config
 
   # Model (must match training config)
