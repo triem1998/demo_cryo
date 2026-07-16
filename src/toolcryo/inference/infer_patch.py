@@ -9,7 +9,7 @@ Matches icecream's inference_util.inference exactly:
 """
 from __future__ import annotations
 
-import json
+import csv
 import time
 from pathlib import Path
 
@@ -29,7 +29,7 @@ from ..utils.utils import (
     _read_pixel_sizes,
     _save_mrc,
     _znorm,
-    fsc_shell,
+    fsc_resolution,
     build_ei_model,
     dump_config_json,
     ensure_dir,
@@ -44,16 +44,12 @@ from ..utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_
 
 class RunEIPatchInferenceConfig(RunEIBaseConfig):
     # ── Checkpoint ──────────────────────────────────────────────────────────
-    checkpoint_path: str = ""
+    checkpoint_paths: list[str] = []
 
     # ── Data ────────────────────────────────────────────────────────────────
     output_dir: str = "./runs/inference_patch"
     max_infer_vols: int = 5
     normalize: bool = True
-
-    # ── DataLoader ──────────────────────────────────────────────────────────
-    num_workers: int = 1
-    prefetch_factor: int = 1
 
     # ── Patch inference (must match training config) ─────────────────────────
     crop_size: int = 72
@@ -265,11 +261,9 @@ def _infer_one_volume(
     # FSC between half-reconstructions
     evn_t = torch.from_numpy(recon_evn).unsqueeze(0).unsqueeze(0).to(device)
     odd_t = torch.from_numpy(recon_odd).unsqueeze(0).unsqueeze(0).to(device)
-    fsc_curve = GpuFSC(evn_t.shape[-1], device=device)(evn_t, odd_t)
+    fsc_curve = GpuFSC(device=device)(evn_t, odd_t)
     px  = _read_pixel_sizes([evn_path], cfg.pixel_size_angstrom)[0]
-    D   = int(recon_evn.shape[-1])
-    k   = fsc_shell(fsc_curve, cfg.fsc_threshold)
-    res = D * px / max(k, 1)
+    k, res, D = fsc_resolution(fsc_curve, recon_evn.shape, px, cfg.fsc_threshold)
     fsc_str = f"FSC@{cfg.fsc_threshold}={res:.1f} Å (shell {k})"
     print(f"  {fsc_str}", flush=True)
 
@@ -278,27 +272,34 @@ def _infer_one_volume(
     isonet_np   = _load_comparison(_find_mrc(tomo_dir, cfg.isonet_glob, cfg.isonet_fallback_glob))
     icecream_np = _load_comparison(_find_mrc(tomo_dir, cfg.icecream_glob))
 
-    methods = [(evn_np, "EVN"), (odd_np, "ODD"), (isonet_np, "IsoNet"),
-               (icecream_np, "IceCream"), (recon_np, "ours")]
-    valid = [(v, lbl) for v, lbl in methods if v is not None]
-    if valid:
-        vcols, vlabels = zip(*valid)
-        save_slice_figure(
-            images_dir, epoch=0, vol_idx=vol_idx,
-            cols=list(vcols), labels=list(vlabels),
-            title=f"{tomo_name} | method comparison | {fsc_str}",
-            subdir=".", fname=f"vol{vol_idx:02d}_methods.png",
-        )
+    # save_slice_figure shares one vmin/vmax across every column, so they must be
+    # on a common scale: the raw model output has a far smaller std than the
+    # on-disk volumes and would otherwise render as flat grey.
+    cols   = [_znorm(evn_np), _znorm(odd_np), _znorm(recon_np)]
+    labels = ["EVN", "ODD", "ours"]
+    if icecream_np is not None:
+        cols.append(_znorm(icecream_np))
+        labels.append("IceCream")
+    if isonet_np is not None:
+        cols.append(_znorm(isonet_np))
+        labels.append("IsoNet")
+
+    save_slice_figure(
+        images_dir, epoch=0, vol_idx=vol_idx,
+        cols=cols, labels=labels,
+        title=f"{tomo_name} | method comparison | {fsc_str}",
+        subdir=".", fname=f"{tomo_name}_methods.png",
+    )
 
     save_fsc_figure(
-        images_dir, epoch=0, fname=f"vol{vol_idx:02d}_fsc.png",
+        images_dir, epoch=0, fname=f"{tomo_name}_fsc.png",
         fsc_curve=fsc_curve, res_shell=k, res_angstrom=res,
         title=f"{tomo_name} | FSC {res:.1f} Å",
         threshold=cfg.fsc_threshold, vol_size=D, pixel_size=px,
     )
 
     if cfg.save_recon_mrc:
-        mrc_path = images_dir / f"vol{vol_idx:02d}_recon.mrc"
+        mrc_path = images_dir / f"{tomo_name}_recon.mrc"
         _save_mrc(mrc_path, recon_np)
         print(f"  saved {mrc_path.name}", flush=True)
 
@@ -344,7 +345,7 @@ def run_post_training_inference(
     wedge_cpu  = _symmetrize_and_binarize(physics.mask[:-1, :-1, :-1]).cpu()
     images_dir = ensure_dir(output_dir / "inference_images")
     recon_dir  = ensure_dir(output_dir / "reconstructions") if save_mrc else None
-    _gpu_fsc   = GpuFSC(crop_size, device=device)
+    _gpu_fsc   = GpuFSC(device=device)
     raw_model.eval()
 
     if rank == 0:
@@ -415,9 +416,7 @@ def run_post_training_inference(
             torch.cuda.empty_cache()
 
             px_i    = _read_pixel_sizes([ds.evn_paths[i]], pixel_size_angstrom)[0]
-            D_i     = int(recon.shape[-1])
-            k_i     = fsc_shell(fsc_curve_i, threshold=fsc_threshold)
-            res_i   = D_i * px_i / max(k_i, 1)
+            k_i, res_i, D_i = fsc_resolution(fsc_curve_i, recon.shape, px_i, fsc_threshold)
             fsc_str = f"FSC@{fsc_threshold}={res_i:.1f} Å (shell {k_i})"
             print(f"  [{tomo_name}] {fsc_str}", flush=True)
 
@@ -480,24 +479,22 @@ def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
     seed_everything(int(cfg.seed))
 
     output_dir = ensure_dir(cfg.output_dir)
-    images_dir = ensure_dir(output_dir / "inference_images")
     dump_config_json(output_dir / "config.json", cfg.model_dump())
 
-    if not cfg.checkpoint_path:
-        raise ValueError("checkpoint_path must be set.")
+    if not cfg.checkpoint_paths:
+        raise ValueError("checkpoint_paths must be set.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[patch-infer] device={device}", flush=True)
 
+    # Only the dataset's path lists are used below; the DataLoader is never
+    # iterated (volumes are read directly in _infer_one_volume), so the
+    # DataLoader knobs are left at their defaults.
     data_cfg = EIPatchDataConfig(
         input_dir=cfg.input_dir,
         crop_size=int(cfg.crop_size),
         n_crops_per_vol=1,       # not used for inference
         batch_size=1,            # not used for inference
-        num_workers=int(cfg.num_workers),
-        pin_memory=bool(cfg.pin_memory),
-        prefetch_factor=int(cfg.prefetch_factor),
-        persistent_workers=bool(cfg.persistent_workers),
         max_train_vols=0,
         max_val_vols=int(cfg.max_infer_vols),
         seed=int(cfg.seed),
@@ -517,54 +514,71 @@ def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
         cfg.model_type, cfg.unet_dropout, cfg.drunet_sigma, device,
     )
 
-    ckpt = torch.load(cfg.checkpoint_path, map_location=device, weights_only=True)
-    state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
-    model.load_state_dict(state, strict=True)
-    model.eval()
-
-    print(
-        f"[patch-infer] loaded {Path(cfg.checkpoint_path).name}  "
-        f"model={model_info}  params={sum(p.numel() for p in model.parameters()):,}",
-        flush=True,
-    )
-
     stride = int(cfg.stride) if cfg.stride > 0 else cfg.crop_size // 2
 
-    results = []
-    for vol_idx in range(len(val_ds.evn_paths)):
-        result = _infer_one_volume(
-            vol_idx,
-            val_ds.evn_paths[vol_idx],
-            val_ds.odd_paths[vol_idx],
-            val_ds._tilt_ranges[vol_idx],
-            model, cfg, device, stride, images_dir,
-            infer_downsample=int(cfg.infer_downsample),
-        )
-        results.append(result)
-        torch.cuda.empty_cache()
+    rows = []
+    for ckpt_path in cfg.checkpoint_paths:
+        ckpt_name = Path(ckpt_path).stem
+        images_dir = ensure_dir(output_dir / "inference_images" / ckpt_name)
 
-    resolutions = [r["fsc_res_angstrom"] for r in results]
-    if resolutions:
-        res_arr = np.array(resolutions)
-        mean_res, median_res = float(np.mean(res_arr)), float(np.median(res_arr))
-        q1_res, q3_res = float(np.percentile(res_arr, 25)), float(np.percentile(res_arr, 75))
-
-        save_resolution_histogram(
-            images_dir, epoch=0, resolutions_angstrom=resolutions,
-            mean_res=mean_res, median_res=median_res,
-            q1_res=q1_res, q3_res=q3_res,
-            threshold_label=str(cfg.fsc_threshold),
-        )
-        with open(output_dir / "results.json", "w") as f:
-            json.dump({
-                "fsc_threshold": cfg.fsc_threshold, "n_vols": len(resolutions),
-                "mean_res_angstrom": mean_res, "median_res_angstrom": median_res,
-                "q1_res_angstrom": q1_res, "q3_res_angstrom": q3_res,
-                "per_volume": results,
-            }, f, indent=2)
+        # map to CPU: the file also carries optimizer state (~2x the weights) that
+        # inference never uses, and load_state_dict copies CPU->GPU params directly.
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
+        if any(k.startswith("module.") for k in state):
+            state = {k.removeprefix("module."): v for k, v in state.items()}
+            print("[patch-infer] stripped 'module.' prefix from checkpoint keys", flush=True)
+        model.load_state_dict(state, strict=True)
+        model.eval()
+        del ckpt, state
 
         print(
-            f"\n[patch-infer] DONE  n={len(resolutions)}  "
-            f"mean={mean_res:.1f} Å  median={median_res:.1f} Å  (lower=better)",
+            f"\n[patch-infer] loaded {Path(ckpt_path).name}  "
+            f"model={model_info}  params={sum(p.numel() for p in model.parameters()):,}",
+            flush=True,
+        )
+
+        results = []
+        for vol_idx in range(len(val_ds.evn_paths)):
+            result = _infer_one_volume(
+                vol_idx,
+                val_ds.evn_paths[vol_idx],
+                val_ds.odd_paths[vol_idx],
+                val_ds._tilt_ranges[vol_idx],
+                model, cfg, device, stride, images_dir,
+                infer_downsample=int(cfg.infer_downsample),
+            )
+            results.append(result)
+            rows.append({"checkpoint": ckpt_name, **result})
+            torch.cuda.empty_cache()
+
+        resolutions = [r["fsc_res_angstrom"] for r in results]
+        if resolutions:
+            res_arr = np.array(resolutions)
+            mean_res, median_res = float(np.mean(res_arr)), float(np.median(res_arr))
+            q1_res, q3_res = float(np.percentile(res_arr, 25)), float(np.percentile(res_arr, 75))
+
+            save_resolution_histogram(
+                images_dir, epoch=0, resolutions_angstrom=resolutions,
+                mean_res=mean_res, median_res=median_res,
+                q1_res=q1_res, q3_res=q3_res,
+                threshold_label=str(cfg.fsc_threshold),
+            )
+            print(
+                f"[patch-infer] {ckpt_name}  n={len(resolutions)}  "
+                f"mean={mean_res:.1f} Å  median={median_res:.1f} Å  (lower=better)",
+                flush=True,
+            )
+
+    if rows:
+        csv_path = output_dir / "results.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+        print(
+            f"\n[patch-infer] DONE  {len(cfg.checkpoint_paths)} checkpoint(s)  "
+            f"{len(rows)} row(s) -> {csv_path}",
             flush=True,
         )

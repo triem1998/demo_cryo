@@ -18,7 +18,7 @@ import torch.nn as nn
 
 from .utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
 from .utils.utils import (
-    GpuFSC, PerfProbe, append_metrics_row, denoise_patches, fsc_shell, half_set_recon,
+    GpuFSC, PerfProbe, append_metrics_row, denoise_patches, fsc_resolution, half_set_recon,
 )
 
 
@@ -191,22 +191,24 @@ class BaseTrainer(dinv.Trainer):
             self._val_probe = PerfProbe()
             self._val_probe.__enter__()
             self._val_batch_count = 0
+
+            if self._ckpt_dir is not None and step % self.ckp_interval == 0:
+                self._ckpt_dir.mkdir(parents=True, exist_ok=True)
+                raw_model = self.model.module if isinstance(
+                    self.model, nn.parallel.DistributedDataParallel) else self.model
+                state = {
+                    "epoch": step,
+                    "model_state_dict": getattr(raw_model, "processor", raw_model).state_dict(),
+                    "optimizer": self.optimizer.state_dict() if self.optimizer else None,
+                }
+                torch.save(state, self._ckpt_dir / f"ckp_{step:04d}.pth")
+                print(f"[ckpt] saved ckp_{step:04d}.pth", flush=True)
         else:
             if self._val_probe is not None and step % self._log_every_n_epochs == 0:
                 self._val_probe.__exit__(None, None, None)
                 t, n = self._val_probe.elapsed_s, max(1, self._val_batch_count)
                 print(f"[val   ep={step}]  total={t:.1f}s  per_img={t/n:.2f}s  n={n}", flush=True)
             self._val_probe = None
-
-            if self._ckpt_dir is not None and step % self.ckp_interval == 0:
-                self._ckpt_dir.mkdir(parents=True, exist_ok=True)
-                state = {
-                    "epoch": step,
-                    "model_state_dict": getattr(self.model, "processor", self.model).state_dict(),
-                    "optimizer": self.optimizer.state_dict() if self.optimizer else None,
-                }
-                torch.save(state, self._ckpt_dir / f"ckp_{step:04d}.pth")
-                print(f"[ckpt] saved ckp_{step:04d}.pth", flush=True)
 
     def _enable_mixed_precision(self, device_type: str = "cuda") -> None:
         self._scaler = torch.amp.GradScaler(device_type)
@@ -238,12 +240,11 @@ class EIFullTrainer(BaseTrainer):
                 torch.cuda.synchronize()
 
             if not hasattr(self, "_gpu_fsc"):
-                self._gpu_fsc = GpuFSC(f_evn_t.shape[-1], device=f_evn_t.device)
+                self._gpu_fsc = GpuFSC(device=f_evn_t.device)
 
-            fsc_curve = self._gpu_fsc(f_evn_t, f_odd_t)
-            D         = int(f_evn_t.shape[-1])
-            k         = fsc_shell(fsc_curve, self._fsc_threshold)
-            res       = D * px / max(k, 1)
+            fsc_curve  = self._gpu_fsc(f_evn_t, f_odd_t)
+            k, res, D  = fsc_resolution(fsc_curve, f_evn_t.squeeze().shape,
+                                        px, self._fsc_threshold)
             self._val_resolutions.append(res)
 
             # All ranks must call the distributed model; only rank-0 saves figures.
