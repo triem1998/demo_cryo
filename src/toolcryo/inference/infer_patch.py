@@ -24,6 +24,7 @@ from ..physics import MissingWedge
 from ..losses.losses import _initialize_window, _symmetrize_and_binarize
 from ..utils.utils import (
     GpuFSC,
+    append_fsc_row,
     _apply_wedge_batch,
     _find_mrc,
     _read_pixel_sizes,
@@ -420,6 +421,13 @@ def run_post_training_inference(
             fsc_str = f"FSC@{fsc_threshold}={res_i:.1f} Å (shell {k_i})"
             print(f"  [{tomo_name}] {fsc_str}", flush=True)
 
+            # Volumes are sharded across ranks, so each rank writes its own file.
+            append_fsc_row(output_dir / "metrics" / f"fsc_rank{rank}.csv",
+                           mode="train", regime="patch", split=split_label,
+                           vol_idx=i, tomo=tomo_name, pixel_size=px_i,
+                           fsc_threshold=fsc_threshold,
+                           fsc_shell=int(k_i), fsc_res_angstrom=float(res_i))
+
             save_fsc_figure(
                 images_dir, epoch=0,
                 fname=f"{split_label}_{tomo_name}_fsc.png",
@@ -483,6 +491,13 @@ def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
 
     if not cfg.checkpoint_paths:
         raise ValueError("checkpoint_paths must be set.")
+
+    if cfg.train_names:
+        print(
+            f"[patch-infer] WARNING: train_names={cfg.train_names} is ignored — inference "
+            f"reads the val split. Use val_names to pin the volumes to evaluate.",
+            flush=True,
+        )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[patch-infer] device={device}", flush=True)
@@ -550,6 +565,13 @@ def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
             )
             results.append(result)
             rows.append({"checkpoint": ckpt_name, **result})
+            append_fsc_row(output_dir / "metrics" / "fsc.csv",
+                           mode="inference", regime="patch", split="val",
+                           checkpoint=ckpt_name, vol_idx=vol_idx,
+                           tomo=result.get("tomo"), pixel_size=result.get("pixel_size"),
+                           fsc_threshold=cfg.fsc_threshold,
+                           fsc_shell=result.get("fsc_shell"),
+                           fsc_res_angstrom=result.get("fsc_res_angstrom"))
             torch.cuda.empty_cache()
 
         resolutions = [r["fsc_res_angstrom"] for r in results]

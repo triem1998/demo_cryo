@@ -240,6 +240,7 @@ def run_full(cfg: RunEIFullConfig) -> None:
                            images_subdir=f"{fsc_label}_fsc_images" if fsc_label == "train" else "val_images",
                            train_images_subdir="train_images")
         trainer._fsc_tomo_names = [p.parent.name for p in fsc_ds.evn_paths]
+        trainer._fsc_split      = fsc_label
 
         fsc_pixel_sizes = _read_pixel_sizes(fsc_ds.evn_paths, fallback=cfg.pixel_size_angstrom)
         if rank == 0:

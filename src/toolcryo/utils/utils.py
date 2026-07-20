@@ -60,6 +60,18 @@ def append_metrics_row(path: Path | str, row: dict) -> None:
         csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore").writerow(row)
 
 
+# Shared column set so every FSC CSV (train/inference, full/patch) concatenates.
+FSC_CSV_COLUMNS = [
+    "mode", "regime", "split", "epoch", "checkpoint", "vol_idx", "tomo",
+    "pixel_size", "fsc_threshold", "fsc_shell", "fsc_res_angstrom",
+]
+
+
+def append_fsc_row(path: Path | str, **fields) -> None:
+    """Append one per-volume FSC record, padded to FSC_CSV_COLUMNS."""
+    append_metrics_row(path, {c: fields.get(c, "") for c in FSC_CSV_COLUMNS})
+
+
 class DRUNetWrapper(torch.nn.Module):
     """Wraps DRUNet so model(x) works — injects a fixed sigma as a float.
 
