@@ -6,8 +6,8 @@ general:
   run_name: demo-cryo-ei-patch-inference
   execution_mode: submitit
   max_infer_vols: 1
-  val_names: ["tomo_001"]   # empty = random split by max_train_vols
-  seed: 0                
+  val_names: ["tomo_001"]   # volumes to evaluate; empty = first max_infer_vols of a seeded shuffle
+  seed: 0                 # only used when val_names is empty
 
 inference:
   # required: one or more .pth checkpoints; each is evaluated in turn

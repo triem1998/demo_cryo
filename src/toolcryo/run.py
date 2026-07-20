@@ -239,7 +239,9 @@ def run_full(cfg: RunEIFullConfig) -> None:
         _configure_trainer(trainer, cfg, output_dir, rank,
                            images_subdir=f"{fsc_label}_fsc_images" if fsc_label == "train" else "val_images",
                            train_images_subdir="train_images")
-        trainer._fsc_tomo_names = [p.parent.name for p in fsc_ds.evn_paths]
+        trainer._fsc_tomo_names  = [p.parent.name for p in fsc_ds.evn_paths]
+        trainer._fsc_split       = fsc_label
+        trainer._save_fsc_curves = bool(cfg.save_fsc_curves)
 
         fsc_pixel_sizes = _read_pixel_sizes(fsc_ds.evn_paths, fallback=cfg.pixel_size_angstrom)
         if rank == 0:
@@ -428,4 +430,5 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
             fsc_threshold=float(cfg.fsc_threshold),
             pixel_size_angstrom=cfg.pixel_size_angstrom,
             save_mrc=bool(cfg.save_mrc),
+            save_fsc_curves=bool(cfg.save_fsc_curves),
         )

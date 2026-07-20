@@ -6,9 +6,9 @@ general:
   input_dir: /lustre/fswork/projects/rech/fio/commun/cryolithe/empiar-11830
   output_root: ./runs
   run_name: demo-cryo-ei-inference
-  train_names: ["tomo_001"]   # empty = random split by max_train_vols
+  val_names: ["tomo_001"]   # volumes to evaluate; empty = first max_infer_vols of a seeded shuffle
   max_infer_vols: 1
-  seed: 0                 # must match training seed to reproduce the same val split
+  seed: 0                 # only used when val_names is empty
 
 distributed:
   patch_size: [80, 80, 80]

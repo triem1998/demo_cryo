@@ -1,7 +1,10 @@
 """infer_full.py — Inference-only evaluation for a trained EI full-volume model.
 
-Loads a pretrained checkpoint and runs on the validation split (same seed as
-training).  Per volume saves:
+Loads a pretrained checkpoint and runs on the volumes selected by ``val_names``
+(or, when unset, the first ``max_infer_vols`` volumes of a seeded shuffle over
+``input_dir``).  Note this split is re-derived here, not inherited from the
+training run: to evaluate the exact volumes used for training, list them in
+``val_names``.  Per volume saves:
   vol{i}_methods.png  — EVN | ODD | IsoNet | IceCream | ours
   vol{i}_fsc.png      — FSC curve
   vol{i}_recon.mrc    — reconstructed volume  (save_recon_mrc=True, off by default)
@@ -25,6 +28,7 @@ from ..base_config import RunEIBaseConfig, _build_physics
 from ..dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
 from ..utils.utils import (
     GpuFSC,
+    append_fsc_row,
     _find_mrc,
     _read_mrc_vol_size,
     _read_pixel_sizes,
@@ -121,6 +125,13 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
     if not cfg.checkpoint_path:
         raise ValueError("checkpoint_path must be set in the config.")
 
+    if cfg.train_names:
+        print(
+            f"[inference] WARNING: train_names={cfg.train_names} is ignored — inference "
+            f"reads the val split. Use val_names to pin the volumes to evaluate.",
+            flush=True,
+        )
+
     data_cfg = EIFullDataConfig(
         input_dir=cfg.input_dir,
         num_workers=int(cfg.num_workers),
@@ -130,6 +141,7 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
         max_train_vols=0,
         max_val_vols=int(cfg.max_infer_vols),
         seed=int(cfg.seed),
+        val_names=cfg.val_names,
         target_shape=cfg.target_shape,
         fallback_tilt_min=cfg.tilt_min,
         fallback_tilt_max=cfg.tilt_max,
@@ -310,6 +322,15 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
                 "fsc_res_angstrom": float(res),
                 "pixel_size":       float(px),
             })
+
+            if rank == 0:
+                append_fsc_row(output_dir / "metrics" / "fsc.csv",
+                               curve=fsc_curve if cfg.save_fsc_curves else None,
+                               mode="inference", regime="full", split="val",
+                               checkpoint=ckpt_path.name, vol_idx=vol_idx,
+                               tomo=tomo_name, pixel_size=float(px), n_ref=D,
+                               fsc_threshold=cfg.fsc_threshold,
+                               fsc_shell=int(k), fsc_res_angstrom=float(res))
 
         # ── Summary ───────────────────────────────────────────────────────────
         if rank == 0 and resolutions:

@@ -18,7 +18,7 @@ import torch.nn as nn
 
 from .utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
 from .utils.utils import (
-    GpuFSC, PerfProbe, append_metrics_row, denoise_patches, fsc_resolution, half_set_recon,
+    GpuFSC, PerfProbe, append_fsc_row, append_metrics_row, denoise_patches, fsc_resolution, half_set_recon,
 )
 
 
@@ -56,6 +56,8 @@ class BaseTrainer(dinv.Trainer):
         self._last_train_ynet = None
         # FSC eval (EIFullTrainer)
         self._fsc_threshold: float = 0.143
+        self._fsc_split: str = "val"
+        self._save_fsc_curves: bool = True
         self._val_pixel_sizes: list = []
         self._val_resolutions: list = []
         self._val_vol_idx: int = 0
@@ -169,7 +171,7 @@ class BaseTrainer(dinv.Trainer):
 
         if self._metrics_dir is not None:
             row = {"epoch": step, "lr": self.optimizer.param_groups[0]["lr"],
-                   **{k: v for k, v in logs.items() if isinstance(v, (int, float))}}
+                   **{k: v for k, v in logs.items() if isinstance(v, (int, float, str))}}
             append_metrics_row(self._metrics_dir / ("train_epochs.csv" if train else "val_epochs.csv"), row)
 
         if train:
@@ -247,12 +249,21 @@ class EIFullTrainer(BaseTrainer):
                                         px, self._fsc_threshold)
             self._val_resolutions.append(res)
 
+            name = (self._fsc_tomo_names[vol_idx] if vol_idx < len(self._fsc_tomo_names)
+                    else f"vol{vol_idx:02d}")
+            if self._is_rank0 and self._metrics_dir is not None:
+                append_fsc_row(self._metrics_dir / "fsc_per_volume.csv",
+                               curve=fsc_curve if self._save_fsc_curves else None,
+                               mode="train", regime="full", split=self._fsc_split,
+                               epoch=epoch, vol_idx=vol_idx, tomo=name,
+                               pixel_size=px, n_ref=D,
+                               fsc_threshold=self._fsc_threshold,
+                               fsc_shell=int(k), fsc_res_angstrom=float(res))
+
             # All ranks must call the distributed model; only rank-0 saves figures.
             with torch.no_grad():
                 recon_t = half_set_recon(self.model, physics, f_evn_t, f_odd_t)
             if self._images_dir is not None:
-                name = (self._fsc_tomo_names[vol_idx] if vol_idx < len(self._fsc_tomo_names)
-                        else f"vol{vol_idx:02d}")
                 save_fsc_figure(self._images_dir, epoch, f"{name}.png",
                                 fsc_curve, k, res, f"Epoch {epoch} | {name}",
                                 self._fsc_threshold, vol_size=D, pixel_size=px)
@@ -300,7 +311,7 @@ class EIFullTrainer(BaseTrainer):
             q1_res     = float(np.percentile(res_arr, 25))
             q3_res     = float(np.percentile(res_arr, 75))
             logs.update(fsc_res_angstrom=mean_res, fsc_res_median=median_res,
-                        fsc_res_q1=q1_res, fsc_res_q3=q3_res)
+                        fsc_res_q1=q1_res, fsc_res_q3=q3_res, fsc_split=self._fsc_split)
             if self._images_dir is not None:
                 save_resolution_histogram(
                     self._images_dir, step, self._val_resolutions,
