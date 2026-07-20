@@ -58,6 +58,7 @@ class RunEIBaseConfig(BaseModel):
     # ── Evaluation ──────────────────────────────────────────────────────────
     fsc_threshold: float = 0.143
     pixel_size_angstrom: float | None = None
+    save_fsc_curves: bool = True   # write the full per-shell FSC curve, not just the resolution
 
     # ── Pretrained init ──────────────────────────────────────────────────────
     pretrained_ckpt: str | None = None

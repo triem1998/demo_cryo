@@ -325,9 +325,10 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
 
             if rank == 0:
                 append_fsc_row(output_dir / "metrics" / "fsc.csv",
+                               curve=fsc_curve if cfg.save_fsc_curves else None,
                                mode="inference", regime="full", split="val",
                                checkpoint=ckpt_path.name, vol_idx=vol_idx,
-                               tomo=tomo_name, pixel_size=float(px),
+                               tomo=tomo_name, pixel_size=float(px), n_ref=D,
                                fsc_threshold=cfg.fsc_threshold,
                                fsc_shell=int(k), fsc_res_angstrom=float(res))
 

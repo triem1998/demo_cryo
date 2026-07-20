@@ -57,6 +57,7 @@ class BaseTrainer(dinv.Trainer):
         # FSC eval (EIFullTrainer)
         self._fsc_threshold: float = 0.143
         self._fsc_split: str = "val"
+        self._save_fsc_curves: bool = True
         self._val_pixel_sizes: list = []
         self._val_resolutions: list = []
         self._val_vol_idx: int = 0
@@ -252,8 +253,10 @@ class EIFullTrainer(BaseTrainer):
                     else f"vol{vol_idx:02d}")
             if self._is_rank0 and self._metrics_dir is not None:
                 append_fsc_row(self._metrics_dir / "fsc_per_volume.csv",
+                               curve=fsc_curve if self._save_fsc_curves else None,
                                mode="train", regime="full", split=self._fsc_split,
-                               epoch=epoch, vol_idx=vol_idx, tomo=name, pixel_size=px,
+                               epoch=epoch, vol_idx=vol_idx, tomo=name,
+                               pixel_size=px, n_ref=D,
                                fsc_threshold=self._fsc_threshold,
                                fsc_shell=int(k), fsc_res_angstrom=float(res))
 

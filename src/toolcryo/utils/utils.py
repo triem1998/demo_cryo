@@ -61,14 +61,22 @@ def append_metrics_row(path: Path | str, row: dict) -> None:
 
 
 # Shared column set so every FSC CSV (train/inference, full/patch) concatenates.
+# fsc_curve holds the full per-shell curve as a JSON array string (index = shell);
+# resolution per shell is n_ref * pixel_size / shell, derived at plot time.
 FSC_CSV_COLUMNS = [
     "mode", "regime", "split", "epoch", "checkpoint", "vol_idx", "tomo",
-    "pixel_size", "fsc_threshold", "fsc_shell", "fsc_res_angstrom",
+    "pixel_size", "n_ref", "fsc_threshold", "fsc_shell", "fsc_res_angstrom",
+    "fsc_curve",
 ]
 
 
-def append_fsc_row(path: Path | str, **fields) -> None:
-    """Append one per-volume FSC record, padded to FSC_CSV_COLUMNS."""
+def append_fsc_row(path: Path | str, curve=None, **fields) -> None:
+    """Append one per-volume FSC record, padded to FSC_CSV_COLUMNS.
+
+    Pass ``curve`` (the per-shell FSC array) to fill ``fsc_curve`` as JSON.
+    """
+    if curve is not None:
+        fields["fsc_curve"] = json.dumps([round(float(v), 4) for v in curve])
     append_metrics_row(path, {c: fields.get(c, "") for c in FSC_CSV_COLUMNS})
 
 
