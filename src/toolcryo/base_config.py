@@ -1,4 +1,4 @@
-"""Shared base config and physics builder — imported by run.py and inference modules."""
+"""Shared base config — imported by run.py and inference modules."""
 from __future__ import annotations
 
 import datetime as dt
@@ -6,12 +6,14 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict
 
-from .physics import MissingWedge
-
 
 class RunEIBaseConfig(BaseModel):
     """Fields shared across all training and inference configs."""
     model_config = ConfigDict(extra="ignore")
+
+    # ── Method ──────────────────────────────────────────────────────────────
+    # Selects the (physics, model, losses) builder triple from method/registry.py.
+    preset: str = "missingwedge_ei"
 
     # ── Data ────────────────────────────────────────────────────────────────
     input_dir: str = "./dataset/empiar-11058"
@@ -77,15 +79,3 @@ class RunEIBaseConfig(BaseModel):
         output_root = general.get("output_root", "./runs")
         flat["output_dir"] = str(Path(output_root) / f"{run_name}_{timestamp}")
         return flat
-
-
-def _build_physics(cfg: RunEIBaseConfig, crop_size: int, device) -> MissingWedge:
-    return MissingWedge(
-        tilt_max=float(cfg.tilt_max), tilt_min=float(cfg.tilt_min),
-        crop_size=crop_size,
-        use_spherical_support=bool(cfg.use_spherical_support),
-        wedge_double_size=bool(cfg.wedge_double_size),
-        wedge_low_support=float(cfg.wedge_low_support),
-        ref_wedge_support=float(cfg.ref_wedge_support),
-        device=str(device),
-    ).to(device)

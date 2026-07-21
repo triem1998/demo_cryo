@@ -24,8 +24,9 @@ import numpy as np
 import torch
 from deepinv.distributed import DistributedContext, distribute
 
-from ..base_config import RunEIBaseConfig, _build_physics
+from ..base_config import RunEIBaseConfig
 from ..dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
+from ..method.registry import get_preset
 from ..utils.utils import (
     GpuFSC,
     append_fsc_row,
@@ -34,7 +35,6 @@ from ..utils.utils import (
     _read_pixel_sizes,
     _save_mrc,
     fsc_resolution,
-    build_ei_model,
     dump_config_json,
     ensure_dir,
     seed_everything,
@@ -164,10 +164,11 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
             vol_size = _read_mrc_vol_size(val_ds.evn_paths[0])
             print(f"[inference] auto vol_size={vol_size}  (from {val_ds.evn_paths[0].name})", flush=True)
 
-        physics = _build_physics(cfg, vol_size, ctx.device)
+        preset = get_preset(cfg.preset)
+        physics = preset["physics"](cfg, vol_size, ctx.device)
 
         # Build model and load checkpoint before distribute — mirrors run_full
-        wrapper, model_info = build_ei_model(
+        wrapper, model_info = preset["model"](
             cfg.model_type, cfg.unet_dropout, cfg.drunet_sigma, ctx.device,
         )
 

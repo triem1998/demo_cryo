@@ -6,20 +6,20 @@ from pathlib import Path
 import torch
 from deepinv.distributed import DistributedContext, distribute
 
-from .base_config import RunEIBaseConfig, _build_physics
+from .base_config import RunEIBaseConfig
 from .dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders, _make_full_loader
 from .dataset.dataset_patch import (
     EIPatchDataConfig, build_ei_patch_dataloaders, extract_patches_at_positions,
 )
 from .inference.infer_patch import run_post_training_inference
-from .losses.losses import EqLoss, ObsLoss, _symmetrize_and_binarize
-from .losses.losses_custom import EqLoss as EqLossCustom, ObsLoss as ObsLossCustom
+from .losses.losses import _symmetrize_and_binarize
+from .method.registry import get_preset
 from .trainer import EIFullTrainer, EIPatchTrainer
 from .transform import Rotate3D
 from .utils.plot import plot_metrics
 from .utils.utils import (
     _read_mrc_vol_size, _read_pixel_sizes,
-    build_ei_model, dump_config_json, ensure_dir, seed_everything,
+    dump_config_json, ensure_dir, seed_everything,
 )
 
 
@@ -95,20 +95,6 @@ class RunEIPatchConfig(RunEIBaseConfig):
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _build_losses(cfg: RunEIBaseConfig, physics, transform) -> list:
-    if str(cfg.loss_type) == "custom":
-        return [
-            ObsLossCustom(physics, weight=1.0),
-            EqLossCustom(physics, transform, weight=float(cfg.eq_weight)),
-        ]
-    return [
-        ObsLoss(physics, weight=1.0,
-                use_fourier=False, view_as_real=True, no_window=False),
-        EqLoss(physics, transform, weight=float(cfg.eq_weight),
-               use_fourier=False, view_as_real=True, eq_use_direct=False, no_window=False),
-    ]
-
-
 def _configure_trainer(
     trainer,
     cfg: RunEIBaseConfig,
@@ -161,6 +147,8 @@ def run_full(cfg: RunEIFullConfig) -> None:
         fallback_tilt_max=cfg.tilt_max,
     )
 
+    preset = get_preset(cfg.preset)
+
     with DistributedContext(seed=int(cfg.seed), seed_offset=False, cleanup=True) as ctx:
         rank = int(ctx.rank)
 
@@ -174,10 +162,10 @@ def run_full(cfg: RunEIFullConfig) -> None:
             vol_size = _read_mrc_vol_size(first_path)
             print(f"[ei-full] auto vol_size={vol_size}  (from {first_path.name})", flush=True)
 
-        physics   = _build_physics(cfg, vol_size, ctx.device)
+        physics   = preset["physics"](cfg, vol_size, ctx.device)
         transform = Rotate3D(n_trans=1)
 
-        wrapper, model_info = build_ei_model(
+        wrapper, model_info = preset["model"](
             cfg.model_type, cfg.unet_dropout, cfg.drunet_sigma, ctx.device,
         )
 
@@ -210,7 +198,7 @@ def run_full(cfg: RunEIFullConfig) -> None:
                   f"overlap={cfg.overlap}  max_batch_size={cfg.max_batch_size}  "
                   f"checkpoint_batches={cfg.checkpoint_batches}", flush=True)
 
-        losses    = _build_losses(cfg, physics, transform)
+        losses    = preset["losses"](cfg, physics, transform)
         optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.learning_rate))
 
         # FSC eval targets val volumes; if none are paired (val empty/unpaired),
@@ -297,6 +285,8 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
         fallback_tilt_max=cfg.tilt_max,
     )
 
+    preset = get_preset(cfg.preset)
+
     with DistributedContext(seed=int(cfg.seed), seed_offset=False, cleanup=True) as ctx:
         rank = int(ctx.rank)
 
@@ -312,10 +302,10 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
             for p in val_ds.evn_paths:
                 print(f"  {p.parent.name} / {p.name}")
 
-        physics   = _build_physics(cfg, int(cfg.crop_size), ctx.device)
+        physics   = preset["physics"](cfg, int(cfg.crop_size), ctx.device)
         transform = Rotate3D(n_trans=1)
 
-        model, model_info = build_ei_model(
+        model, model_info = preset["model"](
             cfg.model_type, cfg.unet_dropout, cfg.drunet_sigma, ctx.device,
         )
 
@@ -346,7 +336,7 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
             print(f"[ei-patch] crop_size={cfg.crop_size}  batch_size={cfg.batch_size}  "
                   f"wedge_double_size={cfg.wedge_double_size}  eq_weight={cfg.eq_weight}", flush=True)
 
-        losses    = _build_losses(cfg, physics, transform)
+        losses    = preset["losses"](cfg, physics, transform)
         optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.learning_rate))
 
         trainer = EIPatchTrainer(

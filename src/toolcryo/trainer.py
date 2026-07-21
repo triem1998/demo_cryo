@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from .method.forward import ei_denoiser_forward
 from .utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
 from .utils.utils import (
     GpuFSC, PerfProbe, append_fsc_row, append_metrics_row, denoise_patches, fsc_resolution, half_set_recon,
@@ -71,14 +72,15 @@ class BaseTrainer(dinv.Trainer):
         self._patch_probes: list | None = None
         self._patch_probe_wedge = None
         self._patch_probe_dir: Path | None = None
+        # forward-pass strategy (how x_net/y_net are computed from a batch + physics)
+        self._forward_strategy = ei_denoiser_forward
 
     # ------------------------------------------------------------------
     # EI forward pass — f(EVN) and f(ODD) independently
     # ------------------------------------------------------------------
 
     def forward_pass(self, x, y, physics, train):
-        x_net = self.model_inference(y=x, physics=physics, x=y, train=train)
-        y_net = self.model_inference(y=y, physics=physics, x=x, train=train)
+        x_net, y_net = self._forward_strategy(self, x, y, physics, train)
         if train:
             self._last_train_xnet = x_net
             self._last_train_ynet = y_net

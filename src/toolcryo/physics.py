@@ -185,13 +185,18 @@ class MissingWedge(dinv.physics.LinearPhysics):
         in-place before the loss is computed.
 
         With batch_size > 1 (patch training), the DataLoader collates scalar tensors
-        into shape (B,). We reduce to a scalar by taking the mean across the batch
-        — all patches in a batch share the same physics.
+        into shape (B,). All patches in a batch share one physics, so we reduce to a
+        scalar by taking the *intersection* of the per-sample tilt ranges (max of
+        tilt_min, min of tilt_max) — the widest cone contained in every sample's own
+        wedge. This guarantees the shared wedge never marks a frequency "measured"
+        that some sample in the batch never actually measured; averaging or taking
+        the union would leak in frequencies with no data for at least one sample,
+        producing a wrong training signal (verified in scripts/test_wedge_aggregation.py).
         """
         if tilt_min is not None and tilt_max is not None:
             if hasattr(tilt_min, "numel") and tilt_min.numel() > 1:
-                tilt_min = tilt_min.float().mean()
-                tilt_max = tilt_max.float().mean()
+                tilt_min = tilt_min.float().max()
+                tilt_max = tilt_max.float().min()
             self.update_angles(float(tilt_min), float(tilt_max))
 
     def update_angles(self, tilt_min: float, tilt_max: float) -> None:

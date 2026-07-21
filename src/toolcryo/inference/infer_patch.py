@@ -22,6 +22,7 @@ from ..base_config import RunEIBaseConfig
 from ..dataset.dataset_patch import EIPatchDataConfig, build_ei_patch_dataloaders
 from ..physics import MissingWedge
 from ..losses.losses import _initialize_window, _symmetrize_and_binarize
+from ..method.registry import get_preset
 from ..utils.utils import (
     GpuFSC,
     append_fsc_row,
@@ -31,7 +32,6 @@ from ..utils.utils import (
     _save_mrc,
     _znorm,
     fsc_resolution,
-    build_ei_model,
     dump_config_json,
     ensure_dir,
     seed_everything,
@@ -538,7 +538,8 @@ def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
     if not val_ds.evn_paths:
         raise RuntimeError(f"No volumes found in {cfg.input_dir}.")
 
-    model, model_info = build_ei_model(
+    preset = get_preset(cfg.preset)
+    model, model_info = preset["model"](
         cfg.model_type, cfg.unet_dropout, cfg.drunet_sigma, device,
     )
 
