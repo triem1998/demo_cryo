@@ -19,14 +19,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import mrcfile
 import numpy as np
 import torch
 from deepinv.distributed import DistributedContext, distribute
 
 from ..base_config import RunEIBaseConfig
 from ..dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
-from ..method.registry import get_preset
+from ..registry import get_preset
 from ..utils.utils import (
     GpuFSC,
     append_fsc_row,
@@ -34,12 +33,29 @@ from ..utils.utils import (
     _read_mrc_vol_size,
     _read_pixel_sizes,
     _save_mrc,
+    _znorm,
     fsc_resolution,
     dump_config_json,
     ensure_dir,
+    load_mrc_volume,
+    recon_panels,
+    to_canonical_np,
     seed_everything,
 )
 from ..utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
+
+
+class _InferenceModel:
+    """Minimal shim so ``preset["forward"]`` (written for ``dinv.Trainer``)
+    can be called standalone, without a full Trainer instance."""
+
+    def __init__(self, model) -> None:
+        self.model = model
+
+    def model_inference(self, y, physics, x=None, train=False, **kwargs):
+        self.model.eval()
+        with torch.no_grad():
+            return self.model(y, physics, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +81,12 @@ class RunEIFullInferenceConfig(RunEIBaseConfig):
     max_batch_size: int | None = 2
     checkpoint_batches: str | int | None = "auto"
 
+    # ── Unrolled preset only (must match the training config) ────────────────
+    n_iter: int = 4
+    init_stepsize: float = 0.9
+    train_algo_params: bool = True
+    stepsize_learning_rate: float | None = None
+
     # ── Comparison volume globs (searched inside each tomo_* directory) ─────
     icecream_glob: str = "vol_*[Ii]cecream*"
     isonet_glob: str = "vol_*[Ii]so[Nn]et*"
@@ -85,13 +107,12 @@ class RunEIFullInferenceConfig(RunEIBaseConfig):
 def _load_mrc_vol(path: Path, target_shape: tuple | None = None) -> np.ndarray:
     """Load MRC, reorder axes, optional resample, centre-crop to cube, normalise.
 
-    Mirrors ``CryoEIFullDataset._load_and_prepare`` but returns a float32
-    numpy array of shape (D, H, W) instead of a tensor.
+    Returns a float32 numpy array in the canonical ``(Y, X, Z)`` order — the
+    same order used by ``target_shape`` and by every other figure column, for
+    both presets (unrolled reconstructions are brought back from astra order
+    by ``to_canonical_np`` before they reach the figure).
     """
-    with mrcfile.open(str(path), permissive=True, mode="r") as f:
-        vol_np = np.array(f.data, dtype=np.float32)   # (Z, Y, X)
-
-    vol = torch.from_numpy(np.moveaxis(vol_np, 0, 2))  # (D, H, W)
+    vol = torch.from_numpy(load_mrc_volume(path, order="native"))
 
     if target_shape is not None:
         vol = torch.nn.functional.interpolate(
@@ -132,6 +153,8 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
             flush=True,
         )
 
+    is_unrolled = cfg.preset == "unrolled"
+
     data_cfg = EIFullDataConfig(
         input_dir=cfg.input_dir,
         num_workers=int(cfg.num_workers),
@@ -145,6 +168,7 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
         target_shape=cfg.target_shape,
         fallback_tilt_min=cfg.tilt_min,
         fallback_tilt_max=cfg.tilt_max,
+        data_source="measurement" if is_unrolled else "fbp",
     )
 
     with DistributedContext(seed=int(cfg.seed), seed_offset=False, cleanup=True) as ctx:
@@ -157,52 +181,63 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
         if not val_ds.evn_paths:
             raise RuntimeError(f"No volumes found in {cfg.input_dir} — check input_dir and globs.")
 
-        if cfg.target_shape is not None:
-            vol_size = int(min(cfg.target_shape))
-            print(f"[inference] target_shape={cfg.target_shape} → physics crop_size={vol_size}", flush=True)
-        else:
-            vol_size = _read_mrc_vol_size(val_ds.evn_paths[0])
-            print(f"[inference] auto vol_size={vol_size}  (from {val_ds.evn_paths[0].name})", flush=True)
-
-        preset = get_preset(cfg.preset)
-        physics = preset["physics"](cfg, vol_size, ctx.device)
-
-        # Build model and load checkpoint before distribute — mirrors run_full
-        wrapper, model_info = preset["model"](
-            cfg.model_type, cfg.unet_dropout, cfg.drunet_sigma, ctx.device,
-        )
-
         ckpt_path = Path(cfg.checkpoint_path)
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-        ckpt = torch.load(str(ckpt_path), map_location=ctx.device, weights_only=True)
-        state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
-        if any(k.startswith("module.") for k in state):
-            state = {k.removeprefix("module."): v for k, v in state.items()}
-            if rank == 0:
-                print("[inference] stripped 'module.' prefix from checkpoint keys", flush=True)
-        if any(k.startswith("processor.") for k in state):
-            state = {k.removeprefix("processor."): v for k, v in state.items()}
-            if rank == 0:
-                print("[inference] stripped 'processor.' prefix from checkpoint keys", flush=True)
-        wrapper.load_state_dict(state, strict=True)
+        preset = get_preset(cfg.preset)
 
-        backbone = distribute(wrapper, ctx, type_object="denoiser",
-                              patch_size=tuple(int(v) for v in cfg.patch_size),
-                              overlap=tuple(int(v) for v in cfg.overlap),
-                              tiling_dims=(-3, -2, -1),
-                              max_batch_size=cfg.max_batch_size,
-                              checkpoint_batches=cfg.checkpoint_batches)
-        backbone.eval()
+        if is_unrolled:
+            # physics/model take the val volumes' paths / a TomographyEMPair
+            # container, not crop_size — mirrors run_full's is_unrolled branch
+            # (run.py). preset["model"] (build_unrolled_model) loads the
+            # checkpoint (denoiser+stepsize+g_param) and tiles the denoiser
+            # internally, so no separate load/distribute code is needed here.
+            physics = preset["physics"](cfg, val_ds.evn_paths, val_ds.odd_paths, ctx.device, ctx)
+            cfg.pretrained_ckpt = str(ckpt_path)
+            model, model_info = preset["model"](cfg, physics, ctx)
+        else:
+            if cfg.target_shape is not None:
+                vol_size = int(min(cfg.target_shape))
+                print(f"[inference] target_shape={cfg.target_shape} → physics crop_size={vol_size}", flush=True)
+            else:
+                vol_size = _read_mrc_vol_size(val_ds.evn_paths[0])
+                print(f"[inference] auto vol_size={vol_size}  (from {val_ds.evn_paths[0].name})", flush=True)
+
+            physics = preset["physics"](cfg, vol_size, ctx.device)
+
+            # Build model and load checkpoint before distribute — mirrors run_full
+            wrapper, model_info = preset["model"](
+                cfg.model_type, cfg.unet_dropout, cfg.drunet_sigma, ctx.device,
+            )
+
+            ckpt = torch.load(str(ckpt_path), map_location=ctx.device, weights_only=True)
+            state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
+            if any(k.startswith("module.") for k in state):
+                state = {k.removeprefix("module."): v for k, v in state.items()}
+                if rank == 0:
+                    print("[inference] stripped 'module.' prefix from checkpoint keys", flush=True)
+            if any(k.startswith("processor.") for k in state):
+                state = {k.removeprefix("processor."): v for k, v in state.items()}
+                if rank == 0:
+                    print("[inference] stripped 'processor.' prefix from checkpoint keys", flush=True)
+            wrapper.load_state_dict(state, strict=True)
+
+            model = distribute(wrapper, ctx, type_object="denoiser",
+                                patch_size=tuple(int(v) for v in cfg.patch_size),
+                                overlap=tuple(int(v) for v in cfg.overlap),
+                                tiling_dims=(-3, -2, -1),
+                                max_batch_size=cfg.max_batch_size,
+                                checkpoint_batches=cfg.checkpoint_batches)
+        model.eval()
 
         pixel_sizes = _read_pixel_sizes(val_ds.evn_paths, fallback=cfg.pixel_size_angstrom)
 
         if rank == 0:
-            n_params = sum(p.numel() for p in backbone.parameters())
+            n_params = sum(p.numel() for p in model.parameters())
             print(
                 f"[inference] loaded checkpoint {ckpt_path.name}  "
-                f"model={model_info}  params={n_params:,}  vol_size={vol_size}",
+                f"model={model_info}  params={n_params:,}",
                 flush=True,
             )
 
@@ -211,26 +246,28 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
         gpu_fsc: GpuFSC | None = None
         results: list[dict] = []
 
-        for vol_idx, (evn, odd, tilt_params) in enumerate(val_loader):
-            evn = evn.to(ctx.device)   # (1, 1, D, H, W)
+        for vol_idx, (evn, odd, batch_params) in enumerate(val_loader):
+            evn = evn.to(ctx.device)   # unrolled: (1,1,V,A,N) sinogram; else (1,1,D,H,W) volume
             odd = odd.to(ctx.device)
 
-            physics.update_parameters(
-                tilt_min=tilt_params["tilt_min"],
-                tilt_max=tilt_params["tilt_max"],
-            )
-            if rank == 0 and vol_idx == 0:
-                print(
-                    f"[physics] vol={vol_idx}  "
-                    f"tilt_min={float(tilt_params['tilt_min']):.1f}°  "
-                    f"tilt_max={float(tilt_params['tilt_max']):.1f}°",
-                    flush=True,
+            if is_unrolled:
+                physics.update(tomo_idx=batch_params["tomo_idx"])
+            else:
+                physics.update_parameters(
+                    tilt_min=batch_params["tilt_min"],
+                    tilt_max=batch_params["tilt_max"],
                 )
+                if rank == 0 and vol_idx == 0:
+                    print(
+                        f"[physics] vol={vol_idx}  "
+                        f"tilt_min={float(batch_params['tilt_min']):.1f}°  "
+                        f"tilt_max={float(batch_params['tilt_max']):.1f}°",
+                        flush=True,
+                    )
 
+            f_evn_t, f_odd_t = preset["forward"](_InferenceModel(model), evn, odd, physics, train=False)
             with torch.no_grad():
-                f_evn_t = backbone(evn)
-                f_odd_t = backbone(odd)
-                recon_t = 0.5 * (backbone(physics.A(f_evn_t)) + backbone(physics.A(f_odd_t)))
+                recon_t = preset["recon"](model, physics, f_evn_t, f_odd_t)
 
             if hasattr(ctx.device, "type") and ctx.device.type == "cuda":
                 torch.cuda.synchronize()
@@ -255,9 +292,13 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
                 )
 
             # ── numpy conversion ──────────────────────────────────────────────
-            evn_np   = evn.squeeze().cpu().numpy()
-            odd_np   = odd.squeeze().cpu().numpy()
-            recon_np = recon_t.squeeze().cpu().numpy()
+            # For unrolled, evn/odd are sinograms — recon_panels swaps in the
+            # FBP init volumes instead (same convention as EIFullTrainer).
+            evn_np, odd_np, evn_odd_labels = recon_panels(evn, odd, physics)
+            # Canonical (Y, X, Z) from here on — this feeds both the figure and
+            # _save_mrc, which assumes canonical and would otherwise write a
+            # mis-oriented MRC for the unrolled preset.
+            recon_np = to_canonical_np(recon_t.squeeze().cpu().numpy(), physics)
 
             # ── IsoNet / IceCream comparison volumes ──────────────────────────
             tomo_dir      = val_ds.evn_paths[vol_idx].parent
@@ -287,8 +328,13 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
 
             if rank == 0:
                 # ── Figure: methods — EVN | ODD | IsoNet | IceCream | ours ──
-                methods_cols   = [evn_np, odd_np, isonet_np, icecream_np, recon_np]
-                methods_labels = ["EVN",  "ODD",  "IsoNet",  "IceCream",  "ours"]
+                # _znorm(recon_np): save_slice_figure shares one vmin/vmax per row
+                # across all columns, and every other column is already z-scored
+                # (recon_panels / _load_mrc_vol). An un-normalised column would be
+                # rendered with the others' range and come out flat grey. Applied
+                # here, not to recon_np itself — that is also written to MRC below.
+                methods_cols   = [evn_np, odd_np, isonet_np, icecream_np, _znorm(recon_np)]
+                methods_labels = [*evn_odd_labels, "IsoNet", "IceCream", "ours"]
                 valid_pairs = [(v, lbl) for v, lbl in zip(methods_cols, methods_labels) if v is not None]
                 valid_cols, valid_labels = zip(*valid_pairs) if valid_pairs else ([], [])
                 save_slice_figure(

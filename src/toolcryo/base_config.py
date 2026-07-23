@@ -12,7 +12,7 @@ class RunEIBaseConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     # ── Method ──────────────────────────────────────────────────────────────
-    # Selects the (physics, model, losses) builder triple from method/registry.py.
+    # Selects the (physics, model, losses) builder triple from registry.py.
     preset: str = "missingwedge_ei"
 
     # ── Data ────────────────────────────────────────────────────────────────
@@ -51,6 +51,11 @@ class RunEIBaseConfig(BaseModel):
 
     # ── Mixed precision ──────────────────────────────────────────────────────
     use_mixed_precision: bool = True
+    # "fp16" (default, unchanged behaviour + GradScaler) or "bf16". bf16 has
+    # fp32's dynamic range, so it needs no loss scaling and cannot overflow —
+    # use it for the unrolled/full preset, whose large native-resolution
+    # gradients overflow fp16's 65504 ceiling.
+    mixed_precision_dtype: str = "fp16"
 
     # ── Model ───────────────────────────────────────────────────────────────
     model_type: str = "unet"

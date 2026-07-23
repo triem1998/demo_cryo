@@ -5,8 +5,8 @@ Three checks, at native resolution (each saves a comparison figure):
   - pipeline: fbp(A(icecream))     vs. icecream itself (clean round-trip demo)
   - backward: fbp(real split1_ts)  vs. vol_<tag>_split1_fbp_float16.mrc (true IMOD reference)
 
-Uses the axis/sign convention calibrated for this repo's (D, H, W) volumes
-(tilt axis = native axis 0, rotation sign = -1; see AXIS_ORDER/ANGLE_SIGN).
+Uses the axis/sign convention calibrated for this repo's volumes (tilt axis = Y,
+loaded first by load_volume; rotation sign = -1, see ANGLE_SIGN).
 
 
 
@@ -26,6 +26,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from toolcryo.physics import TomographyEM  # noqa: E402
+from toolcryo.utils.utils import load_mrc_volume  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATASET_DIR = REPO_ROOT / "dataset" / "empiar-11830" / "tomo_001"
@@ -34,21 +35,20 @@ OUT_DIR = REPO_ROOT / "runs" / "physics_test"
 DEVICE = "cuda"
 
 # Calibrated once in an earlier axis/sign search (see git history of this
-# script) — the tilt axis is the volume's first native axis (D).
-AXIS_ORDER = (0, 2, 1)
+# script). The axis half of that calibration now lives in the loaders below,
+# which read straight into astra's (Y, Z, X) order — TomographyEM no longer
+# permutes internally (see src/toolcryo/physics/tomography.py).
 ANGLE_SIGN = -1.0
 
 
 # ---------------------------------------------------------------------------
-# Data loading — mirrors the (Z,Y,X) -> (Y,X,Z) = (D,H,W) convention used by
-# CryoEIFullDataset._load_and_prepare in src/toolcryo/dataset/dataset_full.py
+# Data loading — same (Z,Y,X) -> (Y,Z,X) convention the package uses, via the
+# shared helper (utils.utils.load_mrc_volume)
 # ---------------------------------------------------------------------------
 
-def load_native_volume(path: Path) -> torch.Tensor:
-    with mrcfile.open(str(path), permissive=True, mode="r") as mrc:
-        data = np.asarray(mrc.data, dtype=np.float32)  # (nz, ny, nx)
-    vol = np.moveaxis(data, 0, 2)  # (ny, nx, nz) = (D, H, W)
-    return torch.from_numpy(np.ascontiguousarray(vol))
+def load_volume(path: Path) -> torch.Tensor:
+    # (ny, nz, nx) = astra (n_slices, n_rows, n_cols)
+    return torch.from_numpy(load_mrc_volume(path, order="astra"))
 
 
 def load_tilt_series(path: Path) -> torch.Tensor:
@@ -261,7 +261,7 @@ def run(
     split1_ts_path: Path,
     split1_fbp_path: Path,
 ) -> None:
-    icecream_vol = load_native_volume(vol_path).to(DEVICE)
+    icecream_vol = load_volume(vol_path).to(DEVICE)
     real_ts = load_tilt_series(ts_path).to(DEVICE)
     print(f"  volume {tuple(icecream_vol.shape)}   tilt series {tuple(real_ts.shape)}")
 
@@ -269,7 +269,6 @@ def run(
     op = TomographyEM(
         volume_shape=tuple(icecream_vol.shape),
         angles_deg=angles_deg,
-        axis_order=AXIS_ORDER,
         detector_shape=detector_shape,
         angle_sign=ANGLE_SIGN,
         device=DEVICE,
@@ -286,7 +285,7 @@ def run(
     torch.cuda.empty_cache()
 
     split1_ts = load_tilt_series(split1_ts_path).to(DEVICE)
-    reference_fbp_vol = load_native_volume(split1_fbp_path)  # stays on CPU: only used for comparison
+    reference_fbp_vol = load_volume(split1_fbp_path)  # stays on CPU: only used for comparison
     check_backward(op, reference_fbp_vol, split1_ts, save_fig=True)
 
     del split1_ts, reference_fbp_vol, op
