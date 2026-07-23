@@ -1,8 +1,9 @@
 import torch
+from deepinv.models.base import Denoiser
 from .unet3d_bf import UNet3D as UNet3D
 
 
-class IceCreamUNetWrapper(torch.nn.Module):
+class IceCreamUNetWrapper(Denoiser):
     """Wraps icecream's UNet3D so deepinv's model_inference(y, physics) works.
 
     deepinv calls model(y, physics) — the physics object would land on
@@ -10,10 +11,10 @@ class IceCreamUNetWrapper(torch.nn.Module):
     absorbs physics (and any other deepinv kwargs) and forwards only the
     tensor to the underlying UNet.
 
-    Also used with deepinv's distribute(): pass type_object="denoiser" so
-    distribute accepts a non-Denoiser nn.Module, then wrap the backbone with
-    this class so each tiled patch call ignores the physics arg forwarded
-    by DistributedProcessing._apply_op.
+    Both presets tile this wrapper with ``distribute(..., type_object="denoiser")``
+    — missingwedge_ei on the bare wrapper, unrolled on ``prior.denoiser`` inside
+    the PGD. deepinv's tiling *only* activates when the target is a
+    ``deepinv.models.base.Denoiser`` instance, so this class must subclass it.
     """
 
     def __init__(self, unet: torch.nn.Module) -> None:

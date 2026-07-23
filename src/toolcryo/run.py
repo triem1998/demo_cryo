@@ -6,20 +6,20 @@ from pathlib import Path
 import torch
 from deepinv.distributed import DistributedContext, distribute
 
-from .base_config import RunEIBaseConfig, _build_physics
+from .base_config import RunEIBaseConfig
 from .dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders, _make_full_loader
 from .dataset.dataset_patch import (
     EIPatchDataConfig, build_ei_patch_dataloaders, extract_patches_at_positions,
 )
 from .inference.infer_patch import run_post_training_inference
-from .losses.losses import EqLoss, ObsLoss, _symmetrize_and_binarize
-from .losses.losses_custom import EqLoss as EqLossCustom, ObsLoss as ObsLossCustom
+from .losses.losses import _symmetrize_and_binarize
+from .registry import get_preset
 from .trainer import EIFullTrainer, EIPatchTrainer
 from .transform import Rotate3D
 from .utils.plot import plot_metrics
 from .utils.utils import (
     _read_mrc_vol_size, _read_pixel_sizes,
-    build_ei_model, dump_config_json, ensure_dir, seed_everything,
+    dump_config_json, ensure_dir, seed_everything,
 )
 
 
@@ -46,6 +46,16 @@ class RunEIFullConfig(RunEIBaseConfig):
     # ── Training ────────────────────────────────────────────────────────────
     num_epochs: int = 10
     grad_accumulation_steps: int = 4
+
+    # ── Unrolled preset only ───────────────────────────────────────────────
+    n_iter: int = 4
+    init_stepsize: float = 0.9
+    # Trains `stepsize` (+ `g_param` for drunet only) jointly with the
+    # denoiser (models.py::build_unrolled_model). No beta/relaxation.
+    train_algo_params: bool = True
+    # LR for the stepsize param group when train_algo_params — None falls
+    # back to `learning_rate` (used for the denoiser + g_param).
+    stepsize_learning_rate: float | None = None
 
     # ── Evaluation ──────────────────────────────────────────────────────────
     eval_fsc: bool = True
@@ -95,20 +105,6 @@ class RunEIPatchConfig(RunEIBaseConfig):
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _build_losses(cfg: RunEIBaseConfig, physics, transform) -> list:
-    if str(cfg.loss_type) == "custom":
-        return [
-            ObsLossCustom(physics, weight=1.0),
-            EqLossCustom(physics, transform, weight=float(cfg.eq_weight)),
-        ]
-    return [
-        ObsLoss(physics, weight=1.0,
-                use_fourier=False, view_as_real=True, no_window=False),
-        EqLoss(physics, transform, weight=float(cfg.eq_weight),
-               use_fourier=False, view_as_real=True, eq_use_direct=False, no_window=False),
-    ]
-
-
 def _configure_trainer(
     trainer,
     cfg: RunEIBaseConfig,
@@ -130,9 +126,9 @@ def _configure_trainer(
     trainer._grad_accum_steps   = max(1, int(cfg.grad_accumulation_steps))
     trainer.ckp_interval        = int(cfg.ckp_interval)
     if cfg.use_mixed_precision:
-        trainer._enable_mixed_precision()
+        trainer._enable_mixed_precision(dtype=cfg.mixed_precision_dtype)
         if rank == 0:
-            print("[ei] mixed precision enabled", flush=True)
+            print(f"[ei] mixed precision enabled ({cfg.mixed_precision_dtype})", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +140,12 @@ def run_full(cfg: RunEIFullConfig) -> None:
 
     output_dir = ensure_dir(cfg.output_dir)
     dump_config_json(output_dir / "config.json", cfg.model_dump())
+
+    # `preset` is the single switch between the two full-volume methods —
+    # data_source follows it automatically ("measurement": real split1/split2
+    # tilt series for unrolled; "fbp": precomputed FBP volumes for
+    # missingwedge_ei) so nothing else needs to change in sync.
+    is_unrolled = cfg.preset == "unrolled"
 
     data_cfg = EIFullDataConfig(
         input_dir=cfg.input_dir,
@@ -159,76 +161,115 @@ def run_full(cfg: RunEIFullConfig) -> None:
         target_shape=cfg.target_shape,
         fallback_tilt_min=cfg.tilt_min,
         fallback_tilt_max=cfg.tilt_max,
+        data_source="measurement" if is_unrolled else "fbp",
     )
+
+    preset = get_preset(cfg.preset)
 
     with DistributedContext(seed=int(cfg.seed), seed_offset=False, cleanup=True) as ctx:
         rank = int(ctx.rank)
 
         data_bundle = build_ei_full_dataloaders(data_cfg)
+        train_ds = data_bundle.train_loader.dataset
+        val_ds   = data_bundle.val_loader.dataset
 
-        if cfg.target_shape is not None:
-            vol_size = int(min(cfg.target_shape))
-            print(f"[ei-full] target_shape={cfg.target_shape} → physics crop_size={vol_size}", flush=True)
+        if is_unrolled:
+            # Non-uniform vs missingwedge_ei: physics/model take the training
+            # volume's paths / a TomographyEMPair container, not crop_size.
+            # No cropping (an in-plane crop would bias the real sinogram).
+            # Physics is built eagerly for the first training volume and lazily
+            # rebuilt per-tomogram by TomographyEMPair.update() — combined
+            # train+val path lists so FSC eval can rebuild physics for
+            # whichever volume the current batch is (CryoEIFullDataset.index_offset).
+            physics = preset["physics"](
+                cfg, train_ds.evn_paths + val_ds.evn_paths, train_ds.odd_paths + val_ds.odd_paths, ctx.device, ctx)
+            transform = None  # no equivariance term in v1
+
+            # preset["model"] (models.py::build_unrolled_model) tiles the
+            # denoiser across ranks; the physics is not distributed — each rank
+            # runs the full operator.
+            model, model_info = preset["model"](cfg, physics, ctx)
         else:
-            first_path = data_bundle.train_loader.dataset.evn_paths[0]
-            vol_size = _read_mrc_vol_size(first_path)
-            print(f"[ei-full] auto vol_size={vol_size}  (from {first_path.name})", flush=True)
+            if cfg.target_shape is not None:
+                vol_size = int(min(cfg.target_shape))
+                print(f"[ei-full] target_shape={cfg.target_shape} → physics crop_size={vol_size}", flush=True)
+            else:
+                first_path = train_ds.evn_paths[0]
+                vol_size = _read_mrc_vol_size(first_path)
+                print(f"[ei-full] auto vol_size={vol_size}  (from {first_path.name})", flush=True)
 
-        physics   = _build_physics(cfg, vol_size, ctx.device)
-        transform = Rotate3D(n_trans=1)
+            physics   = preset["physics"](cfg, vol_size, ctx.device)
+            transform = Rotate3D(n_trans=1)
 
-        wrapper, model_info = build_ei_model(
-            cfg.model_type, cfg.unet_dropout, cfg.drunet_sigma, ctx.device,
-        )
+            wrapper, model_info = preset["model"](
+                cfg.model_type, cfg.unet_dropout, cfg.drunet_sigma, ctx.device,
+            )
 
-        if cfg.pretrained_ckpt is not None:
-            ckpt = torch.load(cfg.pretrained_ckpt, map_location=ctx.device, weights_only=True)
-            state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
-            if any(k.startswith("module.") for k in state):
-                state = {k.removeprefix("module."): v for k, v in state.items()}
+            if cfg.pretrained_ckpt is not None:
+                ckpt = torch.load(cfg.pretrained_ckpt, map_location=ctx.device, weights_only=True)
+                state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
+                if any(k.startswith("module.") for k in state):
+                    state = {k.removeprefix("module."): v for k, v in state.items()}
+                    if rank == 0:
+                        print("[ei-full] stripped 'module.' prefix from checkpoint keys", flush=True)
+                if any(k.startswith("processor.") for k in state):
+                    state = {k.removeprefix("processor."): v for k, v in state.items()}
+                    if rank == 0:
+                        print("[ei-full] stripped 'processor.' prefix from checkpoint keys", flush=True)
+                wrapper.load_state_dict(state, strict=True)
                 if rank == 0:
-                    print("[ei-full] stripped 'module.' prefix from checkpoint keys", flush=True)
-            if any(k.startswith("processor.") for k in state):
-                state = {k.removeprefix("processor."): v for k, v in state.items()}
-                if rank == 0:
-                    print("[ei-full] stripped 'processor.' prefix from checkpoint keys", flush=True)
-            wrapper.load_state_dict(state, strict=True)
+                    print(f"[ei-full] loaded pretrained weights from {cfg.pretrained_ckpt}", flush=True)
+
+            model = distribute(wrapper, ctx, type_object="denoiser",
+                               patch_size=tuple(int(v) for v in cfg.patch_size),
+                               overlap=tuple(int(v) for v in cfg.overlap),
+                               tiling_dims=(-3, -2, -1),
+                               max_batch_size=cfg.max_batch_size,
+                               checkpoint_batches=cfg.checkpoint_batches)
+
             if rank == 0:
-                print(f"[ei-full] loaded pretrained weights from {cfg.pretrained_ckpt}", flush=True)
-
-        model = distribute(wrapper, ctx, type_object="denoiser",
-                           patch_size=tuple(int(v) for v in cfg.patch_size),
-                           overlap=tuple(int(v) for v in cfg.overlap),
-                           tiling_dims=(-3, -2, -1),
-                           max_batch_size=cfg.max_batch_size,
-                           checkpoint_batches=cfg.checkpoint_batches)
+                print(f"[ei-full] vol_size={vol_size}  patch_size={cfg.patch_size}  "
+                      f"overlap={cfg.overlap}  max_batch_size={cfg.max_batch_size}  "
+                      f"checkpoint_batches={cfg.checkpoint_batches}", flush=True)
 
         if rank == 0:
             n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             print(f"[ei-full] model={model_info}  params={n_params:,}", flush=True)
-            print(f"[ei-full] vol_size={vol_size}  patch_size={cfg.patch_size}  "
-                  f"overlap={cfg.overlap}  max_batch_size={cfg.max_batch_size}  "
-                  f"checkpoint_batches={cfg.checkpoint_batches}", flush=True)
 
-        losses    = _build_losses(cfg, physics, transform)
-        optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.learning_rate))
+        losses = preset["losses"](cfg, physics, transform)
+        if is_unrolled and cfg.train_algo_params:
+            # Split stepsize into its own param group so it can use a
+            # different LR (cfg.stepsize_learning_rate) than the denoiser +
+            # g_param (cfg.learning_rate) — falls back to sharing
+            # cfg.learning_rate when unset.
+            stepsize_params = list(model.params_algo["stepsize"])
+            stepsize_ids = {id(p) for p in stepsize_params}
+            other_params = [p for p in model.parameters() if id(p) not in stepsize_ids]
+            stepsize_lr = (float(cfg.stepsize_learning_rate)
+                           if cfg.stepsize_learning_rate is not None else float(cfg.learning_rate))
+            optimizer = torch.optim.Adam([
+                {"params": other_params, "lr": float(cfg.learning_rate)},
+                {"params": stepsize_params, "lr": stepsize_lr},
+            ])
+        else:
+            optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.learning_rate))
 
         # FSC eval targets val volumes; if none are paired (val empty/unpaired),
         # fall back to running it on the train volumes instead.
-        val_ds       = data_bundle.val_loader.dataset
         n_paired_val = sum(1 for p in val_ds.odd_paths if p is not None)
         if n_paired_val > 0:
             fsc_loader, fsc_ds, fsc_label = data_bundle.val_loader, val_ds, "val"
         else:
-            fsc_ds     = data_bundle.train_loader.dataset
+            fsc_ds     = train_ds
             fsc_loader = _make_full_loader(fsc_ds, shuffle=False, cfg=data_cfg)
             fsc_label  = "train"
-        n_paired_fsc = sum(1 for p in fsc_ds.odd_paths if p is not None)
+        n_paired_fsc    = sum(1 for p in fsc_ds.odd_paths if p is not None)
+        eval_dataloader = fsc_loader if n_paired_fsc > 0 else None
 
         trainer = EIFullTrainer(
             model=model, physics=physics, optimizer=optimizer,
             train_dataloader=data_bundle.train_loader,
-            eval_dataloader=fsc_loader if n_paired_fsc > 0 else None,
+            eval_dataloader=eval_dataloader,
             epochs=int(cfg.num_epochs), losses=losses, metrics=[],
             online_measurements=False, device=ctx.device, save_path=None,
             ckp_interval=int(cfg.ckp_interval), eval_interval=int(cfg.eval_interval),
@@ -239,6 +280,9 @@ def run_full(cfg: RunEIFullConfig) -> None:
         _configure_trainer(trainer, cfg, output_dir, rank,
                            images_subdir=f"{fsc_label}_fsc_images" if fsc_label == "train" else "val_images",
                            train_images_subdir="train_images")
+        trainer._forward_strategy = preset["forward"]
+        trainer._post_optimizer_step = lambda: preset["post_optimizer_step"](model)
+        trainer._recon_strategy      = preset["recon"]
         trainer._fsc_tomo_names  = [p.parent.name for p in fsc_ds.evn_paths]
         trainer._fsc_split       = fsc_label
         trainer._save_fsc_curves = bool(cfg.save_fsc_curves)
@@ -263,9 +307,14 @@ def run_full(cfg: RunEIFullConfig) -> None:
 
         if rank == 0 and trainer._ckpt_dir is not None:
             ckpt_path = Path(trainer._ckpt_dir) / "ckp_final.pth"
+            # .processor is added by distribute() on a bare denoiser
+            # (missingwedge_ei). For unrolled, trainer.model stays the PGD
+            # object itself, with only its internal denoiser replaced by a
+            # distributed (tiled) wrapper.
+            raw_model = trainer.model.processor if hasattr(trainer.model, "processor") else trainer.model
             torch.save({
                 "epoch": cfg.num_epochs,
-                "model_state_dict": trainer.model.processor.state_dict(),
+                "model_state_dict": raw_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
             }, ckpt_path)
             print(f"[ckpt] saved final {ckpt_path}", flush=True)
@@ -297,6 +346,8 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
         fallback_tilt_max=cfg.tilt_max,
     )
 
+    preset = get_preset(cfg.preset)
+
     with DistributedContext(seed=int(cfg.seed), seed_offset=False, cleanup=True) as ctx:
         rank = int(ctx.rank)
 
@@ -312,10 +363,10 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
             for p in val_ds.evn_paths:
                 print(f"  {p.parent.name} / {p.name}")
 
-        physics   = _build_physics(cfg, int(cfg.crop_size), ctx.device)
+        physics   = preset["physics"](cfg, int(cfg.crop_size), ctx.device)
         transform = Rotate3D(n_trans=1)
 
-        model, model_info = build_ei_model(
+        model, model_info = preset["model"](
             cfg.model_type, cfg.unet_dropout, cfg.drunet_sigma, ctx.device,
         )
 
@@ -346,7 +397,7 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
             print(f"[ei-patch] crop_size={cfg.crop_size}  batch_size={cfg.batch_size}  "
                   f"wedge_double_size={cfg.wedge_double_size}  eq_weight={cfg.eq_weight}", flush=True)
 
-        losses    = _build_losses(cfg, physics, transform)
+        losses    = preset["losses"](cfg, physics, transform)
         optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.learning_rate))
 
         trainer = EIPatchTrainer(

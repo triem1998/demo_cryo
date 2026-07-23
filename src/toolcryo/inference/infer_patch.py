@@ -13,7 +13,6 @@ import csv
 import time
 from pathlib import Path
 
-import mrcfile
 import numpy as np
 import torch
 import torch.nn as nn
@@ -22,6 +21,7 @@ from ..base_config import RunEIBaseConfig
 from ..dataset.dataset_patch import EIPatchDataConfig, build_ei_patch_dataloaders
 from ..physics import MissingWedge
 from ..losses.losses import _initialize_window, _symmetrize_and_binarize
+from ..registry import get_preset
 from ..utils.utils import (
     GpuFSC,
     append_fsc_row,
@@ -31,9 +31,9 @@ from ..utils.utils import (
     _save_mrc,
     _znorm,
     fsc_resolution,
-    build_ei_model,
     dump_config_json,
     ensure_dir,
+    load_mrc_volume,
     seed_everything,
 )
 from ..utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
@@ -174,9 +174,7 @@ def patch_inference(
 
 def _load_vol_normalized(path: Path, normalize: bool) -> torch.Tensor:
     """Load MRC → (D, H, W) CPU tensor with optional global normalization."""
-    with mrcfile.open(str(path), permissive=True, mode="r") as mrc:
-        vol_np = np.array(mrc.data, dtype=np.float32)
-    vol_t = torch.from_numpy(np.moveaxis(vol_np, 0, 2))  # (Z,Y,X) → (D,H,W)
+    vol_t = torch.from_numpy(load_mrc_volume(path, order="native"))  # (D, H, W)
     if normalize:
         vol_t = (vol_t - vol_t.mean()) / (vol_t.std() + 1e-8)
     return vol_t
@@ -186,9 +184,7 @@ def _load_comparison(path: Path | None) -> np.ndarray | None:
     if path is None:
         return None
     try:
-        with mrcfile.open(str(path), permissive=True, mode="r") as mrc:
-            vol_np = np.array(mrc.data, dtype=np.float32)
-        vol_t = torch.from_numpy(np.moveaxis(vol_np, 0, 2))
+        vol_t = torch.from_numpy(load_mrc_volume(path, order="native"))
         vol_t = (vol_t - vol_t.mean()) / (vol_t.std() + 1e-8)
         return vol_t.numpy()
     except Exception as exc:
@@ -538,7 +534,8 @@ def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
     if not val_ds.evn_paths:
         raise RuntimeError(f"No volumes found in {cfg.input_dir}.")
 
-    model, model_info = build_ei_model(
+    preset = get_preset(cfg.preset)
+    model, model_info = preset["model"](
         cfg.model_type, cfg.unet_dropout, cfg.drunet_sigma, device,
     )
 

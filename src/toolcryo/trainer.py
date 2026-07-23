@@ -16,9 +16,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from .forward import ei_denoiser_forward
 from .utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
 from .utils.utils import (
     GpuFSC, PerfProbe, append_fsc_row, append_metrics_row, denoise_patches, fsc_resolution, half_set_recon,
+    recon_panels, to_canonical_np,
 )
 
 
@@ -71,17 +73,26 @@ class BaseTrainer(dinv.Trainer):
         self._patch_probes: list | None = None
         self._patch_probe_wedge = None
         self._patch_probe_dir: Path | None = None
+        # forward-pass strategy (how x_net/y_net are computed from a batch + physics)
+        self._forward_strategy = ei_denoiser_forward
+        # hook: called right after optimizer.step() (e.g. clamping trainable
+        # algo params — unrolled preset's stepsize must stay positive). No-op
+        # by default; harmless for missingwedge_ei.
+        self._post_optimizer_step = lambda: None
+        # how the displayed reconstruction is formed from the two half-set
+        # outputs (set from the preset in run.py; see utils.half_set_recon /
+        # utils.unrolled_recon)
+        self._recon_strategy = half_set_recon
 
     # ------------------------------------------------------------------
     # EI forward pass — f(EVN) and f(ODD) independently
     # ------------------------------------------------------------------
 
     def forward_pass(self, x, y, physics, train):
-        x_net = self.model_inference(y=x, physics=physics, x=y, train=train)
-        y_net = self.model_inference(y=y, physics=physics, x=x, train=train)
+        x_net, y_net = self._forward_strategy(self, x, y, physics, train)
         if train:
-            self._last_train_xnet = x_net
-            self._last_train_ynet = y_net
+            self._last_train_xnet = x_net.detach()
+            self._last_train_ynet = y_net.detach()
         return x_net, y_net
 
     def _save_train_figures(self, x, y, epoch, physics) -> None:
@@ -156,8 +167,10 @@ class BaseTrainer(dinv.Trainer):
                     self._scaler.update()
                 else:
                     self.optimizer.step()
+                self._post_optimizer_step()
 
             self._save_train_figures(x, y, epoch, physics)
+            self._last_train_xnet = self._last_train_ynet = None
 
         return loss_total, x_net, logs
 
@@ -176,6 +189,14 @@ class BaseTrainer(dinv.Trainer):
 
         if train:
             self._epoch_probe.__exit__(None, None, None)
+            # Hand PyTorch's cached-but-free blocks back to the CUDA driver at
+            # the epoch boundary. astra (TomographyEM) allocates via raw CUDA
+            # and cannot draw on PyTorch's cache, so without this its
+            # allocateVolumeArray can fail while PyTorch sits on many GB of
+            # unused reserved memory. Once per epoch, so the sync costs nothing
+            # measurable next to a full training epoch.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             n = max(1, self._train_batch_count)
             t, peak_mb = self._epoch_probe.elapsed_s, self._epoch_probe.peak_mb
             if self._block_start_time is None:
@@ -183,7 +204,10 @@ class BaseTrainer(dinv.Trainer):
             if step % self._log_every_n_epochs == 0:
                 block_elapsed = time.perf_counter() - self._block_start_time
                 loss_str = "  ".join(f"{k}={v:.4f}" for k, v in logs.items() if isinstance(v, float))
-                gpu_str = (f"  max_gpu={peak_mb/1024:.2f}/"
+                # reserved, not just allocated: astra allocates outside PyTorch's
+                # caching allocator, so its headroom is total - reserved (see PerfProbe).
+                gpu_str = (f"  max_gpu={peak_mb/1024:.2f}"
+                           f"(reserved {self._epoch_probe.peak_reserved_mb/1024:.2f})/"
                            f"{torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB"
                            if torch.cuda.is_available() else "")
                 n_ep = self._log_every_n_epochs
@@ -212,9 +236,17 @@ class BaseTrainer(dinv.Trainer):
                 print(f"[val   ep={step}]  total={t:.1f}s  per_img={t/n:.2f}s  n={n}", flush=True)
             self._val_probe = None
 
-    def _enable_mixed_precision(self, device_type: str = "cuda") -> None:
-        self._scaler = torch.amp.GradScaler(device_type)
-        self._autocast = torch.amp.autocast(device_type)
+    def _enable_mixed_precision(self, dtype: str = "fp16", device_type: str = "cuda") -> None:
+        if dtype not in ("fp16", "bf16"):
+            raise ValueError(f"mixed_precision_dtype must be 'fp16' or 'bf16', got {dtype!r}.")
+        amp_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
+        self._autocast = torch.amp.autocast(device_type, dtype=amp_dtype)
+        # GradScaler exists to rescue tiny fp16 gradients from underflow via a
+        # 65536x loss multiply. bf16 shares fp32's exponent range, so scaling is
+        # unnecessary — and it was that multiply that overflowed at native
+        # resolution. No scaler for bf16: the trainer already runs a plain
+        # .backward() whenever self._scaler is None (the fp32 path).
+        self._scaler = torch.amp.GradScaler(device_type) if dtype == "fp16" else None
 
     def plot(self, epoch, physics, x, y, x_net, train=True):  # type: ignore[override]
         """Suppress the default deepinv plot."""
@@ -236,8 +268,7 @@ class EIFullTrainer(BaseTrainer):
             px      = self._val_pixel_sizes[vol_idx] if vol_idx < len(self._val_pixel_sizes) else 1.0
 
             with torch.no_grad():
-                f_evn_t = self.model(x)
-                f_odd_t = self.model(y)
+                f_evn_t, f_odd_t = self.forward_pass(x, y, physics, train=False)
             if hasattr(self.device, "type") and self.device.type == "cuda":
                 torch.cuda.synchronize()
 
@@ -260,18 +291,18 @@ class EIFullTrainer(BaseTrainer):
                                fsc_threshold=self._fsc_threshold,
                                fsc_shell=int(k), fsc_res_angstrom=float(res))
 
-            # All ranks must call the distributed model; only rank-0 saves figures.
+            # All ranks must call the (possibly distributed) model; only rank-0 saves.
             with torch.no_grad():
-                recon_t = half_set_recon(self.model, physics, f_evn_t, f_odd_t)
+                recon_t = self._recon_strategy(self.model, physics, f_evn_t, f_odd_t)
             if self._images_dir is not None:
                 save_fsc_figure(self._images_dir, epoch, f"{name}.png",
                                 fsc_curve, k, res, f"Epoch {epoch} | {name}",
                                 self._fsc_threshold, vol_size=D, pixel_size=px)
+                pa, pb, pl = recon_panels(x, y, physics)
                 save_slice_figure(
                     self._images_dir, epoch, vol_idx,
-                    [x.squeeze().cpu().numpy(), y.squeeze().cpu().numpy(),
-                     _znorm_np(recon_t.squeeze().cpu().numpy())],
-                    labels=["EVN", "ODD", "recon"],
+                    [pa, pb, _znorm_np(to_canonical_np(recon_t.squeeze().cpu().numpy(), physics))],
+                    labels=[*pl, "recon"],
                     title=f"Epoch {epoch} | {name} — inference recon",
                     fname=f"{name}_recon.png",
                 )
@@ -282,6 +313,8 @@ class EIFullTrainer(BaseTrainer):
         return super().compute_loss(physics, x, y, train=True, epoch=epoch, step=step)
 
     def _save_train_figures(self, x, y, epoch, physics) -> None:
+        if self._fsc_split == "train" and self._val_pixel_sizes:
+            return  # FSC eval already reconstructs + plots these same volumes
         if epoch != self._train_slice_epoch:
             self._train_slice_epoch = epoch
             self._train_vol_idx = 0
@@ -289,16 +322,17 @@ class EIFullTrainer(BaseTrainer):
         self._train_vol_idx += 1
         if epoch % self.eval_interval != 0:
             return
-        # All ranks must call the distributed model; only rank-0 saves figures.
+        # All ranks must call the (possibly distributed) model; only rank-0 saves.
         with torch.no_grad():
-            recon_t = half_set_recon(self.model, physics, self._last_train_xnet, self._last_train_ynet)
+            recon_t = self._recon_strategy(
+                self.model, physics, self._last_train_xnet, self._last_train_ynet)
         if self._train_images_dir is None:
             return
+        pa, pb, pl = recon_panels(x, y, physics)
         save_slice_figure(
             self._train_images_dir, epoch, vol_idx,
-            [x.squeeze().cpu().numpy(), y.squeeze().cpu().numpy(),
-             _znorm_np(recon_t.squeeze().cpu().numpy())],
-            labels=["EVN", "ODD", "recon"],
+            [pa, pb, _znorm_np(to_canonical_np(recon_t.squeeze().cpu().numpy(), physics))],
+            labels=[*pl, "recon"],
             title=f"Train Epoch {epoch} | Vol {vol_idx} — inference recon",
             fname=f"vol{vol_idx:02d}_recon.png",
         )

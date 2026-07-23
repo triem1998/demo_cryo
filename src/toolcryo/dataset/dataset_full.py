@@ -18,13 +18,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import mrcfile
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 from ..utils.utils import (
-    EIDataBundle, _discover_pairs, _resolve_tlt_ranges, select_train_val_by_name,
+    EIDataBundle, _discover_pairs, _resolve_tlt_ranges, load_mrc_volume,
+    select_train_val_by_name,
 )
 
 # ---------------------------------------------------------------------------
@@ -53,6 +55,13 @@ class EIFullDataConfig:
     # Should be set to match RunEIFullConfig.tilt_min / tilt_max.
     fallback_tilt_min: float = -60.0
     fallback_tilt_max: float = 60.0
+    # "fbp": today's behaviour — load precomputed FBP volumes, crop+normalise
+    #   (missingwedge_ei preset).
+    # "measurement": load the real split1/split2 tilt series at native
+    #   resolution, no crop/resample/normalise (unrolled preset). Angles and
+    #   the FBP-init volumes are read independently by the physics builder,
+    #   not by this dataset.
+    data_source: Literal["fbp", "measurement"] = "fbp"
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +100,8 @@ class CryoEIFullDataset(Dataset):
         tilt_ranges: list[tuple[float, float] | None] | None = None,
         fallback_tilt_min: float = -60.0,
         fallback_tilt_max: float = 60.0,
+        data_source: str = "fbp",
+        index_offset: int = 0,
     ) -> None:
         assert len(evn_paths) == len(odd_paths)
         self.evn_paths         = evn_paths
@@ -98,6 +109,11 @@ class CryoEIFullDataset(Dataset):
         self.target_shape      = target_shape
         self.fallback_tilt_min = fallback_tilt_min
         self.fallback_tilt_max = fallback_tilt_max
+        self.data_source       = data_source
+        # Global identity for measurement mode — lets TomographyEMPair.update()
+        # know which tomogram this item is when train_ds/val_ds are separate
+        # 0-indexed datasets (see physics/__init__.py::build_tomography_physics).
+        self.index_offset      = index_offset
         self._tilt_ranges: list[tuple[float, float] | None] = (
             tilt_ranges if tilt_ranges is not None else [None] * len(evn_paths)
         )
@@ -115,6 +131,11 @@ class CryoEIFullDataset(Dataset):
         return len(self.evn_paths)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        if self.data_source == "measurement":
+            evn_sino, odd_sino = self._load_measurement(idx)
+            tomo_idx = torch.tensor(idx + self.index_offset)
+            return evn_sino, odd_sino, {"tomo_idx": tomo_idx}
+
         evn = self._load_and_prepare(self.evn_paths[idx])   # (1, D, H, W)
         odd = self._load_and_prepare(self.odd_paths[idx])
 
@@ -133,12 +154,63 @@ class CryoEIFullDataset(Dataset):
     # Helpers
     # ------------------------------------------------------------------
 
+    def _load_measurement(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Load real split1/split2 tilt series — no crop, no normalise. If
+        ``target_shape`` is set (local testing only), each projection is
+        resampled to match its (D, H) so the sinogram stays
+        consistent with the correspondingly-resampled FBP-init volume built by
+        ``physics/__init__.py::build_tomography_physics``. Angles and FBP-init
+        volumes are read independently by the physics builder, not here.
+
+        Returns ``(1, V, A, N)`` tensors — matches ``TomographyEM.A()``'s
+        ``(B, C, V, A, N)`` convention (V<-ny, A<-n_angles, N<-nx; see
+        ``scripts/test_tomography_em.py``) — collated by the default
+        DataLoader into ``(B, 1, V, A, N)``.
+        """
+        tomo_dir = self.evn_paths[idx].parent
+        evn_sino = self._load_tilt_series(tomo_dir, "split1")
+        odd_sino = self._load_tilt_series(tomo_dir, "split2")
+        if self.target_shape is not None:
+            # target_shape is canonical (Y, X, Z); the detector grid is
+            # (V, N) = (Y, X), i.e. its first two axes.
+            d, h, _ = self.target_shape
+            evn_sino = self._resample_sinogram(evn_sino, d, h)
+            odd_sino = self._resample_sinogram(odd_sino, d, h)
+        return evn_sino, odd_sino
+
+    @staticmethod
+    def _load_tilt_series(tomo_dir: Path, split: str) -> torch.Tensor:
+        matches = sorted(tomo_dir.glob(f"tilt_series_*_{split}.mrc"))
+        if not matches:
+            raise FileNotFoundError(
+                f"measurement mode: no tilt_series_*_{split}.mrc found in {tomo_dir}"
+            )
+        with mrcfile.open(str(matches[0]), permissive=True, mode="r") as mrc:
+            ts_np = np.array(mrc.data, dtype=np.float32)  # (n_angles, ny, nx)
+        ts_np = np.ascontiguousarray(np.moveaxis(ts_np, 0, 1))  # (ny, n_angles, nx) = (V, A, N)
+        ts = torch.from_numpy(ts_np).unsqueeze(0)  # (1, V, A, N) — channel dim
+        # Z-normalize. The mean is a large DC pedestal (~17x the signal std) that
+        # limited-angle tomography cannot recover — TomographyEM.fbp() already
+        # discards it — so no volume can ever explain it; leaving it in makes the
+        # data-fidelity chase an unfittable constant. Unit std then puts y on the
+        # same scale as A(x) for the z-normalized, unit-norm-operator convention
+        # (see physics.py: load_native_volume + TomographyEM(normalize=True)).
+        return (ts - ts.mean()) / (ts.std() + 1e-8)
+
+    @staticmethod
+    def _resample_sinogram(sino: torch.Tensor, ny: int, nx: int) -> torch.Tensor:
+        """Resample a (1, V0, A, N0) sinogram to (1, ny, A, nx) — resizes V, N
+        only, keeps the angle axis A untouched."""
+        c, v0, a, n0 = sino.shape
+        sino = sino.permute(2, 0, 1, 3)  # (A, C, V0, N0)
+        sino = torch.nn.functional.interpolate(
+            sino, size=(ny, nx), mode="bilinear", align_corners=False,
+        )
+        return sino.permute(1, 2, 0, 3).contiguous()  # (C, ny, A, nx)
+
     def _load_and_prepare(self, path: Path) -> torch.Tensor:
         """Load MRC, reorder axes, optional resample, centre-crop to cube, normalise → (1, D, H, W)."""
-        # MRC stores (Z, Y, X); moveaxis → (Y, X, Z) = (D, H, W)
-        with mrcfile.open(str(path), permissive=True, mode="r") as mrc:
-            vol_np = np.array(mrc.data, dtype=np.float32)
-        vol = torch.from_numpy(np.moveaxis(vol_np, 0, 2))  # (D, H, W)
+        vol = torch.from_numpy(load_mrc_volume(path, order="native"))  # (Y, X, Z) = (D, H, W)
 
         if self.target_shape is not None:
             # interpolate expects (B, C, D, H, W)
@@ -205,9 +277,11 @@ def build_ei_full_dataloaders(cfg: EIFullDataConfig) -> EIDataBundle:
         target_shape=cfg.target_shape,
         fallback_tilt_min=cfg.fallback_tilt_min,
         fallback_tilt_max=cfg.fallback_tilt_max,
+        data_source=cfg.data_source,
     )
     train_ds = CryoEIFullDataset(train_evn, train_odd, tilt_ranges=train_tlt_ranges, **ds_kwargs)
-    val_ds   = CryoEIFullDataset(val_evn,   val_odd,   tilt_ranges=val_tlt_ranges,   **ds_kwargs)
+    val_ds   = CryoEIFullDataset(val_evn,   val_odd,   tilt_ranges=val_tlt_ranges,
+                                  index_offset=len(train_evn), **ds_kwargs)
 
     print(
         f"[ei-full] total={len(all_evn)}  "

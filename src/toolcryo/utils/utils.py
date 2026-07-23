@@ -1,6 +1,6 @@
 """Shared utilities for cryo-ET training.
 
-Covers: seeding, directory helpers, CSV logging, model building, timing (PerfProbe),
+Covers: seeding, directory helpers, CSV logging, timing (PerfProbe),
 dataset discovery (_discover_pairs, select_train_val_by_name), MRC I/O, volume preprocessing,
 and visualisation helpers (save_slice_figure, GpuFSC, FSC curves).
 """
@@ -80,72 +80,16 @@ def append_fsc_row(path: Path | str, curve=None, **fields) -> None:
     append_metrics_row(path, {c: fields.get(c, "") for c in FSC_CSV_COLUMNS})
 
 
-class DRUNetWrapper(torch.nn.Module):
-    """Wraps DRUNet so model(x) works — injects a fixed sigma as a float.
-
-    DRUNet.forward(x, sigma) requires a noise level.  Passing sigma as a
-    Python float uses the 3D-safe branch: torch.ones((B,1,*x.shape[2:]))*sigma,
-    unlike the tensor branch which hard-codes 2D expand calls.
-    """
-
-    def __init__(self, drunet: torch.nn.Module, sigma: float = 0.0) -> None:
-        super().__init__()
-        self.drunet = drunet
-        self.sigma = sigma
-
-    def forward(self, x: torch.Tensor, physics=None, **kwargs) -> torch.Tensor:
-        return self.drunet(x, self.sigma)
-
-
-_UNET_F_MAPS = 64
-_UNET_NUM_LEVELS = 4
-_DRUNET_NB = 4
-
-
-def build_ei_model(
-    model_type: str,
-    unet_dropout: float,
-    drunet_sigma: float,
-    device,
-) -> tuple[torch.nn.Module, str]:
-    """Build IceCreamUNetWrapper (unet) or DRUNetWrapper (drunet) on *device*."""
-    import deepinv as dinv
-    from ..icecream_orig.models import IceCreamUNetWrapper
-    from ..icecream_orig.models.unet3d_bf import UNet3D as _IceCreamUNet3D
-
-    if model_type == "unet":
-        _inner = _IceCreamUNet3D(
-            in_channels=1,
-            out_channels=1,
-            f_maps=_UNET_F_MAPS,
-            num_levels=_UNET_NUM_LEVELS,
-            layer_order="cr",
-            use_bias=False,
-            dropout_prob=unet_dropout,
-        ).to(device)
-        model = IceCreamUNetWrapper(_inner)
-        info = f"unet  f_maps={_UNET_F_MAPS}  num_levels={_UNET_NUM_LEVELS}  dropout={unet_dropout}"
-    elif model_type == "drunet":
-        _nc = tuple(_UNET_F_MAPS * (2 ** i) for i in range(4))
-        _inner = dinv.models.DRUNet(
-            in_channels=1,
-            out_channels=1,
-            nc=_nc,
-            nb=_DRUNET_NB,
-            pretrained="download_2d",
-            pretrained_2d_isotropic=False,
-            dim=3,
-        ).to(device)
-        model = DRUNetWrapper(_inner, sigma=drunet_sigma)
-        info = f"drunet  nc={_nc}  nb={_DRUNET_NB}  sigma={drunet_sigma}  init=pretrained_2d"
-    else:
-        raise ValueError(f"Unknown model_type: {model_type!r}. Use 'unet' or 'drunet'.")
-    return model, info
-
-
 class PerfProbe:
     """Context manager that measures wall time and peak GPU memory for a code block.
 
+    Reports *both* allocated and reserved peaks. ``max_memory_allocated`` alone
+    is misleading whenever a non-PyTorch CUDA library shares the device — astra
+    (``TomographyEM``) calls CUDA directly and cannot use PyTorch's cached
+    blocks, so what it can allocate is bounded by total - *reserved*, not
+    total - *allocated*. PyTorch's caching allocator does not return freed
+    blocks to the driver by default, so ``reserved`` can sit far above
+    ``allocated``.
     """
     def __enter__(self) -> "PerfProbe":
         if torch.cuda.is_available():
@@ -155,10 +99,9 @@ class PerfProbe:
 
     def __exit__(self, *_) -> None:
         self.elapsed_s: float = time.perf_counter() - self._t0
-        self.peak_mb: float = (
-            torch.cuda.max_memory_allocated() / 1e6
-            if torch.cuda.is_available() else 0.0
-        )
+        cuda = torch.cuda.is_available()
+        self.peak_mb: float = torch.cuda.max_memory_allocated() / 1e6 if cuda else 0.0
+        self.peak_reserved_mb: float = torch.cuda.max_memory_reserved() / 1e6 if cuda else 0.0
 
 
 @dataclass
@@ -319,6 +262,36 @@ def _find_mrc(tomo_dir: Path, *globs: str) -> Path | None:
     return None
 
 
+# MRC files store (Z, Y, X). Two downstream orders are in use, both correct —
+# this maps each to the destination axis for np.moveaxis(vol, 0, dest):
+#   "native" -> (Y, X, Z): the missingwedge_ei / patch convention, the order
+#       _save_mrc writes back from.
+#   "astra"  -> (Y, Z, X): tilt axis first, which is what TomographyEM hands
+#       straight to astra (see physics/tomography.py — keeping the reorder at
+#       load time is what lets A()/A_adjoint() stay permute-free).
+_MRC_AXIS_DEST = {"native": 2, "astra": 1}
+
+
+def load_mrc_volume(path: Path, order: str = "native") -> np.ndarray:
+    """Read an MRC volume and reorient it out of the file's (Z, Y, X) layout.
+
+    Single source of truth for that reorientation — it was previously spelled
+    out inline at every call site, so a convention change had to be applied to
+    each one in lockstep. Callers keep their own resample/crop/normalise steps,
+    which genuinely differ between them.
+
+    :param Path path: MRC file to read.
+    :param str order: ``"native"`` or ``"astra"`` — see ``_MRC_AXIS_DEST``.
+    :return: contiguous float32 array (the copy also satisfies astra's
+        ``assert data.is_contiguous()``; ``np.moveaxis`` alone returns a view).
+    """
+    if order not in _MRC_AXIS_DEST:
+        raise ValueError(f"order must be one of {sorted(_MRC_AXIS_DEST)}, got {order!r}.")
+    with mrcfile.open(str(path), permissive=True, mode="r") as mrc:
+        vol_np = np.array(mrc.data, dtype=np.float32)  # (Z, Y, X)
+    return np.ascontiguousarray(np.moveaxis(vol_np, 0, _MRC_AXIS_DEST[order]))
+
+
 def _save_mrc(path: Path, vol_dhw: np.ndarray) -> None:
     """Save a (D, H, W) float32 numpy array as an MRC file (axis order: Z, Y, X)."""
     vol_zyx = np.moveaxis(vol_dhw.astype(np.float32), 2, 0)
@@ -472,6 +445,62 @@ def half_set_recon(
 ) -> "torch.Tensor":
     """Self-supervised reconstruction: 0.5 * (f(A(f_evn)) + f(A(f_odd)))."""
     return 0.5 * (model(physics.A(f_evn)) + model(physics.A(f_odd)))
+
+
+def unrolled_recon(model, physics, f_evn: "torch.Tensor", f_odd: "torch.Tensor") -> "torch.Tensor":
+    """Reconstruction for the unrolled preset: 0.5 * (x_net_evn + x_net_odd).
+
+    No ``f(A(f(.)))`` round-trip as in ``half_set_recon``: there ``f`` is a
+    denoiser and ``A`` a wedge mask, both volume->volume, so re-applying them is
+    the icecream inference convention. Here ``f`` is the PGD net
+    (sinogram -> volume) and ``A`` is volume -> sinogram, and ``f_evn``/``f_odd``
+    are *already* the reconstructions — the PGD iteration
+    ``x - gamma*A^T(A x - y)`` performed the measurement-consistency step
+    internally, n_iter times. Averaging the two half-set reconstructions is all
+    that's left. Same signature as ``half_set_recon`` so it drops into
+    ``EIFullTrainer._recon_strategy``; note it never calls ``model``, so unlike
+    ``half_set_recon`` it involves no distributed collective.
+    """
+    return 0.5 * (f_evn + f_odd)
+
+
+def to_canonical_np(vol: np.ndarray, physics) -> np.ndarray:
+    """Bring a volume into the canonical ``(Y, X, Z)`` order for presentation.
+
+    Tomography-physics volumes live in astra's ``(Y, Z, X)`` (tilt axis first —
+    a hard astra requirement, and it must not be permuted inside
+    ``A``/``A_adjoint``, see physics/tomography.py). Everything a human or a
+    file ever sees is canonical instead, so figures, MRC output and
+    cross-preset comparisons all share one axis order. The swap is axes 1<->2
+    and happens only here, at the presentation boundary, outside autograd.
+
+    ``physics`` is duck-typed on ``init_evn`` — the same discriminator
+    ``recon_panels`` already uses to tell a TomographyEMPair from a
+    MissingWedge (importing the class would make utils depend on physics).
+    """
+    return np.moveaxis(vol, 1, 2) if hasattr(physics, "init_evn") else vol
+
+
+def recon_panels(x: "torch.Tensor", y: "torch.Tensor", physics):
+    """The two 'before' panels shown next to a reconstruction.
+
+    For missingwedge_ei ``x``/``y`` are the EVN/ODD *volumes*, so they are
+    used directly. For unrolled they are *sinograms* (B,1,V,A,N) — a
+    different domain and shape from the reconstructed volume — so the FBP
+    init volumes on the physics container are shown instead, giving a
+    FBP -> unrolled before/after. Shared by ``EIFullTrainer`` (training) and
+    ``infer_full.py`` (inference) so both presets render the same way.
+    """
+    init_evn = getattr(physics, "init_evn", None)
+    if init_evn is None:
+        return (x.squeeze().cpu().numpy(), y.squeeze().cpu().numpy(), ["EVN", "ODD"])
+
+    def _znorm_np(arr):
+        return (arr - arr.mean()) / (arr.std() + 1e-8)
+
+    return (_znorm_np(to_canonical_np(init_evn.squeeze().cpu().numpy(), physics)),
+            _znorm_np(to_canonical_np(physics.init_odd.squeeze().cpu().numpy(), physics)),
+            ["FBP EVN", "FBP ODD"])
 
 
 # ---------------------------------------------------------------------------
