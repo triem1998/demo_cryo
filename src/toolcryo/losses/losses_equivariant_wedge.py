@@ -1,4 +1,5 @@
-"""losses.py — EI loss terms for cryo-ET equivariant training.
+"""losses_equivariant_wedge.py — EI loss terms for the ``missingwedge_ei``
+preset (synthetic Fourier-wedge physics).
 
 Implements the two loss terms from icecream's EquivariantTrainer.compute_loss:
 

@@ -7,6 +7,8 @@ redefined here, only wrapped.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 from deepinv.distributed import DistributedContext, distribute
 from deepinv.distributed.framework import DistributedReplicatedParameters
@@ -83,13 +85,19 @@ def build_ei_model(model_type, unet_dropout, drunet_sigma, device) -> tuple[torc
     from .icecream_orig.models.unet3d_bf import UNet3D as _IceCreamUNet3D
 
     if model_type == "unet":
+        # UNet3D only inserts Dropout when the layer_order string asks for it
+        # ('d'); dropout_prob alone is inert. Dropout has no parameters, so
+        # state_dicts stay identical either way — checkpoints are compatible
+        # across this switch. 'd' not 'D': Dropout2d is deprecated on 5-D input.
+        layer_order = "crd" if unet_dropout > 0 else "cr"
         _inner = _IceCreamUNet3D(
             in_channels=1, out_channels=1, f_maps=_UNET_F_MAPS,
-            num_levels=_UNET_NUM_LEVELS, layer_order="cr", use_bias=False,
+            num_levels=_UNET_NUM_LEVELS, layer_order=layer_order, use_bias=False,
             dropout_prob=unet_dropout,
         ).to(device)
         model = IceCreamUNetWrapper(_inner)
-        info = f"unet  f_maps={_UNET_F_MAPS}  num_levels={_UNET_NUM_LEVELS}  dropout={unet_dropout}"
+        info = (f"unet  f_maps={_UNET_F_MAPS}  num_levels={_UNET_NUM_LEVELS}  "
+                f"layer_order={layer_order}  dropout={unet_dropout}")
     elif model_type == "drunet":
         _nc = tuple(_UNET_F_MAPS * (2 ** i) for i in range(4))
         _inner = dinv.models.DRUNet(
@@ -140,6 +148,58 @@ def _kernels_native_to_astra(state: dict) -> dict:
     return out
 
 
+def build_distributed_denoiser(
+    cfg, ctx: DistributedContext, rank: int, ckpt_path: Path | None,
+    permute_native_to_astra: bool = False, log_prefix: str = "",
+) -> tuple[torch.nn.Module, str]:
+    """Build a plain denoiser (``missingwedge_ei`` / ``tomo_ei`` — both use
+    ``build_ei_model``), optionally load a checkpoint, and tile it across
+    ranks. Shared by training (``run.py``, ``ckpt_path=cfg.pretrained_ckpt``)
+    and inference (``infer_full.py``, one call per entry in
+    ``cfg.checkpoint_paths``) — the two differ only in where the path
+    comes from and whether it's required.
+
+    :param bool permute_native_to_astra: apply ``_kernels_native_to_astra``
+        before loading — needed when ``ckpt_path`` is a native-order
+        (``missingwedge_ei``/patch) checkpoint being warm-started into an
+        astra-order model (``tomo_ei``). Mirrors ``build_unrolled_model``'s
+        identical handling for its own bare-denoiser case.
+    """
+    wrapper, model_info = build_ei_model(cfg.model_type, cfg.unet_dropout, cfg.drunet_sigma, ctx.device)
+    if ckpt_path is not None:
+        ckpt = torch.load(str(ckpt_path), map_location=ctx.device, weights_only=True)
+        state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
+        # torch.compile wraps the module in an OptimizedModule holding it as
+        # ``_orig_mod``, so a checkpoint saved from a compiled run carries that
+        # prefix on every key. Strip it so compiled and eager checkpoints stay
+        # interchangeable (same reason 'module.'/'processor.' are stripped).
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+        if any(k.startswith("module.") for k in state):
+            state = {k.removeprefix("module."): v for k, v in state.items()}
+            if rank == 0:
+                print(f"[{log_prefix}] stripped 'module.' prefix from checkpoint keys", flush=True)
+        if any(k.startswith("processor.") for k in state):
+            state = {k.removeprefix("processor."): v for k, v in state.items()}
+            if rank == 0:
+                print(f"[{log_prefix}] stripped 'processor.' prefix from checkpoint keys", flush=True)
+        if permute_native_to_astra:
+            state = _kernels_native_to_astra(state)
+            if rank == 0:
+                print(f"[{log_prefix}] permuted conv kernels native (Y,X,Z) -> astra (Y,Z,X) order", flush=True)
+        wrapper.load_state_dict(state, strict=True)
+
+    if cfg.compile:
+        wrapper = torch.compile(wrapper)
+
+    model = distribute(wrapper, ctx, type_object="denoiser",
+                        patch_size=tuple(int(v) for v in cfg.patch_size),
+                        overlap=tuple(int(v) for v in cfg.overlap),
+                        tiling_dims=(-3, -2, -1),
+                        max_batch_size=cfg.max_batch_size,
+                        checkpoint_batches=cfg.checkpoint_batches)
+    return model, model_info
+
+
 def build_unrolled_model(cfg, physics: TomographyEMPair, ctx: DistributedContext) -> tuple:
     """Build a distributed PGD-unfold model with a PnP(denoiser) prior.
 
@@ -174,6 +234,11 @@ def build_unrolled_model(cfg, physics: TomographyEMPair, ctx: DistributedContext
     if cfg.pretrained_ckpt is not None:
         ckpt = torch.load(cfg.pretrained_ckpt, map_location=ctx.device, weights_only=True)
         state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
+        # torch.compile wraps the module in an OptimizedModule holding it as
+        # ``_orig_mod``, so a checkpoint saved from a compiled run carries that
+        # prefix on every key. Strip it so compiled and eager checkpoints stay
+        # interchangeable (same reason 'module.'/'processor.' are stripped).
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
         if any(k.startswith("module.") for k in state):
             state = {k.removeprefix("module."): v for k, v in state.items()}
         is_full_unrolled_ckpt = any(
@@ -203,12 +268,19 @@ def build_unrolled_model(cfg, physics: TomographyEMPair, ctx: DistributedContext
     trainable_params = (["stepsize"] + (["g_param"] if is_drunet else [])) if train_algo else []
 
     n_iter = int(cfg.n_iter)
+    # Both physics paths end up unit spectral norm — normalize=True when
+    # unsharded, normalize_sharded() when sharded — so init_stepsize is used
+    # as-is either way, with no per-tomogram rescaling.
+    # A sharded operator's A_adjoint spans ranks, so the data-fidelity gradient
+    # needs the matching collective; a plain L2 would silently use only the
+    # local shard's contribution.
+    data_fidelity = distribute(L2(), ctx) if physics.num_operators is not None else L2()
     model = PGD(
         stepsize=[float(cfg.init_stepsize)] * n_iter,
         sigma_denoiser=float(cfg.drunet_sigma),
         beta=[1.0] * n_iter,
         trainable_params=trainable_params,
-        data_fidelity=L2(),
+        data_fidelity=data_fidelity,
         max_iter=n_iter,
         prior=PnP(denoiser=denoiser),
         unfold=True,
@@ -220,6 +292,8 @@ def build_unrolled_model(cfg, physics: TomographyEMPair, ctx: DistributedContext
     # denoiser makes each rank's contribution differ. Same pieces
     # _distribute_base_optim does, minus the data-fidelity distribution.
     model = model.to(ctx.device)
+    if cfg.compile:
+        model.prior[0].denoiser = torch.compile(model.prior[0].denoiser)
     model.prior[0].denoiser = distribute(
         model.prior[0].denoiser, ctx, type_object="denoiser",
         patch_size=tuple(int(v) for v in cfg.patch_size),
@@ -234,6 +308,16 @@ def build_unrolled_model(cfg, physics: TomographyEMPair, ctx: DistributedContext
         model._deepinv_dist_sync = DistributedReplicatedParameters(ctx, algo_params, average=True)
 
     if full_ckpt_state is not None:
+        # ``cfg.compile`` inserts an ``_orig_mod.`` segment *inside* the key path
+        # (prior.0.denoiser.processor._orig_mod.unet...), on the checkpoint when
+        # the saving run was compiled and on this model when this run is — so a
+        # leading-prefix strip cannot reconcile them. Canonicalise the checkpoint
+        # by dropping the segment, then re-key it to whatever this model expects.
+        tgt = set(model.state_dict())
+        if not set(full_ckpt_state) <= tgt:
+            canon = {k.replace("_orig_mod.", ""): v for k, v in full_ckpt_state.items()}
+            full_ckpt_state = {k: canon[k.replace("_orig_mod.", "")] for k in tgt
+                               if k.replace("_orig_mod.", "") in canon}
         try:
             model.load_state_dict(full_ckpt_state, strict=True)
         except RuntimeError as e:

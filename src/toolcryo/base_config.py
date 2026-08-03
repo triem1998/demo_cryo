@@ -38,13 +38,17 @@ class RunEIBaseConfig(BaseModel):
 
     # ── EI loss ─────────────────────────────────────────────────────────────
     eq_weight: float = 2.0
-    loss_type: str = "icecream"
 
     # ── Training ────────────────────────────────────────────────────────────
     learning_rate: float = 1e-4
     grad_clip: float | None = 1.0
     ckp_interval: int = 10
     eval_interval: int = 1
+    # ReduceLROnPlateau on the training TotalLoss. Off by default — unchanged
+    # behaviour (flat learning_rate for the whole run) unless enabled.
+    use_lr_scheduler: bool = False
+    lr_scheduler_factor: float = 0.5
+    lr_scheduler_patience: int = 10
 
     # ── Physics ─────────────────────────────────────────────────────────────
     wedge_double_size: bool = True
@@ -58,6 +62,10 @@ class RunEIBaseConfig(BaseModel):
     mixed_precision_dtype: str = "fp16"
 
     # ── Model ───────────────────────────────────────────────────────────────
+    # torch.compile the denoiser, always *before* the distribute() tiling
+    # wrapper, so the compiled region is the plain denoiser rather than the
+    # wrapper's Python tiling loop.
+    compile: bool = False
     model_type: str = "unet"
     unet_dropout: float = 0.1
     drunet_sigma: float = 0.0
@@ -69,6 +77,17 @@ class RunEIBaseConfig(BaseModel):
 
     # ── Pretrained init ──────────────────────────────────────────────────────
     pretrained_ckpt: str | None = None
+
+    # ── Checkpoint axis order (tomo_ei only — missingwedge_ei never needs this,
+    # it stays in native order throughout) ────────────────────────────────────
+    # None = auto: True when loading a checkpoint for tomo_ei *training*
+    # (pretrained_ckpt is assumed to be a native-order missingwedge_ei/patch
+    # checkpoint), False for tomo_ei *inference* (checkpoint_paths is assumed
+    # to already be astra-order, i.e. produced by a previous tomo_ei/unrolled
+    # run). Set explicitly to override either way — e.g. True to evaluate a
+    # raw patch checkpoint directly under tomo_ei inference, or False to
+    # resume tomo_ei training from its own (already astra-order) checkpoint.
+    permute_native_to_astra: bool | None = None
 
     @classmethod
     def _flat_from_yaml(cls, conf: dict, default_run_name: str) -> dict:

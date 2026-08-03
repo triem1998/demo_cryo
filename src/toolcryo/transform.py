@@ -18,6 +18,12 @@ class Rotate3D(T.Transform):
 
     :param bool n_trans: number of independent transforms to sample per input
         (passed to the deepinv Transform base class). Default 1.
+    :param tuple[int,int,int] | None volume_shape: When given and not a cube,
+        only rotations that preserve this shape are sampled — needed for
+        tomography physics, whose astra geometry is bound to a fixed
+        ``volume_shape`` (unlike the Fourier-wedge presets, which always crop
+        to a cube). ``None`` (default) keeps all 40 — cubic volumes are
+        shape-preserving under every entry, so this is a no-op there.
     """
 
     # The 40-element k_set from icecream (kx, ky, kz, flip_axis) where
@@ -36,8 +42,31 @@ class Rotate3D(T.Transform):
         [1, 2, 0, -1], [1, 2, 1, -1], [1, 2, 2, -1], [1, 2, 3, -1],
     ]
 
-    def __init__(self, n_trans: int = 1, **kwargs) -> None:
+    def __init__(
+        self, n_trans: int = 1,
+        volume_shape: tuple[int, int, int] | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(n_trans=n_trans, **kwargs)
+        self._valid_indices = self._shape_preserving_indices(volume_shape)
+
+    @staticmethod
+    def _rotated_shape(shape: tuple[int, int, int], kx: int, ky: int, kz: int) -> tuple[int, int, int]:
+        """Shape after the same (kx, ky, kz) rot90 sequence as ``transform`` —
+        an odd count swaps the two axes it acts on; flips never change shape."""
+        s = list(shape)
+        for k, (a, b) in ((kx, (1, 2)), (ky, (0, 2)), (kz, (0, 1))):
+            if k % 2:
+                s[a], s[b] = s[b], s[a]
+        return tuple(s)
+
+    @classmethod
+    def _shape_preserving_indices(cls, volume_shape: tuple[int, int, int] | None) -> list[int]:
+        if volume_shape is None:
+            return list(range(len(cls._KSET)))
+        shape = tuple(int(s) for s in volume_shape)
+        return [i for i, (kx, ky, kz, _axis) in enumerate(cls._KSET)
+                if cls._rotated_shape(shape, kx, ky, kz) == shape]
 
     # ------------------------------------------------------------------
     # deepinv Transform interface
@@ -45,7 +74,7 @@ class Rotate3D(T.Transform):
 
     def get_params(self, x: torch.Tensor) -> dict:
         """Sample a random rotation index (same k for the whole batch)."""
-        idx = int(torch.randint(len(self._KSET), (1,)).item())
+        idx = self._valid_indices[int(torch.randint(len(self._valid_indices), (1,)).item())]
         return {"k_idx": idx}
 
     def transform(self, x: torch.Tensor, k_idx: int = 0, **kwargs) -> torch.Tensor:

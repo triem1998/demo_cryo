@@ -19,6 +19,8 @@ inference:
 
   # Model (must match training config)
   model_type: unet        # "unet" | "drunet"
+  # torch.compile the denoiser (before the distribute()/DDP wrap). false = off.
+  compile: false
   unet_dropout: 0.1
   drunet_sigma: 0.0
 
@@ -56,7 +58,7 @@ slurm:
   ntasks_per_node: 1
   cpus_per_task: 20
   time: "02:00:00"
-  account: # your account here
+  account: fio@h100 # your account here
   constraint: "h100"
   qos: "qos_gpu_h100-dev"
   stderr_to_stdout: true

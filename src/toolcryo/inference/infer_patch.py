@@ -20,7 +20,7 @@ import torch.nn as nn
 from ..base_config import RunEIBaseConfig
 from ..dataset.dataset_patch import EIPatchDataConfig, build_ei_patch_dataloaders
 from ..physics import MissingWedge
-from ..losses.losses import _initialize_window, _symmetrize_and_binarize
+from ..losses.losses_equivariant_wedge import _initialize_window, _symmetrize_and_binarize
 from ..registry import get_preset
 from ..utils.utils import (
     GpuFSC,
@@ -550,6 +550,7 @@ def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
         # inference never uses, and load_state_dict copies CPU->GPU params directly.
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}   # torch.compile wrapper
         if any(k.startswith("module.") for k in state):
             state = {k.removeprefix("module."): v for k, v in state.items()}
             print("[patch-infer] stripped 'module.' prefix from checkpoint keys", flush=True)

@@ -66,17 +66,25 @@ def append_metrics_row(path: Path | str, row: dict) -> None:
 FSC_CSV_COLUMNS = [
     "mode", "regime", "split", "epoch", "checkpoint", "vol_idx", "tomo",
     "pixel_size", "n_ref", "fsc_threshold", "fsc_shell", "fsc_res_angstrom",
-    "fsc_curve",
+    # Same score for the one-pass intermediate f(.), written during training
+    # only, and only for presets whose recon has a real round trip. Blank
+    # elsewhere. Lets one CSV track both numbers per (epoch, volume).
+    "fsc_shell_1pass", "fsc_res_1pass_angstrom",
+    "fsc_curve", "fsc_curve_1pass",
 ]
 
 
-def append_fsc_row(path: Path | str, curve=None, **fields) -> None:
+def append_fsc_row(path: Path | str, curve=None, curve_1pass=None, **fields) -> None:
     """Append one per-volume FSC record, padded to FSC_CSV_COLUMNS.
 
-    Pass ``curve`` (the per-shell FSC array) to fill ``fsc_curve`` as JSON.
+    Pass ``curve`` (the per-shell FSC array) to fill ``fsc_curve`` as JSON, and
+    ``curve_1pass`` for the one-pass intermediate's curve — both land in the
+    same row, so one file carries the whole pair.
     """
     if curve is not None:
         fields["fsc_curve"] = json.dumps([round(float(v), 4) for v in curve])
+    if curve_1pass is not None:
+        fields["fsc_curve_1pass"] = json.dumps([round(float(v), 4) for v in curve_1pass])
     append_metrics_row(path, {c: fields.get(c, "") for c in FSC_CSV_COLUMNS})
 
 
@@ -307,6 +315,14 @@ def _read_mrc_vol_size(path: Path) -> int:
     return min(nx, ny, nz)
 
 
+def _read_mrc_vol_shape(path: Path) -> tuple[int, int, int]:
+    """Read an MRC header and return the native (Y, X, Z) = (D, H, W) shape
+    (header-only, no data loaded) — matches ``load_mrc_volume(order="native")``."""
+    with mrcfile.open(str(path), permissive=True, mode="r") as mrc:
+        nx, ny, nz = int(mrc.header.nx), int(mrc.header.ny), int(mrc.header.nz)
+    return (ny, nx, nz)
+
+
 def _read_pixel_sizes(
     evn_paths: list[Path],
     fallback: float | None = None,
@@ -442,13 +458,30 @@ def half_set_recon(
     physics,
     f_evn: "torch.Tensor",
     f_odd: "torch.Tensor",
-) -> "torch.Tensor":
-    """Self-supervised reconstruction: 0.5 * (f(A(f_evn)) + f(A(f_odd)))."""
-    return 0.5 * (model(physics.A(f_evn)) + model(physics.A(f_odd)))
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """The two half reconstructions ``f(A(f(.)))`` — kept separate on purpose.
+
+    Callers average them for display, but FSC must score them *apart*: it
+    measures agreement between two independent half-sets, so handing it one
+    pre-averaged volume is meaningless. This is also what makes the full-volume
+    number comparable to patch inference, which reports FSC on exactly this
+    two-pass pair (see inference/infer_patch.py::patch_inference).
+
+    ``TomographyEMPair`` needs the round trip spelled differently: its ``A``
+    maps volume -> sinogram, so a plain ``model(physics.A(v))`` would feed the
+    denoiser a sinogram. Projecting through the real geometry and back via
+    ``fbp`` plays the wedge mask's role — it discards exactly what the tilt
+    range never measured. Duck-typed on ``physics_evn``, the same discriminator
+    ``to_canonical_np``/``recon_panels`` use.
+    """
+    if hasattr(physics, "physics_evn"):
+        pe, po = physics.physics_evn, physics.physics_odd
+        return model(pe.fbp(pe.A(f_evn))), model(po.fbp(po.A(f_odd)))
+    return model(physics.A(f_evn)), model(physics.A(f_odd))
 
 
-def unrolled_recon(model, physics, f_evn: "torch.Tensor", f_odd: "torch.Tensor") -> "torch.Tensor":
-    """Reconstruction for the unrolled preset: 0.5 * (x_net_evn + x_net_odd).
+def unrolled_recon(model, physics, f_evn: "torch.Tensor", f_odd: "torch.Tensor") -> tuple["torch.Tensor", "torch.Tensor"]:
+    """The two half reconstructions for the unrolled preset — already done.
 
     No ``f(A(f(.)))`` round-trip as in ``half_set_recon``: there ``f`` is a
     denoiser and ``A`` a wedge mask, both volume->volume, so re-applying them is
@@ -456,12 +489,12 @@ def unrolled_recon(model, physics, f_evn: "torch.Tensor", f_odd: "torch.Tensor")
     (sinogram -> volume) and ``A`` is volume -> sinogram, and ``f_evn``/``f_odd``
     are *already* the reconstructions — the PGD iteration
     ``x - gamma*A^T(A x - y)`` performed the measurement-consistency step
-    internally, n_iter times. Averaging the two half-set reconstructions is all
-    that's left. Same signature as ``half_set_recon`` so it drops into
-    ``EIFullTrainer._recon_strategy``; note it never calls ``model``, so unlike
-    ``half_set_recon`` it involves no distributed collective.
+    internally, n_iter times, so the pair is returned as-is. Same signature as
+    ``half_set_recon`` so it drops into ``EIFullTrainer._recon_strategy``; note
+    it never calls ``model``, so unlike ``half_set_recon`` it involves no
+    distributed collective.
     """
-    return 0.5 * (f_evn + f_odd)
+    return f_evn, f_odd
 
 
 def to_canonical_np(vol: np.ndarray, physics) -> np.ndarray:

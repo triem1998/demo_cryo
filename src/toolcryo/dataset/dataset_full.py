@@ -16,6 +16,7 @@ Differences from the patch variant:
 """
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -48,6 +49,13 @@ class EIFullDataConfig:
     # If set, volumes are trilinearly resampled to this (D, H, W) shape after
     # loading — same semantics as supervised CryoDataConfig.target_shape.
     target_shape: tuple[int, int, int] | None = None
+    # If set, a random cubic crop of this side is taken after normalisation
+    # (icecream's Volume.get_random_crop). None = no crop, full volume — used
+    # for FSC/inference so evaluation always sees the whole tomogram.
+    crop_size: int | None = None
+    # Also re-normalise each crop after cropping (icecream's
+    # normalize_crops). Whole-volume normalisation always happens first.
+    normalize_crops: bool = False
     # Glob patterns used to discover EVN and ODD volumes inside each tomo_* dir.
     evn_glob: str = "vol*split1*.mrc"
     odd_glob: str = "vol*split2*.mrc"
@@ -102,6 +110,8 @@ class CryoEIFullDataset(Dataset):
         fallback_tilt_max: float = 60.0,
         data_source: str = "fbp",
         index_offset: int = 0,
+        crop_size: int | None = None,
+        normalize_crops: bool = False,
     ) -> None:
         assert len(evn_paths) == len(odd_paths)
         self.evn_paths         = evn_paths
@@ -110,6 +120,8 @@ class CryoEIFullDataset(Dataset):
         self.fallback_tilt_min = fallback_tilt_min
         self.fallback_tilt_max = fallback_tilt_max
         self.data_source       = data_source
+        self.crop_size         = crop_size
+        self.normalize_crops   = normalize_crops
         # Global identity for measurement mode — lets TomographyEMPair.update()
         # know which tomogram this item is when train_ds/val_ds are separate
         # 0-indexed datasets (see physics/__init__.py::build_tomography_physics).
@@ -136,8 +148,9 @@ class CryoEIFullDataset(Dataset):
             tomo_idx = torch.tensor(idx + self.index_offset)
             return evn_sino, odd_sino, {"tomo_idx": tomo_idx}
 
-        evn = self._load_and_prepare(self.evn_paths[idx])   # (1, D, H, W)
+        evn = self._load_and_prepare(self.evn_paths[idx])   # (1, D, H, W), whole-volume normalised
         odd = self._load_and_prepare(self.odd_paths[idx])
+        evn, odd = self._crop_pair(evn, odd)
 
         tilt = self._tilt_ranges[idx]
         if tilt is None:
@@ -147,6 +160,7 @@ class CryoEIFullDataset(Dataset):
         tilt_params = {
             "tilt_min": torch.tensor(tilt_min, dtype=torch.float32),
             "tilt_max": torch.tensor(tilt_max, dtype=torch.float32),
+            "vol_shape": torch.tensor(evn.shape[-3:], dtype=torch.int64),
         }
         return evn, odd, tilt_params
 
@@ -188,20 +202,13 @@ class CryoEIFullDataset(Dataset):
         with mrcfile.open(str(matches[0]), permissive=True, mode="r") as mrc:
             ts_np = np.array(mrc.data, dtype=np.float32)  # (n_angles, ny, nx)
         ts_np = np.ascontiguousarray(np.moveaxis(ts_np, 0, 1))  # (ny, n_angles, nx) = (V, A, N)
-        ts = torch.from_numpy(ts_np).unsqueeze(0)  # (1, V, A, N) — channel dim
-        # Z-normalize. The mean is a large DC pedestal (~17x the signal std) that
-        # limited-angle tomography cannot recover — TomographyEM.fbp() already
-        # discards it — so no volume can ever explain it; leaving it in makes the
-        # data-fidelity chase an unfittable constant. Unit std then puts y on the
-        # same scale as A(x) for the z-normalized, unit-norm-operator convention
-        # (see physics.py: load_native_volume + TomographyEM(normalize=True)).
+        ts = torch.from_numpy(ts_np).unsqueeze(0)  
         return (ts - ts.mean()) / (ts.std() + 1e-8)
 
     @staticmethod
     def _resample_sinogram(sino: torch.Tensor, ny: int, nx: int) -> torch.Tensor:
         """Resample a (1, V0, A, N0) sinogram to (1, ny, A, nx) — resizes V, N
         only, keeps the angle axis A untouched."""
-        c, v0, a, n0 = sino.shape
         sino = sino.permute(2, 0, 1, 3)  # (A, C, V0, N0)
         sino = torch.nn.functional.interpolate(
             sino, size=(ny, nx), mode="bilinear", align_corners=False,
@@ -209,7 +216,12 @@ class CryoEIFullDataset(Dataset):
         return sino.permute(1, 2, 0, 3).contiguous()  # (C, ny, A, nx)
 
     def _load_and_prepare(self, path: Path) -> torch.Tensor:
-        """Load MRC, reorder axes, optional resample, centre-crop to cube, normalise → (1, D, H, W)."""
+        """Load MRC, reorder axes, optional resample, normalise → (1, D, H, W).
+
+        Normalisation is whole-volume (icecream's ``load_volume`` /
+        ``normalize_volume``), applied before any cropping — see
+        ``_crop_pair`` for the crop step.
+        """
         vol = torch.from_numpy(load_mrc_volume(path, order="native"))  # (Y, X, Z) = (D, H, W)
 
         if self.target_shape is not None:
@@ -221,18 +233,36 @@ class CryoEIFullDataset(Dataset):
                 align_corners=False,
             ).squeeze(0).squeeze(0)  # back to (D, H, W)
 
-        # Centre-crop to cube of side min(D, H, W)
-        D, H, W = vol.shape
-        S = min(D, H, W)
-        d0, h0, w0 = (D - S) // 2, (H - S) // 2, (W - S) // 2
-        vol = vol[d0:d0 + S, h0:h0 + S, w0:w0 + S]  # (S, S, S)
-
-        # Normalise after crop so stats reflect the kept region
         mu = vol.mean()
         sigma = vol.std()
         vol = (vol - mu) / (sigma + 1e-8)
 
-        return vol.unsqueeze(0)  # (1, S, S, S)
+        return vol.unsqueeze(0)  # (1, D, H, W)
+
+    def _crop_pair(self, evn: torch.Tensor, odd: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Crop EVN/ODD at one shared random origin (icecream's ``get_random_crop``).
+
+        ``self.crop_size is None`` → no crop, full (possibly non-cubic) volume —
+        used for FSC/inference. Otherwise a random cubic crop of that side,
+        clamped to fit; optionally re-normalised per crop (``normalize_crops``).
+        """
+        if self.crop_size is None:
+            return evn, odd
+
+        _, D, H, W = evn.shape
+        cs = min(self.crop_size, D, H, W)
+        d0 = random.randint(0, D - cs)
+        h0 = random.randint(0, H - cs)
+        w0 = random.randint(0, W - cs)
+
+        evn = evn[:, d0:d0 + cs, h0:h0 + cs, w0:w0 + cs]
+        odd = odd[:, d0:d0 + cs, h0:h0 + cs, w0:w0 + cs]
+
+        if self.normalize_crops:
+            evn = (evn - evn.mean()) / (evn.std() + 1e-8)
+            odd = (odd - odd.mean()) / (odd.std() + 1e-8)
+
+        return evn, odd
 
 
 # ---------------------------------------------------------------------------
@@ -279,9 +309,14 @@ def build_ei_full_dataloaders(cfg: EIFullDataConfig) -> EIDataBundle:
         fallback_tilt_max=cfg.fallback_tilt_max,
         data_source=cfg.data_source,
     )
-    train_ds = CryoEIFullDataset(train_evn, train_odd, tilt_ranges=train_tlt_ranges, **ds_kwargs)
+    # Train sees random crops (or the whole volume if crop_size is None);
+    # val/FSC always evaluates the whole volume — crop_size=None regardless
+    # of the training config.
+    train_ds = CryoEIFullDataset(train_evn, train_odd, tilt_ranges=train_tlt_ranges,
+                                  crop_size=cfg.crop_size, normalize_crops=cfg.normalize_crops,
+                                  **ds_kwargs)
     val_ds   = CryoEIFullDataset(val_evn,   val_odd,   tilt_ranges=val_tlt_ranges,
-                                  index_offset=len(train_evn), **ds_kwargs)
+                                  index_offset=len(train_evn), crop_size=None, **ds_kwargs)
 
     print(
         f"[ei-full] total={len(all_evn)}  "
