@@ -137,11 +137,24 @@ def save_fsc_figure(
     threshold: float = 0.143,
     vol_size: int | None = None,
     pixel_size: float | None = None,
+    fsc_curve_1: np.ndarray | None = None,
+    res_shell_1: int | None = None,
+    res_angstrom_1: float | None = None,
 ) -> None:
-    """Save an FSC curve PNG with threshold and resolution marker lines."""
+    """Save an FSC curve PNG with threshold and resolution marker lines.
+
+    ``fsc_curve_1`` optionally overlays the one-pass intermediate's curve on the
+    same axes. Reading them together is the point: the two-pass curve rising
+    while the one-pass curve falls is the signature of the Eq term's degenerate
+    solution (see EIFullTrainer.compute_loss).
+    """
     n = len(fsc_curve)
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(fsc_curve, lw=1.5)
+    ax.plot(fsc_curve, lw=1.5,
+            label=f"2 pass  {res_angstrom:.1f} Å" if fsc_curve_1 is not None else None)
+    if fsc_curve_1 is not None:
+        ax.plot(fsc_curve_1, lw=1.3, color="seagreen", label=f"1 pass  {res_angstrom_1:.1f} Å")
+        ax.axvline(res_shell_1, color="seagreen", ls=":", lw=1.1)
     ax.axhline(threshold, color="r", ls="--", label=f"thr={threshold}")
     if vol_size and pixel_size:
         tick_shells = np.linspace(max(1, n // 8), n - 1, num=8, dtype=int)

@@ -3,7 +3,7 @@ method: equivariant_full   # routes to run_full; `general.preset` below selects 
 general:
   input_dir: /lustre/fswork/projects/rech/fio/commun/cryolithe/empiar-11830
   output_root: ./runs
-  run_name: demo-cryo-full
+  run_name: unrolled
   execution_mode: submitit   # change to 'local' to run without SLURM
   train_names: ["tomo_001"]   # empty = random split by max_train_vols
   max_train_vols: 1 # null = all non-val volumes
@@ -11,39 +11,38 @@ general:
   seed: 0
   target_shape: null
   # ── THE SWITCH ──────────────────────────────────────────────────────────
-  # "missingwedge_ei" (default): denoiser + Fourier-wedge physics + Obs/Eq
-  #   losses, trained on precomputed FBP volumes.
-  # "unrolled": PGD-unfold + PnP(denoiser), trained on the real tilt series
-  #   (astra physics). Only this one line needs
-  #   to change; data_source (fbp vs measurement) follows automatically.
-  #   The "unrolled preset only" and "missingwedge_ei preset only" blocks
-  #   below are pre-filled either way — the inactive one is simply unread by
-  #   whichever preset isn't selected.
-  preset: missingwedge_ei   # "missingwedge_ei" | "unrolled"
+  preset: unrolled   # "missingwedge_ei" | "unrolled" | "tomo_ei" 
 
 training:
-  num_epochs: 10
+  num_epochs: 100
   learning_rate: 1.0e-4
-  grad_clip: 1.0
-  ckp_interval: 10
+  grad_clip: 10.0
+  # ReduceLROnPlateau on the training TotalLoss. false = off (default,
+  # unchanged behaviour — flat learning_rate for the whole run).
+  use_lr_scheduler: true
+  lr_scheduler_factor: 0.5
+  lr_scheduler_patience: 10
+  ckp_interval: 30
   eval_interval: 5
   # Accumulate gradients over this many full volumes before each optimiser step.
   # Compensates for DataLoader batch_size=1.
   grad_accumulation_steps: 1
-  use_mixed_precision: true  # true = fp16 forward + scaled backward (~2x faster, matches icecream default)
+  use_mixed_precision: true   
+  mixed_precision_dtype: bf16 # "fp16" | "bf16"
   model_type: unet         # "unet" | "drunet"
+  # torch.compile the denoiser (before the distribute()/DDP wrap). false = off.
+  compile: true
   # unet params
-  unet_dropout: 0.1
+  unet_dropout: 0.0
   # drunet params
   drunet_sigma: 0.0
   pretrained_ckpt: /lustre/fswork/projects/rech/fio/commun/Results_cryo/runs/demo-cryo-ei-patch_20260715-212312_40000_epochs_unet/slurm-1885787/checkpoints/ckp_final.pth
-
   # also loaded by the unrolled preset — build_unrolled_model loads it onto the
   # same denoiser wrapper class used here before the PGD/distribute wrap
 
 # unrolled preset only (PGD unfold) — ignored by missingwedge_ei
 unrolled:
-  n_iter: 3                # PGD steps (demo_tomo default)
+  n_iter: 2                # PGD steps 
   init_stepsize: 0.9       # demo_tomo default; operators are built with
                             # normalize=True (unit spectral norm), so this is
                             # used directly, no per-tomogram rescaling needed
@@ -64,9 +63,14 @@ distributed:
   overlap: [16, 16, 16]
   # Maximum number of tiles processed simultaneously on the GPU.
   # Reduce to save VRAM; increase to improve throughput.
-  max_batch_size: 2
+  max_batch_size: 1
   # Gradient checkpointing inside the distributed tiled forward pass.
   checkpoint_batches: "auto"
+  # Angle-sharded tomography physics (unrolled  only — the
+  # missing-wedge FFT has no valid split). null = one full operator per
+  # rank, no physics collective; "auto" = one operator per rank; an int =
+  # that many, round-robin (more than world_size lowers peak astra memory).
+  num_operators:  null
 
 # missingwedge_ei preset only — ignored by unrolled (it reads real angles
 # from each tomogram's own .tlt files instead)
@@ -76,7 +80,6 @@ missingwedge_ei:
   use_spherical_support: true
   wedge_double_size: false
   eq_weight: 2
-  loss_type: icecream   # "icecream" | "custom"
   wedge_low_support: 0.0
   ref_wedge_support: 1.0
 
@@ -88,7 +91,7 @@ evaluation:
 
 
 slurm:
-  job_name: demo-cryo-ei-full
+  job_name: unrolled
   nodes: 1
   gpus_per_node: 4
   ntasks_per_node: 4
@@ -103,3 +106,4 @@ slurm:
     - "module load arch/h100"
     - "module load pytorch-gpu/py3/2.7.0"
     - "export NCCL_DEBUG=INFO"
+    - "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"

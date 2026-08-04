@@ -75,6 +75,9 @@ class BaseTrainer(dinv.Trainer):
         self._patch_probe_dir: Path | None = None
         # forward-pass strategy (how x_net/y_net are computed from a batch + physics)
         self._forward_strategy = ei_denoiser_forward
+        # ReduceLROnPlateau, stepped manually from log_metrics_mlops (not
+        # self.scheduler — see _build_plateau_scheduler in run.py).
+        self._plateau_scheduler = None
         # hook: called right after optimizer.step() (e.g. clamping trainable
         # algo params — unrolled preset's stepsize must stay positive). No-op
         # by default; harmless for missingwedge_ei.
@@ -171,6 +174,7 @@ class BaseTrainer(dinv.Trainer):
 
             self._save_train_figures(x, y, epoch, physics)
             self._last_train_xnet = self._last_train_ynet = None
+            logs.setdefault("gradient_norm", "")
 
         return loss_total, x_net, logs
 
@@ -179,6 +183,15 @@ class BaseTrainer(dinv.Trainer):
     # ------------------------------------------------------------------
 
     def log_metrics_mlops(self, logs: dict, step: int, train: bool = True) -> None:  # type: ignore[override]
+        if train and self._plateau_scheduler is not None and "TotalLoss" in logs:
+            # All-reduce first: each rank has its own optimizer, and a per-rank
+            # local loss could trigger LR drops on different epochs per rank,
+            # desyncing the model replicas. Must run before the rank0 return below.
+            loss_t = torch.tensor(float(logs["TotalLoss"]), device=self.device)
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(loss_t, op=torch.distributed.ReduceOp.AVG)
+            self._plateau_scheduler.step(loss_t.item())
+
         if not self._is_rank0:
             return
 
@@ -189,12 +202,8 @@ class BaseTrainer(dinv.Trainer):
 
         if train:
             self._epoch_probe.__exit__(None, None, None)
-            # Hand PyTorch's cached-but-free blocks back to the CUDA driver at
-            # the epoch boundary. astra (TomographyEM) allocates via raw CUDA
-            # and cannot draw on PyTorch's cache, so without this its
-            # allocateVolumeArray can fail while PyTorch sits on many GB of
-            # unused reserved memory. Once per epoch, so the sync costs nothing
-            # measurable next to a full training epoch.
+            # astra allocates raw CUDA outside PyTorch's cache; without this it
+            # can OOM while PyTorch sits on unused reserved memory.
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             n = max(1, self._train_batch_count)
@@ -235,6 +244,9 @@ class BaseTrainer(dinv.Trainer):
                 t, n = self._val_probe.elapsed_s, max(1, self._val_batch_count)
                 print(f"[val   ep={step}]  total={t:.1f}s  per_img={t/n:.2f}s  n={n}", flush=True)
             self._val_probe = None
+            # Same reasoning as the train-side empty_cache() above.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     def _enable_mixed_precision(self, dtype: str = "fp16", device_type: str = "cuda") -> None:
         if dtype not in ("fp16", "bf16"):
@@ -272,37 +284,61 @@ class EIFullTrainer(BaseTrainer):
             if hasattr(self.device, "type") and self.device.type == "cuda":
                 torch.cuda.synchronize()
 
+            # Scored apart by FSC (comparable to patch inference); averaged only for display.
+            with torch.no_grad():
+                r_evn, r_odd = self._recon_strategy(self.model, physics, f_evn_t, f_odd_t)
+
             if not hasattr(self, "_gpu_fsc"):
                 self._gpu_fsc = GpuFSC(device=f_evn_t.device)
 
-            fsc_curve  = self._gpu_fsc(f_evn_t, f_odd_t)
-            k, res, D  = fsc_resolution(fsc_curve, f_evn_t.squeeze().shape,
+            fsc_curve  = self._gpu_fsc(r_evn, r_odd)
+            k, res, D  = fsc_resolution(fsc_curve, r_evn.squeeze().shape,
                                         px, self._fsc_threshold)
             self._val_resolutions.append(res)
 
+            # 1-pass f(.) score, before the round trip — guards against the Eq
+            # term's collapse mode (2-pass score rising while this one falls).
+            has_round_trip = self._recon_strategy is half_set_recon
+            res_1 = k_1 = fsc_curve_1 = None
+            if has_round_trip:
+                fsc_curve_1 = self._gpu_fsc(f_evn_t, f_odd_t)
+                k_1, res_1, _ = fsc_resolution(fsc_curve_1, f_evn_t.squeeze().shape,
+                                               px, self._fsc_threshold)
+
             name = (self._fsc_tomo_names[vol_idx] if vol_idx < len(self._fsc_tomo_names)
                     else f"vol{vol_idx:02d}")
+            if self._is_rank0:
+                _p = getattr(physics, "physics_evn", physics)   # TomographyEMPair holds the operator
+                print(f"[physics] {name}  tilt=[{_p._tilt_min:.1f}, {_p._tilt_max:.1f}]°", flush=True)
             if self._is_rank0 and self._metrics_dir is not None:
                 append_fsc_row(self._metrics_dir / "fsc_per_volume.csv",
                                curve=fsc_curve if self._save_fsc_curves else None,
+                               curve_1pass=fsc_curve_1 if self._save_fsc_curves else None,
                                mode="train", regime="full", split=self._fsc_split,
                                epoch=epoch, vol_idx=vol_idx, tomo=name,
                                pixel_size=px, n_ref=D,
                                fsc_threshold=self._fsc_threshold,
-                               fsc_shell=int(k), fsc_res_angstrom=float(res))
+                               fsc_shell=int(k), fsc_res_angstrom=float(res),
+                               **({"fsc_shell_1pass": int(k_1),
+                                   "fsc_res_1pass_angstrom": float(res_1)} if has_round_trip else {}))
 
-            # All ranks must call the (possibly distributed) model; only rank-0 saves.
-            with torch.no_grad():
-                recon_t = self._recon_strategy(self.model, physics, f_evn_t, f_odd_t)
+            recon_t = 0.5 * (r_evn + r_odd)
             if self._images_dir is not None:
                 save_fsc_figure(self._images_dir, epoch, f"{name}.png",
                                 fsc_curve, k, res, f"Epoch {epoch} | {name}",
-                                self._fsc_threshold, vol_size=D, pixel_size=px)
+                                self._fsc_threshold, vol_size=D, pixel_size=px,
+                                fsc_curve_1=fsc_curve_1, res_shell_1=k_1,
+                                res_angstrom_1=res_1)
                 pa, pb, pl = recon_panels(x, y, physics)
+                cols, labels = [pa, pb], list(pl)
+                if has_round_trip:
+                    recon_1 = 0.5 * (f_evn_t + f_odd_t)
+                    cols.append(_znorm_np(to_canonical_np(recon_1.squeeze().cpu().numpy(), physics)))
+                    labels.append(f"1 pass  f(.)\n{res_1:.1f} Å")
+                cols.append(_znorm_np(to_canonical_np(recon_t.squeeze().cpu().numpy(), physics)))
+                labels.append(f"2 pass  f(A(f(.)))\n{res:.1f} Å" if has_round_trip else "recon")
                 save_slice_figure(
-                    self._images_dir, epoch, vol_idx,
-                    [pa, pb, _znorm_np(to_canonical_np(recon_t.squeeze().cpu().numpy(), physics))],
-                    labels=[*pl, "recon"],
+                    self._images_dir, epoch, vol_idx, cols, labels=labels,
                     title=f"Epoch {epoch} | {name} — inference recon",
                     fname=f"{name}_recon.png",
                 )
@@ -324,8 +360,9 @@ class EIFullTrainer(BaseTrainer):
             return
         # All ranks must call the (possibly distributed) model; only rank-0 saves.
         with torch.no_grad():
-            recon_t = self._recon_strategy(
+            r_evn, r_odd = self._recon_strategy(
                 self.model, physics, self._last_train_xnet, self._last_train_ynet)
+        recon_t = 0.5 * (r_evn + r_odd)
         if self._train_images_dir is None:
             return
         pa, pb, pl = recon_panels(x, y, physics)

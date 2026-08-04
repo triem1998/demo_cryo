@@ -9,45 +9,41 @@ general:
   val_names: ["tomo_001"]   # volumes to evaluate; empty = first max_infer_vols of a seeded shuffle
   max_infer_vols: 1
   seed: 0                 # only used when val_names is empty
-  preset: missingwedge_ei # "missingwedge_ei" or "unrolled" — data_source (fbp vs measurement)
+  preset: tomo_ei # "missingwedge_ei" | "unrolled" | "tomo_ei" — data_source (fbp vs measurement)
                           # follows this automatically; must match the training run's preset
-
+  
 distributed:
-  patch_size: [80, 80, 80]
-  overlap: [24, 24, 24]
-  max_batch_size: 4
+  patch_size: [128, 128, 128]
+  overlap: [16, 16, 16]
+  max_batch_size: 1
   checkpoint_batches: "auto"
+  # Angle-sharded tomography physics (unrolled / tomo_ei only — the
+  # missing-wedge FFT has no valid split). null = one full operator per
+  # rank, no physics collective; "auto" = one operator per rank; an int =
+  # that many, round-robin (more than world_size lowers peak astra memory).
+  num_operators: null
 
+# Shared by all three presets — checkpoint/model architecture, FSC, output.
 inference:
-  checkpoint_path: #
+  checkpoint_paths: [/lustre/fswork/projects/rech/fio/commun/Results_cryo/runs/tomo_ei_200_epochs/slurm-471044/checkpoints/ckp_final.pth]
+  # This is a raw patch checkpoint (native axis order), not one produced by a
+  # tomo_ei/unrolled run — must permute its conv kernels to astra order. Set
+  # to false once checkpoint_paths points at an actual tomo_ei checkpoint.
+  permute_native_to_astra: false
+
   # DataLoader
   num_workers: 1
   pin_memory: true
   prefetch_factor: 1
   persistent_workers: true
 
-  # Model (must match training config)
-  model_type: unet        # "unet" or "drunet" — reused as the PnP prior when preset=unrolled
-  unet_dropout: 0.1
+  # Model (must match training config) — model_type/unet_dropout/drunet_sigma
+  # apply to all three presets (unrolled reuses it as the PnP prior).
+  model_type: unet        # "unet" or "drunet"
+  # torch.compile the denoiser (before the distribute()/DDP wrap). false = off.
+  compile: true
+  unet_dropout: 0.0
   drunet_sigma: 0.0
-
-  # Physics — missingwedge_ei only (ignored when preset=unrolled, which reads
-  # real angles from each tomogram's own .tlt files instead)
-  tilt_max: 60.0
-  tilt_min: -60.0
-  use_spherical_support: true
-  wedge_double_size: false
-  wedge_low_support: 0.0
-  ref_wedge_support: 1.0
-
-  # Unrolled preset only (ignored when preset=missingwedge_ei) — must match
-  # the training config exactly: n_iter/model_type/train_algo_params
-  # determine the checkpoint's state_dict shape and will fail to load if
-  #  
-  n_iter: 4
-  init_stepsize: 0.9
-  train_algo_params: true
-  stepsize_learning_rate: null
 
   # FSC
   fsc_threshold: 0.143
@@ -61,6 +57,26 @@ inference:
   # Output
   save_recon_mrc: false
 
+# missingwedge_ei preset only — ignored by unrolled/tomo_ei (both read real
+# angles from each tomogram's own .tlt files instead). Must match the
+# training config's physics.
+missingwedge_ei:
+  tilt_max: 60.0
+  tilt_min: -60.0
+  use_spherical_support: true
+  wedge_double_size: false
+  wedge_low_support: 0.0
+  ref_wedge_support: 1.0
+
+# unrolled preset only — ignored by missingwedge_ei/tomo_ei. Must match the
+# training config exactly: n_iter/model_type/train_algo_params determine the
+# checkpoint's state_dict shape and will fail to load if mismatched.
+unrolled:
+  n_iter: 2
+  init_stepsize: 0.9
+  train_algo_params: true
+  stepsize_learning_rate: null
+
 
 slurm:
   job_name: demo-cryo-ei-inference
@@ -69,7 +85,7 @@ slurm:
   ntasks_per_node: 4
   cpus_per_task: 20
   time: "02:00:00"
-  account: #
+  account:  #
   constraint: "h100"
   qos: "qos_gpu_h100-dev"
   stderr_to_stdout: true

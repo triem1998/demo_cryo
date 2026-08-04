@@ -54,8 +54,9 @@ src/
     physics.py               # MissingWedge (missing-wedge forward operator)
     transform.py             # Rotate3D (cube-symmetry group)
     losses/
-      losses.py              # ObsLoss, EqLoss (icecream-based)
-      losses_custom.py       # ObsLoss, EqLoss (direct torch.fft, no icecream dependency)
+      losses_equivariant_wedge.py  # ObsLoss, EqLoss (missingwedge_ei, icecream-based)
+      losses_equivariant_tomo.py   # EqLoss (tomo_ei, true physics)
+      losses_unrolled.py           # ObsLoss (unrolled / tomo_ei)
     dataset/
       dataset_full.py        # full-volume dataset + dataloaders
       dataset_patch.py       # patch dataset + dataloaders
@@ -111,7 +112,6 @@ Uses deepinv's [distributed tiling framework](https://github.com/deepinv/deepinv
 | `use_spherical_support` | Spherical rather than cylindrical wedge |
 | `wedge_double_size` | Pad FFT to 2× before applying wedge (patch mode) |
 | `eq_weight` | Weight of the equivariant loss term |
-| `loss_type` | `"icecream"` (default) or `"custom"` (direct torch.fft, no icecream dependency) |
 | `pixel_size_angstrom` | Pixel size for FSC resolution reporting |
 
 **`training`** (patch)

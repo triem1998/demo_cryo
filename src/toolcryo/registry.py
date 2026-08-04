@@ -6,8 +6,8 @@ or a small standalone glue function (forward.py). Nothing is defined here.
 """
 from .physics import build_missingwedge_physics, build_tomography_physics
 from .models import build_ei_model, build_unrolled_model, clamp_stepsize
-from .losses import build_ei_losses, build_tomography_losses
-from .forward import ei_denoiser_forward, unrolled_forward
+from .losses import build_ei_losses, build_tomography_losses, build_tomo_ei_losses
+from .forward import ei_denoiser_forward, tomo_ei_forward, unrolled_forward
 from .utils.utils import half_set_recon, unrolled_recon
 
 PRESETS = {
@@ -29,6 +29,21 @@ PRESETS = {
         "forward": unrolled_forward,
         "post_optimizer_step": clamp_stepsize,
         "recon": unrolled_recon,
+    },
+    # True-physics EI: same TomographyEMPair physics as unrolled, but a plain
+    # denoiser (missingwedge_ei's model builder) applied to each half's FBP
+    # volume instead of PGD-unfolding through the operator. run_full branches
+    # on preset name for the physics/model build calls (non-uniform
+    # signatures, same as unrolled).
+    "tomo_ei": {
+        "physics": build_tomography_physics,
+        "model": build_ei_model,
+        "losses": build_tomo_ei_losses,
+        "forward": tomo_ei_forward,
+        "post_optimizer_step": lambda model: None,
+        # Same two-pass round trip as missingwedge_ei — half_set_recon routes
+        # through fbp(A(.)) for TomographyEMPair (A maps volume -> sinogram here).
+        "recon": half_set_recon,
     },
 }
 

@@ -12,9 +12,14 @@ general:
   seed: 0
 
 training:
-  num_epochs: 1000
+  num_epochs: 5000
   learning_rate: 1.0e-4
   grad_clip: 1.0
+  # ReduceLROnPlateau on the training TotalLoss. false = off (default,
+  # unchanged behaviour — flat learning_rate for the whole run).
+  use_lr_scheduler: false
+  lr_scheduler_factor: 0.5
+  lr_scheduler_patience: 10
   ckp_interval: 5000
   eval_interval: 500 # print loss summary every N epochs
   grad_accumulation_steps: 1
@@ -26,6 +31,8 @@ training:
   save_mrc: false          # save reconstruction as .mrc file
   use_mixed_precision: true  # true = fp16 forward + scaled backward (~2x faster, matches icecream default)
   model_type: unet         # "unet" | "drunet"
+  # torch.compile the denoiser (before the distribute()/DDP wrap). false = off.
+  compile: false
   # unet params
   unet_dropout: 0.1
   # drunet params
@@ -40,10 +47,11 @@ patch:
   prefetch_factor: 1
   persistent_workers: true
   normalize: true            # whole-volume zero-mean, unit-std (matches icecream's load_volume normalization)
+  normalize_crops: false     # also re-normalise each crop (icecream's normalize_crops)
   # Crop origins [d, h, w] evaluated on the val set every log interval; saved to runs/.../patch_probe/
   patch_positions:
-    - [0, 0, 0]
-    - [100, 100, 50]
+    - [628, 312, 256]
+    - [576, 572, 256]
 
 equivariant:
   tilt_max: 60.0
@@ -51,7 +59,6 @@ equivariant:
   use_spherical_support: true
   wedge_double_size: true
   eq_weight: 2.0
-  loss_type: icecream   # "icecream" | "custom"
 
 
   wedge_low_support: 0.0
@@ -65,7 +72,7 @@ slurm:
   ntasks_per_node: 2   # one task per GPU 
   cpus_per_task: 20    
   time: "02:00:00"
-  account:   # your account here
+  account:  fio@h100 # your account here
   constraint: "h100"
   qos: "qos_gpu_h100-dev"
   stderr_to_stdout: true

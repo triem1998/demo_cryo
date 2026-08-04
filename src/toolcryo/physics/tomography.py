@@ -10,8 +10,29 @@ from pathlib import Path
 import numpy as np
 import torch
 import deepinv as dinv
+from deepinv.distributed import distribute
+from deepinv.utils.tensorlist import TensorList
 
 from ..utils.utils import load_mrc_volume
+
+
+def projection_splits(num_angles: int, num_operators: int) -> list[tuple[int, int]]:
+    """Contiguous ``[start, end)`` angle ranges, one per operator (demo_tomo's split)."""
+    base, rem = divmod(int(num_angles), int(num_operators))
+    sizes = [base + (1 if i < rem else 0) for i in range(num_operators)]
+    edges = [0]
+    for s in sizes:
+        edges.append(edges[-1] + s)
+    return [(edges[i], edges[i + 1]) for i in range(num_operators)]
+
+
+def split_sinogram(y: torch.Tensor, num_operators: int) -> TensorList:
+    """Split a ``(B, C, V, A, N)`` sinogram along the angle axis to match the
+    sharded operators — the measurement counterpart of ``projection_splits``.
+    Same layout and axis as demo_tomo's ``split_sinogram``.
+    """
+    chunks = projection_splits(int(y.shape[3]), num_operators)
+    return TensorList([y[:, :, :, s:e, :].contiguous() for (s, e) in chunks])
 
 
 class TomographyEM(dinv.physics.LinearPhysics):
@@ -75,6 +96,10 @@ class TomographyEM(dinv.physics.LinearPhysics):
 
         angles = torch.as_tensor(angles_deg, dtype=torch.float32) * float(angle_sign)
         self.n_angles = int(angles.numel())
+        # Logging only — pre-sign-flip, so it matches the .tlt file. Same
+        # private names MissingWedge uses, so one log line reads either physics.
+        self._tilt_min = float(torch.as_tensor(angles_deg).min())
+        self._tilt_max = float(torch.as_tensor(angles_deg).max())
 
         self.xray = dinv.physics.TomographyWithAstra(
             img_size=self.volume_shape,
@@ -160,6 +185,10 @@ class TomographyEMPair:
     odd_paths: list
     device: object
     target_shape: tuple | None
+    # None = one full operator per rank (no physics collective). An int shards
+    # the angles into that many operators, distributed round-robin across ranks.
+    num_operators: int | None = None
+    ctx: object = None
     _tomo_idx: int = 0
 
     def update(self, tomo_idx=None, **kwargs) -> None:
@@ -180,10 +209,53 @@ class TomographyEMPair:
             return
         evn_path, odd_path = self.evn_paths[tomo_idx], self.odd_paths[tomo_idx]
         self.physics_evn, self.init_evn = build_one_tomography_em(
-            evn_path.parent, "split1", evn_path, self.device, self.target_shape)
+            evn_path.parent, "split1", evn_path, self.device, self.target_shape,
+            self.num_operators, self.ctx)
         self.physics_odd, self.init_odd = build_one_tomography_em(
-            odd_path.parent, "split2", odd_path, self.device, self.target_shape)
+            odd_path.parent, "split2", odd_path, self.device, self.target_shape,
+            self.num_operators, self.ctx)
+        # A different tomogram means different angles, hence a different global
+        # norm — re-normalise so the sharded operator stays unit-norm per volume.
+        if self.num_operators is not None:
+            normalize_sharded(self.physics_evn, self.init_evn)
+            normalize_sharded(self.physics_odd, self.init_odd)
         self._tomo_idx = tomo_idx
+
+
+def measure_opnorm_sq(physics, init: torch.Tensor) -> float:
+    """``||A^T A||_2`` of a distributed (sharded) operator.
+
+    Only needed when sharding: the shards are built with ``normalize=False``
+    because each one's own norm is not the full operator's.
+
+    ``local_only=False`` runs the power iteration over the *assembled* operator,
+    communicating at each step. deepinv's default (``True``) only sums the
+    per-shard norms, an upper bound that grows with the shard count — which
+    would make the stepsize, and so the reconstruction, depend on
+    ``num_operators``. Paid once at build time, not per step.
+    """
+    # Full (B, C, D, H, W) init, not the unbatched form deepinv's docstring
+    # suggests: the power iteration feeds x0 straight into A, and astra's
+    # forward unpacks five dims.
+    return float(physics.compute_sqnorm(init, local_only=False, verbose=False))
+
+
+def normalize_sharded(physics, init: torch.Tensor) -> float:
+    """Give a sharded operator the unit spectral norm ``normalize=True`` gives
+    the unsharded one, by rescaling every shard with the *global* norm.
+
+    Scaling only the PGD stepsize by :math:`1/\\|A\\|^2` fixes the :math:`A^{T}A` term of the 
+    data-fidelity gradient but leaves the :math:`A^{T}y` term off by one factor of the norm,
+    so the two paths converge to different reconstructions. Normalising the
+    operator itself makes the sharded and unsharded physics identical.
+
+    :return: the measured ``||A^T A||_2`` before normalisation (diagnostic).
+    """
+    sqnorm = measure_opnorm_sq(physics, init)
+    for p in physics.local_physics:
+        p.xray.operator_norm = sqnorm ** 0.5
+        p.xray.normalize = True
+    return sqnorm
 
 
 def load_fbp_init(
@@ -219,7 +291,20 @@ def load_fbp_init(
 def build_one_tomography_em(
     tomo_dir: Path, split: str, vol_path: Path, device,
     target_shape: tuple[int, int, int] | None,
+    num_operators: int | None = None, ctx=None,
 ) -> tuple["TomographyEM", torch.Tensor]:
+    """``num_operators=None`` (default): one full operator held locally by every
+    rank — no physics collective, today's behaviour.
+
+    An int shards the tilt angles into that many operators and distributes them
+    round-robin across ranks (deepinv only parallelises a *collection* of
+    operators; it cannot split one, so the split is built here — same recipe as
+    demo_tomo). Shards are built with ``normalize=False``: each shard's own
+    spectral norm differs from the full operator's, so per-shard normalisation
+    would be wrong. The global norm is measured once by the caller
+    (``build_tomography_physics``) via ``compute_sqnorm`` and folded into the
+    PGD stepsize instead.
+    """
     ang_matches = sorted(tomo_dir.glob(f"angles_*_{split}.tlt"))
     if not ang_matches:
         raise FileNotFoundError(f"build_unrolled_physics: no angles_*_{split}.tlt in {tomo_dir}")
@@ -228,11 +313,31 @@ def build_one_tomography_em(
     init = load_fbp_init(vol_path, device, target_shape)
     volume_shape = tuple(init.shape[-3:])
 
-    physics = TomographyEM(
-        volume_shape=volume_shape,
-        angles_deg=angles,
-        angle_sign=_TOMO_ANGLE_SIGN,
-        normalize=True,
-        device=str(device),
-    )
+    if num_operators is None:
+        physics = TomographyEM(
+            volume_shape=volume_shape,
+            angles_deg=angles,
+            angle_sign=_TOMO_ANGLE_SIGN,
+            normalize=True,
+            device=str(device),
+        )
+        return physics, init
+
+    splits = projection_splits(len(angles), int(num_operators))
+
+    def _factory(index: int, dev, shared=None):
+        start, end = splits[index]
+        return TomographyEM(
+            volume_shape=volume_shape,
+            angles_deg=angles[start:end],
+            angle_sign=_TOMO_ANGLE_SIGN,
+            normalize=False,
+            device=str(dev),
+        )
+
+    physics = distribute(_factory, ctx, type_object="linear_physics",
+                         num_operators=int(num_operators))
+    # The shards each hold a slice of the angles; carry the *global* range on the
+    # container so logging reports the tomogram's real tilt range, not a shard's.
+    physics._tilt_min, physics._tilt_max = float(angles.min()), float(angles.max())
     return physics, init

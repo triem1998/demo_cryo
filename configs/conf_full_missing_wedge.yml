@@ -1,0 +1,118 @@
+method: equivariant_full   # routes to run_full; `general.preset` below selects the actual method
+
+general:
+  input_dir: /lustre/fswork/projects/rech/fio/commun/cryolithe/empiar-11830
+  output_root: ./runs
+  run_name: full
+  execution_mode: submitit   # change to 'local' to run without SLURM
+  train_names: ["tomo_001"]   # empty = random split by max_train_vols
+  max_train_vols: 1 # null = all non-val volumes
+  max_val_vols: 0
+  seed: 0
+  target_shape: null
+  # ── THE SWITCH ──────────────────────────────────────────────────────────
+  preset: missingwedge_ei   # "missingwedge_ei" | "unrolled" | "tomo_ei"
+
+training:
+  num_epochs: 100
+  learning_rate: 1.0e-4
+  grad_clip: 1.0
+  # ReduceLROnPlateau on the training TotalLoss. false = off (default,
+  # unchanged behaviour — flat learning_rate for the whole run).
+  use_lr_scheduler: false
+  lr_scheduler_factor: 0.5
+  lr_scheduler_patience: 10
+  ckp_interval: 50
+  eval_interval: 5
+  crop_size: 512   # random training crop side for missingwedge_ei ; eval always sees the whole volume
+  normalize_crops: false   # also re-normalise each crop (missingwedge_ei)
+  # Accumulate gradients over this many full volumes before each optimiser step.
+  # Compensates for DataLoader batch_size=1.
+  grad_accumulation_steps: 2
+  use_mixed_precision: true
+  model_type: unet         # "unet" | "drunet"
+  # torch.compile the denoiser (before the distribute()/DDP wrap). false = off.
+  compile: true
+  # unet params
+  unet_dropout: 0.0
+  # drunet params
+  drunet_sigma: 0.0
+  pretrained_ckpt: /lustre/fswork/projects/rech/fio/commun/Results_cryo/runs/demo-cryo-ei-patch_20260715-212312_40000_epochs_unet/slurm-1885787/checkpoints/ckp_final.pth
+
+  # also loaded by the unrolled preset — build_unrolled_model loads it onto the
+  # same denoiser wrapper class used here before the PGD/distribute wrap
+
+# unrolled preset only (PGD unfold) — ignored by missingwedge_ei
+unrolled:
+  n_iter: 2                # PGD steps (demo_tomo default)
+  init_stepsize: 0.9       # demo_tomo default; operators are built with
+                            # normalize=True (unit spectral norm), so this is
+                            # used directly, no per-tomogram rescaling needed
+  train_algo_params: true  # learn stepsize (+ g_param for drunet) jointly
+                            # with the denoiser
+  stepsize_learning_rate: null   # null = share `training.learning_rate`
+
+data:
+  batch_size: 1          # always 1 full volume per item
+  num_workers: 1
+  pin_memory: true
+  prefetch_factor: 1
+  persistent_workers: true
+
+distributed:
+  # UNet tile size — must be strictly < target_shape in every dimension.
+  patch_size: [128, 128, 128]
+  overlap: [16, 16, 16]
+  # Maximum number of tiles processed simultaneously on the GPU.
+  # Reduce to save VRAM; increase to improve throughput.
+  max_batch_size: 2
+  # Gradient checkpointing inside the distributed tiled forward pass.
+  checkpoint_batches: "auto"
+  # Angle-sharded tomography physics (unrolled / tomo_ei only — the
+  # missing-wedge FFT has no valid split). null = one full operator per
+  # rank, no physics collective; "auto" = one operator per rank; an int =
+  # that many, round-robin (more than world_size lowers peak astra memory).
+  num_operators: null
+
+# Equivariance loss weight — shared by missingwedge_ei's Fourier EqLoss and
+# tomo_ei's true-physics EqLoss. Not read by unrolled (no Eq term, v1 scope).
+# For tomo_ei: Eq is skipped entirely (not zero-weighted) when this is 0 —
+# it roughly doubles astra's GPU memory/compute vs Obs-only.
+equivariant:
+  eq_weight: 2
+
+# missingwedge_ei preset only — ignored by unrolled/tomo_ei (both read real
+# angles from each tomogram's own .tlt files instead)
+missingwedge_ei:
+  tilt_max: 60.0
+  tilt_min: -60.0
+  use_spherical_support: true
+  wedge_double_size: false
+  wedge_low_support: 0.0
+  ref_wedge_support: 1.0
+
+# shared by both presets
+evaluation:
+  eval_fsc: true
+  fsc_threshold: 0.143   # gold-standard FSC resolution criterion
+  pixel_size_angstrom: 7.84
+
+
+slurm:
+  job_name: ei-full
+  nodes: 1
+  gpus_per_node: 4
+  ntasks_per_node: 4
+  cpus_per_task: 24
+  time: "02:00:00"
+  account:  # your account here
+  constraint: "h100"
+  qos: "qos_gpu_h100-dev"
+  stderr_to_stdout: true
+  setup:
+    - "module purge"
+    - "module load arch/h100"
+    - "module load pytorch-gpu/py3/2.7.0"
+    - "export NCCL_DEBUG=INFO"
+    - "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
+

@@ -50,7 +50,8 @@ class EIPatchDataConfig:
     seed: int = 0
     train_names: list[str] | None = None   # select train vols by name; None = split
     val_names: list[str] | None = None     # select val vols by name; None = split
-    normalize: bool = True             # zero-mean, unit-std per patch
+    normalize: bool = True              # whole-volume zero-mean, unit-std (icecream's load_volume)
+    normalize_crops: bool = False       # also re-normalise each crop (icecream's normalize_crops)
     # Glob patterns — same as CryoEIFullDataset
     evn_glob: str = "vol*split1*.mrc"
     odd_glob: str = "vol*split2*.mrc"
@@ -84,6 +85,17 @@ def _open_mrc_mmap(path_str: str) -> tuple:
     # moveaxis creates a non-contiguous view — no data pages are read here
     vol = np.moveaxis(data, 0, 2)   # (Z, Y, X) → (Y, X, Z) = (D, H, W)
     return mrc, vol
+
+
+@lru_cache(maxsize=64)
+def _vol_mean_std(path_str: str) -> tuple[float, float]:
+    """Whole-volume mean/std (icecream's ``load_volume`` normalisation),
+    computed once per (path, process) and cached. Reduces over the memmap
+    directly — no full-volume copy is materialised in RAM — so only the
+    first crop drawn from a given volume in a worker pays the one-time full
+    file read; every crop after that costs the same as it did before this."""
+    _, vol = _open_mrc_mmap(path_str)
+    return float(vol.mean()), float(vol.std())
 
 
 # ---------------------------------------------------------------------------
@@ -135,8 +147,12 @@ class CryoEIPatchDataset(Dataset):
     Repeated access to the same region within a worker is served from the OS
     page cache (no disk I/O after the first touch).
 
-    Normalisation (zero-mean, unit-std per patch) is applied independently to
-    each patch after cropping when ``normalize=True``.
+    Normalisation is whole-volume (icecream's ``load_volume``), applied
+    before cropping when ``normalize=True``; each crop is optionally
+    re-normalised on top of that when ``normalize_crops=True`` (icecream's
+    ``normalize_crops``). Whole-volume stats are cached per (path, process)
+    so only the first crop drawn from a volume in a worker pays the cost of
+    the full-file read.
 
     When only EVN is available, ``odd_patch`` is a copy of ``evn_patch`` so
     the single-half ObsLoss fallback ``L = fourier_loss(y, f(y), wedge)``
@@ -146,7 +162,8 @@ class CryoEIPatchDataset(Dataset):
     :param list[Path | None] odd_paths: Paths to ODD half-set MRC volumes (or None).
     :param int crop_size: Cubic crop side length (default 72).
     :param int n_crops_per_vol: Virtual crops per volume per epoch (default 10).
-    :param bool normalize: Standardise each patch independently (default True).
+    :param bool normalize: Whole-volume standardise, applied before cropping (default True).
+    :param bool normalize_crops: Also standardise each crop after cropping (default False).
     :param list tilt_ranges: Per-volume (tilt_min, tilt_max) or None.
     :param float fallback_tilt_min: Used when tilt_ranges[i] is None.
     :param float fallback_tilt_max: Used when tilt_ranges[i] is None.
@@ -159,6 +176,7 @@ class CryoEIPatchDataset(Dataset):
         crop_size: int = 72,
         n_crops_per_vol: int = 10,
         normalize: bool = False,
+        normalize_crops: bool = False,
         tilt_ranges: list[tuple[float, float] | None] | None = None,
         fallback_tilt_min: float = -60.0,
         fallback_tilt_max: float = 60.0,
@@ -169,6 +187,7 @@ class CryoEIPatchDataset(Dataset):
         self.crop_size         = crop_size
         self.n_crops_per_vol   = n_crops_per_vol
         self.normalize         = normalize
+        self.normalize_crops   = normalize_crops
         self.fallback_tilt_min = fallback_tilt_min
         self.fallback_tilt_max = fallback_tilt_max
         self._tilt_ranges: list[tuple[float, float] | None] = (
@@ -198,12 +217,12 @@ class CryoEIPatchDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, dict]:
         vol_idx = idx % len(self.evn_paths)
 
-        _, evn_vol = _open_mrc_mmap(str(self.evn_paths[vol_idx]))
+        evn_path = str(self.evn_paths[vol_idx])
         odd_p = self.odd_paths[vol_idx]
-        if odd_p is not None:
-            _, odd_vol = _open_mrc_mmap(str(odd_p))
-        else:
-            odd_vol = evn_vol
+        odd_path = str(odd_p) if odd_p is not None else evn_path
+
+        _, evn_vol = _open_mrc_mmap(evn_path)
+        _, odd_vol = _open_mrc_mmap(odd_path)
 
         D, H, W = evn_vol.shape
         cs = self.crop_size
@@ -222,8 +241,13 @@ class CryoEIPatchDataset(Dataset):
         ).unsqueeze(0)
 
         if self.normalize:
-            evn_patch = (evn_patch - evn_patch.mean()) / (evn_patch.std() + 1e-8)
-            odd_patch = (odd_patch - odd_patch.mean()) / (odd_patch.std() + 1e-8)
+            evn_mu, evn_sigma = _vol_mean_std(evn_path)
+            odd_mu, odd_sigma = _vol_mean_std(odd_path)
+            evn_patch = (evn_patch - evn_mu) / (evn_sigma + 1e-8)
+            odd_patch = (odd_patch - odd_mu) / (odd_sigma + 1e-8)
+            if self.normalize_crops:
+                evn_patch = (evn_patch - evn_patch.mean()) / (evn_patch.std() + 1e-8)
+                odd_patch = (odd_patch - odd_patch.mean()) / (odd_patch.std() + 1e-8)
 
         tilt = self._tilt_ranges[vol_idx]
         if tilt is None:
@@ -325,6 +349,7 @@ def build_ei_patch_dataloaders(cfg: EIPatchDataConfig, rank: int = 0, world_size
         crop_size=int(cfg.crop_size),
         n_crops_per_vol=int(cfg.n_crops_per_vol),
         normalize=bool(cfg.normalize),
+        normalize_crops=bool(cfg.normalize_crops),
         fallback_tilt_min=cfg.fallback_tilt_min,
         fallback_tilt_max=cfg.fallback_tilt_max,
     )
