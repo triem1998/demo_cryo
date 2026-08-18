@@ -199,15 +199,6 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
         # Physics doesn't depend on checkpoint content — build once, reused
         # across every checkpoint in cfg.checkpoint_paths.
         if is_tomo:
-            # See run.py's matching guard: tomo_ei calls physics.fbp() every
-            # eval (half_set_recon), which sharded physics doesn't implement.
-            if not is_unrolled and cfg.num_operators is not None:
-                raise ValueError(
-                    f"num_operators={cfg.num_operators!r} is not supported for preset "
-                    f"{cfg.preset!r}: it calls physics.fbp() (half_set_recon), which "
-                    f"sharded (distributed) physics does not implement. Set "
-                    f"num_operators: null for this preset, or use preset: unrolled."
-                )
             physics = preset["physics"](cfg, val_ds.evn_paths, val_ds.odd_paths, ctx.device, ctx)
         else:
             # No crop_size guess here — evaluation always sees the whole

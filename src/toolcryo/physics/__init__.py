@@ -105,11 +105,16 @@ def build_tomography_physics(
     # then all rescaled by the measured global norm — leaving the assembled
     # operator unit-norm, exactly as normalize=True leaves the unsharded one.
     if n_ops is not None:
+        # build_one_tomography_em caps the shard count at the tilt count, so read
+        # back what was actually built: TomographyEMPair.num_operators drives
+        # split_sinogram (forward.py), which must match the operator exactly.
+        requested, n_ops = n_ops, int(physics_evn.num_operators)
         sq_evn = normalize_sharded(physics_evn, init_evn)
         normalize_sharded(physics_odd, init_odd)
         if ctx.rank == 0:
-            print(f"[physics] sharded into {n_ops} operator(s) over {ctx.world_size} rank(s)  "
-                  f"||A^T A||_2={sq_evn:.4g} -> normalised", flush=True)
+            capped = f" (capped from {requested} by the tilt count)" if n_ops != requested else ""
+            print(f"[physics] sharded into {n_ops} operator(s) over {ctx.world_size} rank(s)"
+                  f"{capped}  ||A^T A||_2={sq_evn:.4g} -> normalised", flush=True)
 
     return TomographyEMPair(
         physics_evn=physics_evn, physics_odd=physics_odd,

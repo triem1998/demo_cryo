@@ -555,9 +555,9 @@ class TomographyEMTorch(dinv.physics.LinearPhysics):
         ringing rivals the signal. The absolute DC level is unrecoverable from a
         limited-angle tilt series anyway.
         """
-        return self._fbp_raw(y - y.mean(dim=(-3, -2, -1), keepdim=True))
+        return self.fbp_raw(y - y.mean(dim=(-3, -2, -1), keepdim=True))
 
-    def _fbp_raw(self, y: torch.Tensor) -> torch.Tensor:
+    def fbp_raw(self, y: torch.Tensor) -> torch.Tensor:
         """FBP without the DC centring — mirrors ``TomographyWithAstra.fbp``."""
         filtered = self.filter(y.to(torch.float32), dim=-1).to(_work_dtype(y))
         # detector_cell_v_length / object_cell_volume == 1 for this geometry

@@ -126,4 +126,9 @@ class TomographyEM(dinv.physics.LinearPhysics):
         :param torch.Tensor y: Sinogram of shape (B, C, V, A, N).
         :return: Volume of shape (B, C, *volume_shape).
         """
-        return self.xray.fbp(y - y.mean(dim=(-3, -2, -1), keepdim=True))
+        return self.fbp_raw(y - y.mean(dim=(-3, -2, -1), keepdim=True))
+
+    def fbp_raw(self, y: torch.Tensor, **kwargs) -> torch.Tensor:
+        """FBP without the DC centring — the piece ``ShardedTomography`` composes,
+        since the centring must be done once on the *global* sinogram."""
+        return self.xray.fbp(y)

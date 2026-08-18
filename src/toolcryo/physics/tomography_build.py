@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from deepinv.distributed import distribute
+from deepinv.distributed.framework import DistributedStackedLinearPhysics
 from deepinv.utils.tensorlist import TensorList
 
 from ..utils.utils import load_mrc_volume
@@ -72,6 +72,34 @@ def split_sinogram(y: torch.Tensor, num_operators: int) -> TensorList:
     """
     chunks = projection_splits(int(y.shape[3]), num_operators)
     return TensorList([y[:, :, :, s:e, :].contiguous() for (s, e) in chunks])
+
+
+class ShardedTomography(DistributedStackedLinearPhysics):
+    """Angle-sharded tomography + the one method deepinv's container lacks: ``fbp``.
+
+    ``fbp`` is a ``TomographyEM`` method, not part of ``LinearPhysics``, so the
+    distributed container has none. It is the same map-reduce as ``A_adjoint``
+    (each shard back-projects its own angles, the volumes are summed across
+    ranks) plus the two corrections that keep it identical to the unsharded
+    operator: each shard divides by its *own* angle count, so it is reweighted
+    by ``A_i / n_angles_total`` (attached by ``build_one_tomography_em``); and
+    the DC centring uses the global sinogram mean, since centring is
+    shift-idempotent and so cannot be recovered shard by shard.
+    """
+
+    def fbp(self, y, gather: bool = True, reduce_op: str | None = "sum", **kwargs):
+        # A plain list, and the global-length branch first — same precedence as
+        # A_adjoint. A TensorList is not a list subclass, so map_reduce_gather
+        # would hand the *whole* stack to every shard instead of pairing them.
+        y_loc = [y[i] for i in self.local_indexes] if len(y) == self.num_operators else list(y)
+        mean = self._map_reduce_gather(
+            y_loc,
+            lambda p, t, **kw: t.mean(dim=(-3, -2, -1), keepdim=True) * (p.n_angles / self.n_angles_total),
+            reduce_op="sum")
+        return self._map_reduce_gather(
+            [t - mean for t in y_loc],
+            lambda p, t, **kw: p.fbp_raw(t) * (p.n_angles / self.n_angles_total),
+            gather=gather, reduce_op=reduce_op, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +269,13 @@ def build_one_tomography_em(
         raise FileNotFoundError(f"build_unrolled_physics: no angles_*_{split}.tlt in {tomo_dir}")
     angles = np.loadtxt(str(ang_matches[0]))
 
+    if num_operators is not None:
+        # The tilt count is the hard ceiling: more shards than angles would build
+        # zero-angle operators, which fail in the constructor. A 64-rank job over
+        # 41 angles shards into 41; the spare ranks hold no physics (deepinv
+        # supports empty ranks) but still carry their denoiser tiles.
+        num_operators = min(int(num_operators), len(angles))
+
     init = load_fbp_init(vol_path, device, target_shape)
     volume_shape = tuple(init.shape[-3:])
     op_cls = TOMOGRAPHY_BACKENDS[backend]
@@ -267,9 +302,10 @@ def build_one_tomography_em(
             device=str(dev),
         )
 
-    physics = distribute(_factory, ctx, type_object="linear_physics",
-                         num_operators=int(num_operators))
+    physics = ShardedTomography(ctx, int(num_operators), _factory)
     # The shards each hold a slice of the angles; carry the *global* range on the
     # container so logging reports the tomogram's real tilt range, not a shard's.
     physics._tilt_min, physics._tilt_max = float(angles.min()), float(angles.max())
+    physics.n_angles_total = len(angles)   # fbp's A_i/A reweighting
+    physics.volume_shape = volume_shape     # shards share it; Rotate3D reads it (run.py)
     return physics, init

@@ -19,6 +19,7 @@ from toolcryo.physics import (  # noqa: E402
     TOMOGRAPHY_BACKENDS, TomographyEM, TomographyEMPair, TomographyEMTorch,
     resolve_tomography_backend,
 )
+from toolcryo.physics import tomography_build  # noqa: E402
 
 
 def test_backend_map():
@@ -49,7 +50,6 @@ def test_auto_falls_back_on_rocm(monkeypatch):
 
 
 def test_auto_falls_back_without_astra(monkeypatch):
-    from toolcryo.physics import tomography_build
     monkeypatch.setattr(tomography_build.importlib.util, "find_spec", lambda name: None)
     assert resolve_tomography_backend("auto", "cuda") == "torch"
 
