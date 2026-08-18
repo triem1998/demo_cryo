@@ -78,6 +78,9 @@ distributed:
   # rank, no physics collective; "auto" = one operator per rank; an int =
   # that many, round-robin (more than world_size lowers peak astra memory).
   num_operators: null
+  # Tomography operator backend: auto | astra | torch. auto = astra where its
+  # CUDA kernels can run, else the pure-torch operator (CPU / AMD-ROCm capable).
+  tomography_backend: auto
 
 # Equivariance loss weight — shared by missingwedge_ei's Fourier EqLoss and
 # tomo_ei's true-physics EqLoss (losses_equivariant_wedge.py / losses_equivariant_tomo.py).

@@ -11,10 +11,12 @@ loaded first by load_volume; rotation sign = -1, see ANGLE_SIGN).
 
 
 Run with:
-    python scripts/test_tomography_em.py
+    python scripts/test_tomography_em.py                  # auto backend (astra here)
+    python scripts/test_tomography_em.py --backend torch  # the pure-torch operator
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -25,7 +27,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-from toolcryo.physics import TomographyEM  # noqa: E402
+from toolcryo.physics import (  # noqa: E402
+    TOMOGRAPHY_BACKENDS, TomographyEM, resolve_tomography_backend,
+)
 from toolcryo.utils.utils import load_mrc_volume  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -260,13 +264,14 @@ def run(
     ts_path: Path,
     split1_ts_path: Path,
     split1_fbp_path: Path,
+    op_cls: type = TomographyEM,
 ) -> None:
     icecream_vol = load_volume(vol_path).to(DEVICE)
     real_ts = load_tilt_series(ts_path).to(DEVICE)
     print(f"  volume {tuple(icecream_vol.shape)}   tilt series {tuple(real_ts.shape)}")
 
     detector_shape = (real_ts.shape[0], real_ts.shape[1])
-    op = TomographyEM(
+    op = op_cls(
         volume_shape=tuple(icecream_vol.shape),
         angles_deg=angles_deg,
         detector_shape=detector_shape,
@@ -293,8 +298,20 @@ def run(
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", default="auto", choices=["auto", "astra", "torch"],
+                        help="tomography operator backend (default: auto)")
+    args = parser.parse_args()
     if not torch.cuda.is_available():
-        raise RuntimeError("This script requires a CUDA device (astra-toolbox backend).")
+        raise RuntimeError("This script requires a CUDA device (native-resolution volumes).")
+    backend = resolve_tomography_backend(args.backend, DEVICE)
+    op_cls = TOMOGRAPHY_BACKENDS[backend]
+    print(f"[backend] {backend} ({op_cls.__name__})")
+    # Keep astra's figures where they have always been; the torch run writes
+    # alongside them so the two can be compared without overwriting.
+    global OUT_DIR
+    if backend != "astra":
+        OUT_DIR = OUT_DIR.parent / f"physics_test_{backend}"
 
     angles_path = DATASET_DIR / f"angles_{TAG}.tlt"
     vol_path = DATASET_DIR / f"vol_{TAG}_Icecream.mrc"
@@ -310,7 +327,7 @@ def main() -> None:
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    run(angles_deg, vol_path, ts_path, split1_ts_path, split1_fbp_path)
+    run(angles_deg, vol_path, ts_path, split1_ts_path, split1_fbp_path, op_cls)
 
 
 if __name__ == "__main__":

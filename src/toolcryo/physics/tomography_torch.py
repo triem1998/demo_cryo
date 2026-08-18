@@ -273,6 +273,11 @@ class TomographyEMTorch(dinv.physics.LinearPhysics):
         angles = torch.as_tensor(angles_deg, dtype=torch.float32).flatten()
         self.angles_deg = (angles * float(angle_sign)).to(self.device)
         self.n_angles = int(self.angles_deg.numel())
+        # Logging only — pre-sign-flip, so it matches the .tlt file. Same
+        # private names TomographyEM uses, so trainer.py's one log line reads
+        # either backend.
+        self._tilt_min = float(angles.min())
+        self._tilt_max = float(angles.max())
         self.img_size = self.volume_shape
 
         # Joseph's method: split the angles by dominant axis. Each group steps
