@@ -21,3 +21,9 @@ dataset/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Claude Code local state
+.claude/
+
+# Local docs / plans
+docs/
