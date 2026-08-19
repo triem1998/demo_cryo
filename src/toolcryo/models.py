@@ -211,8 +211,8 @@ def build_unrolled_model(cfg, physics: TomographyEMPair, ctx: DistributedContext
     there is no operator-norm division and nothing to rescale per tomogram.
 
     The denoiser inside ``PnP`` is tiled across ranks (``distribute(...,
-    type_object="denoiser")``); the physics itself is not distributed — each
-    rank runs the full operator.
+    type_object="denoiser")``); the physics is distributed only when
+    ``cfg.num_operators`` shards the angles.
 
     ``cfg.pretrained_ckpt`` accepts two different checkpoint shapes,
     auto-detected from their top-level keys:

@@ -28,15 +28,11 @@ def unrolled_forward(trainer, x, y, physics, train):
 
     x/y are the EVN/ODD sinograms; physics is the TomographyEMPair container
     (separate operators + FBP inits for each half, see physics/__init__.py).
-    The PGD uses a plain L2 + the full raw operator, so the sinogram is passed
-    straight through — each rank runs the whole projection locally.
-
-    With ``num_operators=None`` the operators are built with ``normalize=True``
-    (unit spectral norm), so no per-tomogram stepsize rescaling is needed. When
-    the angles are sharded the sinogram must be split to match — a distributed
-    operator consumes one measurement per shard, not one whole sinogram (see
-    physics/tomography.py::split_sinogram); the stepsize is then scaled by the
-    measured global norm instead (models.py::build_unrolled_model).
+    The PGD uses a plain L2 + the raw operator, so the sinogram is passed
+    straight through. When the angles are sharded it must be split to match — a
+    distributed operator consumes one measurement per shard, not one whole
+    sinogram (see physics/tomography_build.py::split_sinogram). Both paths end
+    up unit spectral norm, so the stepsize is the same either way.
     """
     if physics.num_operators is not None:
         x = split_sinogram(x, physics.num_operators)
