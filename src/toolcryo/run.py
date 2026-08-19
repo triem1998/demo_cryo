@@ -201,14 +201,6 @@ def run_full(cfg: RunEIFullConfig) -> None:
         val_ds   = data_bundle.val_loader.dataset
 
         if is_tomo:
-            if not is_unrolled and cfg.num_operators is not None:
-                raise ValueError(
-                    f"num_operators={cfg.num_operators!r} is not supported for preset "
-                    f"{cfg.preset!r}: it calls physics.fbp() (TomoEqLoss / half_set_recon), "
-                    f"which sharded (distributed) physics does not implement. Set "
-                    f"num_operators: null for this preset, or use preset: unrolled."
-                )
-
             physics = preset["physics"](
                 cfg, train_ds.evn_paths + val_ds.evn_paths, train_ds.odd_paths + val_ds.odd_paths, ctx.device, ctx)
 

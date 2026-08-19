@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -52,6 +53,11 @@ class RunEIBaseConfig(BaseModel):
 
     # ── Physics ─────────────────────────────────────────────────────────────
     wedge_double_size: bool = True
+    # Tomography operator backend (unrolled/tomo_ei presets only; ignored by
+    # missingwedge_ei). "auto" = astra wherever its CUDA kernels can actually
+    # run, else the pure-torch operator — which is also the only one that works
+    # on CPU and on AMD/ROCm. Force either explicitly with "astra" / "torch".
+    tomography_backend: Literal["auto", "astra", "torch"] = "auto"
 
     # ── Mixed precision ──────────────────────────────────────────────────────
     use_mixed_precision: bool = True

@@ -1,11 +1,15 @@
 """Physics operator construction from a run config.
 
-Heavy classes live in the sibling modules — ``missingwedge.py``
-(``MissingWedge``, for the ``missingwedge_ei`` preset) and ``tomography.py``
-(``TomographyEM``/``TomographyEMPair``, for the ``unrolled``/tomography-domain
-presets). This ``__init__`` is the thin construction layer: one builder per
+Heavy code lives in the sibling modules — ``missingwedge.py`` (``MissingWedge``,
+for the ``missingwedge_ei`` preset), the two interchangeable tomography
+operators ``tomography.py`` (astra) / ``tomography_torch.py`` (pure torch), and
+``tomography_build.py``, the backend-neutral layer that builds and pairs either
+of them. This ``__init__`` is the thin construction layer: one builder per
 preset, plus re-exports so callers can do ``from ..physics import X`` without
 knowing which sibling module ``X`` actually lives in.
+
+Reading ``cfg`` stops here: this is the only module that touches
+``cfg.tomography_backend``; everything below it takes a resolved backend name.
 """
 from __future__ import annotations
 
@@ -15,13 +19,16 @@ from deepinv.distributed import DistributedContext
 
 from ..base_config import RunEIBaseConfig
 from .missingwedge import MissingWedge
-from .tomography import (
-    TomographyEM, TomographyEMPair, build_one_tomography_em, normalize_sharded,
-    split_sinogram,
+from .tomography import TomographyEM
+from .tomography_build import (
+    TOMOGRAPHY_BACKENDS, TomographyEMPair, build_one_tomography_em,
+    normalize_sharded, resolve_tomography_backend, split_sinogram,
 )
+from .tomography_torch import TomographyEMTorch
 
 __all__ = [
-    "MissingWedge", "TomographyEM", "TomographyEMPair",
+    "MissingWedge", "TomographyEM", "TomographyEMPair", "TomographyEMTorch",
+    "TOMOGRAPHY_BACKENDS", "resolve_tomography_backend",
     "build_missingwedge_physics", "build_tomography_physics", "split_sinogram",
 ]
 
@@ -82,25 +89,36 @@ def build_tomography_physics(
     elif n_ops is not None:
         n_ops = int(n_ops)
 
+    backend = resolve_tomography_backend(
+        getattr(cfg, "tomography_backend", "auto"), device)
+    if ctx.rank == 0:
+        print(f"[physics] tomography backend: {backend} "
+              f"({TOMOGRAPHY_BACKENDS[backend].__name__})", flush=True)
+
     evn_path, odd_path = evn_paths[0], odd_paths[0]
     physics_evn, init_evn = build_one_tomography_em(
-        evn_path.parent, "split1", evn_path, device, target_shape, n_ops, ctx)
+        evn_path.parent, "split1", evn_path, device, target_shape, n_ops, ctx, backend)
     physics_odd, init_odd = build_one_tomography_em(
-        odd_path.parent, "split2", odd_path, device, target_shape, n_ops, ctx)
+        odd_path.parent, "split2", odd_path, device, target_shape, n_ops, ctx, backend)
 
     # Shards are built unnormalised (a shard's own norm is not the operator's),
     # then all rescaled by the measured global norm — leaving the assembled
     # operator unit-norm, exactly as normalize=True leaves the unsharded one.
     if n_ops is not None:
+        # build_one_tomography_em caps the shard count at the tilt count, so read
+        # back what was actually built: TomographyEMPair.num_operators drives
+        # split_sinogram (forward.py), which must match the operator exactly.
+        requested, n_ops = n_ops, int(physics_evn.num_operators)
         sq_evn = normalize_sharded(physics_evn, init_evn)
         normalize_sharded(physics_odd, init_odd)
         if ctx.rank == 0:
-            print(f"[physics] sharded into {n_ops} operator(s) over {ctx.world_size} rank(s)  "
-                  f"||A^T A||_2={sq_evn:.4g} -> normalised", flush=True)
+            capped = f" (capped from {requested} by the tilt count)" if n_ops != requested else ""
+            print(f"[physics] sharded into {n_ops} operator(s) over {ctx.world_size} rank(s)"
+                  f"{capped}  ||A^T A||_2={sq_evn:.4g} -> normalised", flush=True)
 
     return TomographyEMPair(
         physics_evn=physics_evn, physics_odd=physics_odd,
         init_evn=init_evn, init_odd=init_odd,
         evn_paths=evn_paths, odd_paths=odd_paths, device=device, target_shape=target_shape,
-        num_operators=n_ops, ctx=ctx,
+        num_operators=n_ops, backend=backend, ctx=ctx,
     )

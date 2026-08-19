@@ -73,11 +73,13 @@ distributed:
   max_batch_size: 1
   # Gradient checkpointing inside the distributed tiled forward pass.
   checkpoint_batches: "auto"
-  # Angle-sharded tomography physics (unrolled / tomo_ei only — the
-  # missing-wedge FFT has no valid split). null = one full operator per
-  # rank, no physics collective; "auto" = one operator per rank; an int =
-  # that many, round-robin (more than world_size lowers peak astra memory).
+  # Angle-sharded tomography physics (unrolled / tomo_ei only). null = one full
+  # operator per rank, no collective (default); "auto" = one per rank; int = that
+  # many. Capped at the tilt-angle count, so "auto" on 64 ranks builds 41.
   num_operators: null
+  # Tomography operator backend: auto | astra | torch. auto = astra where its
+  # CUDA kernels can run, else the pure-torch operator (CPU / AMD-ROCm capable).
+  tomography_backend: auto
 
 # Equivariance loss weight — shared by missingwedge_ei's Fourier EqLoss and
 # tomo_ei's true-physics EqLoss (losses_equivariant_wedge.py / losses_equivariant_tomo.py).
@@ -109,7 +111,7 @@ slurm:
   ntasks_per_node: 4
   cpus_per_task: 24
   time: "02:00:00"
-  account: fio@h100 # your account here
+  account: # your account here
   constraint: "h100"
   qos: "qos_gpu_h100-dev"
   stderr_to_stdout: true

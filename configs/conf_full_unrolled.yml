@@ -66,11 +66,13 @@ distributed:
   max_batch_size: 1
   # Gradient checkpointing inside the distributed tiled forward pass.
   checkpoint_batches: "auto"
-  # Angle-sharded tomography physics (unrolled  only — the
-  # missing-wedge FFT has no valid split). null = one full operator per
-  # rank, no physics collective; "auto" = one operator per rank; an int =
-  # that many, round-robin (more than world_size lowers peak astra memory).
+  # Angle-sharded tomography physics (unrolled / tomo_ei only). null = one full
+  # operator per rank, no collective (default); "auto" = one per rank; int = that
+  # many. Capped at the tilt-angle count, so "auto" on 64 ranks builds 41.
   num_operators:  null
+  # Tomography operator backend: auto | astra | torch. auto = astra where its
+  # CUDA kernels can run, else the pure-torch operator (CPU / AMD-ROCm capable).
+  tomography_backend: auto
 
 # missingwedge_ei preset only — ignored by unrolled (it reads real angles
 # from each tomogram's own .tlt files instead)

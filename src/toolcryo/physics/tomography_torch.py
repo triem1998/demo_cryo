@@ -273,6 +273,11 @@ class TomographyEMTorch(dinv.physics.LinearPhysics):
         angles = torch.as_tensor(angles_deg, dtype=torch.float32).flatten()
         self.angles_deg = (angles * float(angle_sign)).to(self.device)
         self.n_angles = int(self.angles_deg.numel())
+        # Logging only — pre-sign-flip, so it matches the .tlt file. Same
+        # private names TomographyEM uses, so trainer.py's one log line reads
+        # either backend.
+        self._tilt_min = float(angles.min())
+        self._tilt_max = float(angles.max())
         self.img_size = self.volume_shape
 
         # Joseph's method: split the angles by dominant axis. Each group steps
@@ -550,9 +555,9 @@ class TomographyEMTorch(dinv.physics.LinearPhysics):
         ringing rivals the signal. The absolute DC level is unrecoverable from a
         limited-angle tilt series anyway.
         """
-        return self._fbp_raw(y - y.mean(dim=(-3, -2, -1), keepdim=True))
+        return self.fbp_raw(y - y.mean(dim=(-3, -2, -1), keepdim=True))
 
-    def _fbp_raw(self, y: torch.Tensor) -> torch.Tensor:
+    def fbp_raw(self, y: torch.Tensor) -> torch.Tensor:
         """FBP without the DC centring — mirrors ``TomographyWithAstra.fbp``."""
         filtered = self.filter(y.to(torch.float32), dim=-1).to(_work_dtype(y))
         # detector_cell_v_length / object_cell_volume == 1 for this geometry
