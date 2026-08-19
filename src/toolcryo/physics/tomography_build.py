@@ -88,16 +88,19 @@ class ShardedTomography(DistributedStackedLinearPhysics):
     """
 
     def fbp(self, y, gather: bool = True, reduce_op: str | None = "sum", **kwargs):
-        # A plain list, and the global-length branch first — same precedence as
-        # A_adjoint. A TensorList is not a list subclass, so map_reduce_gather
-        # would hand the *whole* stack to every shard instead of pairing them.
-        y_loc = [y[i] for i in self.local_indexes] if len(y) == self.num_operators else list(y)
-        mean = self._map_reduce_gather(
-            y_loc,
-            lambda p, t, **kw: t.mean(dim=(-3, -2, -1), keepdim=True) * (p.n_angles / self.n_angles_total),
-            reduce_op="sum")
+        if len(y) != self.num_operators:
+            raise ValueError(
+                f"fbp needs the whole sinogram (all {self.num_operators} pieces, as "
+                f"returned by A(x)), got {len(y)}: the global DC mean cannot be formed "
+                f"from a subset, and centring per shard is not equivalent.")
+        # Every rank holds every piece (A gathers), so the global mean is local
+        # arithmetic — no collective. Summing first and dividing once is the plain
+        # definition of the mean; the A_i/A reweighting below is still needed
+        # because each shard's fbp_raw divides by its *own* angle count.
+        count = sum(t.shape[-3] * t.shape[-2] * t.shape[-1] for t in y)
+        mean = sum(t.sum(dim=(-3, -2, -1), keepdim=True) for t in y) / count
         return self._map_reduce_gather(
-            [t - mean for t in y_loc],
+            [y[i] - mean for i in self.local_indexes],
             lambda p, t, **kw: p.fbp_raw(t) * (p.n_angles / self.n_angles_total),
             gather=gather, reduce_op=reduce_op, **kwargs)
 
@@ -105,8 +108,8 @@ class ShardedTomography(DistributedStackedLinearPhysics):
 # ---------------------------------------------------------------------------
 # A tomogram's two half-set (EVN/ODD) TomographyEM operators — split1/split2
 # use different interleaved tilt angles, so each half gets its own operator —
-# bundled with their FBP-init volumes. Method-agnostic physics: consumed by
-# the unrolled preset today, reusable by future tomography-domain presets.
+# bundled with their FBP-init volumes. Method-agnostic physics: consumed by the
+# unrolled and tomo_ei presets, reusable by future tomography-domain presets.
 # ---------------------------------------------------------------------------
 
 # Calibrated for this dataset's acquisition convention (see
@@ -117,11 +120,11 @@ _TOMO_ANGLE_SIGN = -1.0
 
 @dataclass
 class TomographyEMPair:
-    """A tomogram's two half-set (EVN/ODD) TomographyEM operators + FBP inits.
+    """A tomogram's two half-set (EVN/ODD) tomography operators + FBP inits.
 
-    Each rank runs the full operator locally — the tilt angles are *not* sharded
-    across ranks. Only the denoiser is tiled (models.py::build_unrolled_model),
-    so no per-iteration physics collective is needed.
+    With ``num_operators=None`` each rank runs the full operator locally and only
+    the denoiser is tiled; otherwise the angles are sharded and every
+    ``A_adjoint``/``fbp`` costs a collective.
     """
     physics_evn: "TomographyEM"
     physics_odd: "TomographyEM"
@@ -260,9 +263,8 @@ def build_one_tomography_em(
     operators; it cannot split one, so the split is built here — same recipe as
     demo_tomo). Shards are built with ``normalize=False``: each shard's own
     spectral norm differs from the full operator's, so per-shard normalisation
-    would be wrong. The global norm is measured once by the caller
-    (``build_tomography_physics``) via ``compute_sqnorm`` and folded into the
-    PGD stepsize instead.
+    would be wrong. The caller (``build_tomography_physics``) measures the global
+    norm once and rescales every shard with it (``normalize_sharded``).
     """
     ang_matches = sorted(tomo_dir.glob(f"angles_*_{split}.tlt"))
     if not ang_matches:

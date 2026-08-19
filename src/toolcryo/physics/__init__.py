@@ -56,16 +56,16 @@ def build_missingwedge_physics(
 def build_tomography_physics(
     cfg: RunEIBaseConfig, evn_paths: list[Path], odd_paths: list[Path], device, ctx: DistributedContext,
 ) -> TomographyEMPair:
-    """Build a tomogram's EVN/ODD TomographyEM operators and their FBP inits.
+    """Build a tomogram's EVN/ODD tomography operators and their FBP inits.
 
-    The operators are built with ``normalize=True``, so each has unit spectral
-    norm and maps a z-normalized volume onto the same scale as the z-normalized
-    sinogram — no separate operator-norm bookkeeping or stepsize rescaling is
-    needed.
+    The operator ends up unit spectral norm either way — ``normalize=True``
+    unsharded, ``normalize_sharded`` when the angles are split — so a
+    z-normalized volume maps onto the z-normalized sinogram's scale and the PGD
+    stepsize needs no rescaling.
 
-    Each rank runs the full operator locally — the tilt angles are not sharded
-    across ranks; only the denoiser is tiled. ``ctx`` is accepted for a uniform
-    ``preset["physics"]`` signature but no longer used here.
+    ``cfg.num_operators`` shards the tilt angles across ranks (null = one full
+    operator per rank, only the denoiser tiled); ``cfg.tomography_backend``
+    picks the astra or the pure-torch operator.
 
     ``evn_paths``/``odd_paths`` are the *combined* (train, then val)
     discovered FBP volume paths — ``train_ds.evn_paths + val_ds.evn_paths``.
