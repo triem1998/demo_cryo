@@ -56,8 +56,10 @@ class RunEIBaseConfig(BaseModel):
     # Tomography operator backend (unrolled/tomo_ei presets only; ignored by
     # missingwedge_ei). "auto" = astra wherever its CUDA kernels can actually
     # run, else the pure-torch operator — which is also the only one that works
-    # on CPU and on AMD/ROCm. Force either explicitly with "astra" / "torch".
-    tomography_backend: Literal["auto", "astra", "torch"] = "auto"
+    # on CPU and on AMD/ROCm. "torch" reproduces astra's approximate adjoint, so
+    # switching backends leaves the gradient unchanged; "torch_exact" uses the
+    # true transpose instead (a real PGD gradient, ~4x slower at native size).
+    tomography_backend: Literal["auto", "astra", "torch", "torch_exact"] = "auto"
 
     # ── Mixed precision ──────────────────────────────────────────────────────
     use_mixed_precision: bool = True

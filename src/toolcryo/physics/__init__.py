@@ -92,8 +92,7 @@ def build_tomography_physics(
     backend = resolve_tomography_backend(
         getattr(cfg, "tomography_backend", "auto"), device)
     if ctx.rank == 0:
-        print(f"[physics] tomography backend: {backend} "
-              f"({TOMOGRAPHY_BACKENDS[backend].__name__})", flush=True)
+        print(f"[physics] tomography backend: {backend}", flush=True)
 
     evn_path, odd_path = evn_paths[0], odd_paths[0]
     physics_evn, init_evn = build_one_tomography_em(

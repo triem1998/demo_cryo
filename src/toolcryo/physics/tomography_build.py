@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib.util
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -28,9 +29,15 @@ from ..utils.utils import load_mrc_volume
 from .tomography import TomographyEM
 from .tomography_torch import TomographyEMTorch
 
-#: The two interchangeable operators, keyed by the ``tomography_backend`` config
+#: The interchangeable operators, keyed by the ``tomography_backend`` config
 #: value. They share a constructor signature, so the backend is a pure lookup.
-TOMOGRAPHY_BACKENDS = {"astra": TomographyEM, "torch": TomographyEMTorch}
+TOMOGRAPHY_BACKENDS = {
+    "astra": TomographyEM,
+    # astra's back-projector is not a true transpose, so reproducing it keeps the
+    # gradient unchanged when ``auto`` flips astra -> torch; ~4x quicker too.
+    "torch": partial(TomographyEMTorch, adjoint_mode="fast"),
+    "torch_exact": TomographyEMTorch,   # true transpose: a real PGD gradient
+}
 
 
 def resolve_tomography_backend(backend: str, device) -> str:

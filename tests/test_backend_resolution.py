@@ -23,7 +23,19 @@ from toolcryo.physics import tomography_build  # noqa: E402
 
 
 def test_backend_map():
-    assert TOMOGRAPHY_BACKENDS == {"astra": TomographyEM, "torch": TomographyEMTorch}
+    assert set(TOMOGRAPHY_BACKENDS) == {"astra", "torch", "torch_exact"}
+    assert TOMOGRAPHY_BACKENDS["astra"] is TomographyEM
+    assert TOMOGRAPHY_BACKENDS["torch_exact"] is TomographyEMTorch
+
+
+@pytest.mark.parametrize("backend,mode", [("torch", "fast"), ("torch_exact", "exact")])
+def test_torch_backend_adjoint_mode(backend, mode):
+    """``torch`` reproduces astra's approximate back-projector so that flipping
+    ``auto`` from astra to torch leaves the gradient unchanged; ``torch_exact``
+    opts into the true transpose."""
+    op = TOMOGRAPHY_BACKENDS[backend](volume_shape=(4, 4, 4), angles_deg=[0.0], device="cpu")
+    assert isinstance(op, TomographyEMTorch)
+    assert op.adjoint_mode == mode
 
 
 @pytest.mark.parametrize("backend", ["astra", "torch"])

@@ -21,8 +21,10 @@ distributed:
   # operator per rank, no collective (default); "auto" = one per rank; int = that
   # many. Capped at the tilt-angle count, so "auto" on 64 ranks builds 41.
   num_operators: null
-  # Tomography operator backend: auto | astra | torch. auto = astra where its
-  # CUDA kernels can run, else the pure-torch operator (CPU / AMD-ROCm capable).
+  # Tomography operator backend: auto | astra | torch | torch_exact. auto =
+  # astra where its CUDA kernels can run, else the pure-torch operator (CPU /
+  # AMD-ROCm capable). torch matches astra's adjoint; torch_exact is the true
+  # transpose (a real PGD gradient, ~4x slower at native resolution).
   tomography_backend: auto
 
 # Shared by all three presets — checkpoint/model architecture, FSC, output.
