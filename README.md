@@ -1,10 +1,15 @@
 # demo_cryo
 
-Self-supervised cryo-ET denoising using **Equivariant Imaging (EI)** with missing-wedge physics and cube-symmetry rotations. 
+Self-supervised cryo-ET denoising using **Equivariant Imaging (EI)** and cube-symmetry rotations.
 
 Two training modes:
 - **patch** — crop-based, fast
 - **full** — whole-tomogram tiled, slow
+
+Three methods, selected by `general.preset`:
+- **`missingwedge_ei`** — EI with an FFT missing-wedge operator, applied to precomputed FBP volumes (icecream-style).
+- **`unrolled`** — PGD reconstruction unrolled through the *real* tomography operator, trained on the measured tilt series.
+- **`tomo_ei`** — EI with the real tomography operator: a plain denoiser on each half's FBP volume, with the equivariance term re-simulated through `fbp(A(·))`.
 
 ---
 
@@ -29,8 +34,10 @@ cd ..
 pip install --user -e /path/to/demo_cryo
 
 # 4. Submit a job (set execution_mode: submitit in the config)
-python main.py --config configs/conf_equivariant_patch.yml
-python main.py --config configs/conf_equivariant_full.yml
+python main.py --config configs/conf_equivariant_patch.yml   # patch, missingwedge_ei
+python main.py --config configs/conf_full_missing_wedge.yml  # full, missingwedge_ei
+python main.py --config configs/conf_full_unrolled.yml       # full, unrolled
+python main.py --config configs/conf_full_eq_tomo.yml        # full, tomo_ei
 ```
 
 
@@ -45,14 +52,23 @@ main.py                      # CLI launcher (local + SLURM via submitit)
 pyproject.toml               # dependencies + build config (install with uv sync)
 configs/
   conf_equivariant_patch.yml # patch training config
-  conf_equivariant_full.yml  # full-volume training config
+  conf_full_*.yml            # full-volume training configs (one per preset)
+  conf_*_inference*.yml      # standalone inference configs
 src/
   toolcryo/                  # installable package
     base_config.py           # RunEIBaseConfig (shared fields)
     run.py                   # RunEIFullConfig, RunEIPatchConfig, run_full, run_patch
     trainer.py               # BaseTrainer, EIFullTrainer, EIPatchTrainer
-    physics.py               # MissingWedge (missing-wedge forward operator)
+    registry.py              # preset -> (physics, model, losses, forward, recon)
+    models.py                # build_ei_model (denoiser), build_unrolled_model (PGD)
+    forward.py               # per-preset forward passes (how x_net/y_net are computed)
     transform.py             # Rotate3D (cube-symmetry group)
+    physics/
+      missingwedge.py        # MissingWedge (FFT wedge operator)
+      tomography.py          # TomographyEM (astra backend)
+      tomography_torch.py    # TomographyEMTorch (pure-torch, CPU/ROCm capable)
+      tomography_build.py    # backend choice, EVN/ODD pairing, angle sharding
+      __init__.py            # one physics builder per preset
     losses/
       losses_equivariant_wedge.py  # ObsLoss, EqLoss (missingwedge_ei, icecream-based)
       losses_equivariant_tomo.py   # EqLoss (tomo_ei, true physics)
@@ -64,7 +80,7 @@ src/
       infer_full.py          # standalone inference for full-volume checkpoints
       infer_patch.py         # standalone + post-training inference for patch checkpoints
     utils/
-      utils.py               # GpuFSC, build_ei_model, MRC I/O, metrics helpers
+      utils.py               # GpuFSC, MRC I/O, metrics helpers
       plot.py                # slice figures, FSC plots, metrics plots
     icecream_orig/           # vendored IceCream UNet3D — do not modify
 ```
@@ -86,7 +102,7 @@ Similar to IceCream's patch-based training with a few differences:
 
 Uses deepinv's [distributed tiling framework](https://github.com/deepinv/deepinv/pull/1088) (`deepinv.distributed.distribute`) to run the UNet/drunet on a whole tomogram by splitting it into overlapping 3D tiles, processing each tile on a GPU, and stitching results back — no spatial downsampling.
 
-**Current dataset handling**: the raw EMPIAR-11830 volumes are `1024×1024×512` (D×H×W). To keep things simple the dataset centre-crops each volume to a cube of side `min(D, H, W) = 512`, giving `512³` tensors fed to the trainer. A decision is still needed on how to utilize the full volume, e.g., center cropping, random 512³ cropping, or alternative patch-sampling strategies.
+**Current dataset handling**: the raw EMPIAR-11830 volumes are `1024×1024×512` (D×H×W) and are fed to the trainer at native resolution — no cropping by default (`crop_size: null`). `target_shape` trilinearly downsamples volumes *and* the matching tilt series for local smoke tests. The `unrolled`/`tomo_ei` presets read the measured tilt series instead of FBP volumes (`data_source: measurement`), with the FBP volumes used only as the PGD initialisation.
 
 ---
 
@@ -104,6 +120,8 @@ Uses deepinv's [distributed tiling framework](https://github.com/deepinv/deepinv
 | `max_train_vols` | Cap on training volumes (`null` = all) |
 | `max_val_vols` | Cap on validation volumes |
 | `seed` | Global random seed |
+| `preset` | `missingwedge_ei` \| `unrolled` \| `tomo_ei` — selects the (physics, model, losses) triple |
+| `target_shape` | Trilinearly resample volumes/sinograms to `[Y, X, Z]` (`null` = native; local testing only) |
 
 **`equivariant`**
 | Key | Description |
@@ -142,6 +160,15 @@ Uses deepinv's [distributed tiling framework](https://github.com/deepinv/deepinv
 | `overlap` | Tile overlap `[D, H, W]` |
 | `max_batch_size` | Max tiles on GPU simultaneously |
 | `checkpoint_batches` | Gradient checkpointing in tiled forward (`"auto"` or int) |
+| `num_operators` | Angle-sharded tomography physics: `null` = one full operator per rank, `"auto"` = one per rank, int = that many (capped at the tilt count) |
+| `tomography_backend` | `auto` \| `astra` \| `torch` — `auto` picks astra where its CUDA kernels run, else the pure-torch operator (CPU / AMD-ROCm) |
+
+**`unrolled`** (unrolled / tomo_ei presets)
+| Key | Description |
+|---|---|
+| `n_iter` | PGD steps unrolled into the network |
+| `init_stepsize` | Initial PGD stepsize (operators are unit-norm, so used as-is) |
+| `train_algo_params` | Learn `stepsize` jointly with the denoiser |
 
 **`slurm`**
 | Key | Description |
