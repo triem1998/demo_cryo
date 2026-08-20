@@ -5,7 +5,25 @@ import datetime as dt
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+import torch
+from pydantic import BaseModel, ConfigDict, model_validator
+
+
+def amp_dtype_from_str(mixed_precision: str) -> torch.dtype | None:
+    """Map a ``mixed_precision`` config value to a torch dtype, or ``None``.
+
+    ``None`` means "off": every consumer treats it as *do nothing* — no
+    autocast, no GradScaler, no half-precision cast anywhere. Shared by the
+    trainer and the inference paths so a run cannot train in one dtype and then
+    evaluate or infer in another.
+    """
+    if mixed_precision == "off":
+        return None
+    if mixed_precision not in ("fp16", "bf16"):
+        raise ValueError(
+            f"mixed_precision must be 'off', 'fp16' or 'bf16', got {mixed_precision!r}."
+        )
+    return torch.bfloat16 if mixed_precision == "bf16" else torch.float16
 
 
 class RunEIBaseConfig(BaseModel):
@@ -62,12 +80,15 @@ class RunEIBaseConfig(BaseModel):
     tomography_backend: Literal["auto", "astra", "torch", "torch_exact"] = "auto"
 
     # ── Mixed precision ──────────────────────────────────────────────────────
-    use_mixed_precision: bool = True
-    # "fp16" (default, unchanged behaviour + GradScaler) or "bf16". bf16 has
-    # fp32's dynamic range, so it needs no loss scaling and cannot overflow —
-    # use it for the unrolled/full preset, whose large native-resolution
-    # gradients overflow fp16's 65504 ceiling.
-    mixed_precision_dtype: str = "fp16"
+    # One switch for the whole run — training, validation and inference alike.
+    #
+    #   "off"  : pure fp32. A strict no-op — no autocast, no GradScaler, no
+    #            half cast in the inference sliding window.
+    #   "fp16" : icecream's default. Needs a GradScaler, and overflows at
+    #            native resolution (the 65504 ceiling).
+    #   "bf16" : fp32's dynamic range, so no loss scaling and no overflow —
+    #            the right choice for the full/unrolled presets.
+    mixed_precision: Literal["off", "fp16", "bf16"] = "off"
 
     # ── Model ───────────────────────────────────────────────────────────────
     # torch.compile the denoiser, always *before* the distribute() tiling
@@ -96,6 +117,28 @@ class RunEIBaseConfig(BaseModel):
     # raw patch checkpoint directly under tomo_ei inference, or False to
     # resume tomo_ei training from its own (already astra-order) checkpoint.
     permute_native_to_astra: bool | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_amp_keys(cls, data):
+        """Fail loudly on the retired ``use_mixed_precision`` / ``mixed_precision_dtype``.
+
+        ``model_config`` sets ``extra="ignore"``, so without this an old config
+        would be accepted with its AMP keys silently dropped and the run would
+        fall back to the ``mixed_precision`` default — flipping precision with
+        nothing printed. Raising is the only safe migration.
+        """
+        if isinstance(data, dict):
+            legacy = [k for k in ("use_mixed_precision", "mixed_precision_dtype") if k in data]
+            if legacy:
+                raise ValueError(
+                    f"{', '.join(legacy)} has been replaced by a single field: "
+                    'mixed_precision: "off" | "fp16" | "bf16". '
+                    "Rewrite the config — use_mixed_precision: false becomes "
+                    'mixed_precision: "off", and true + mixed_precision_dtype: bf16 '
+                    'becomes mixed_precision: "bf16".'
+                )
+        return data
 
     @classmethod
     def _flat_from_yaml(cls, conf: dict, default_run_name: str) -> dict:

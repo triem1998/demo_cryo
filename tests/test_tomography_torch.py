@@ -311,20 +311,32 @@ def test_chunking_is_exact(device):
     assert rel_l2(full.A_adjoint(y), chunked.A_adjoint(y)) < 1e-6
 
 
-def test_no_nan_under_amp():
-    """Inside autocast the projector stays fp32 and finite.
+@pytest.mark.parametrize("amp_dtype", [torch.float16, torch.bfloat16])
+def test_no_nan_under_amp(amp_dtype):
+    """Inside autocast the projector stays fp32 and finite, in both AMP dtypes.
 
     Line integrals accumulate hundreds of terms; fp16 loses far too much, so the
-    operator deliberately opts out of autocast's dtype.
+    operator deliberately opts out of autocast's dtype. It has to do so by
+    itself: autocast gives ``grid_sample`` no protection at all — the op is
+    fallthrough and returns whatever dtype it is handed. Covers ``fbp`` and the
+    gradient too, since those are the paths the training presets actually use.
     """
     if not torch.cuda.is_available():
         pytest.skip("autocast check needs CUDA")
     op, x = make_op("cuda"), rand_volume("cuda")
-    with torch.autocast("cuda", dtype=torch.float16):
+    x = x.clone().requires_grad_(True)
+    with torch.autocast("cuda", dtype=amp_dtype):
         y = op.A(x)
         rec = op.A_adjoint(y)
-    assert y.dtype == torch.float32 and rec.dtype == torch.float32
-    assert torch.isfinite(y).all() and torch.isfinite(rec).all()
+        recon = op.fbp(y)
+    for t in (y, rec, recon):
+        assert t.dtype == torch.float32
+        assert torch.isfinite(t).all()
+
+    # The backward runs in whatever dtype the forward ran in, so an fp32 forward
+    # is what keeps the gradient fp32 as well.
+    (g,) = torch.autograd.grad(rec.square().sum(), x)
+    assert g.dtype == torch.float32 and torch.isfinite(g).all()
 
 
 def test_rejects_invalid_geometry_and_mode(device):

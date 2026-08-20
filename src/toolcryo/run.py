@@ -8,7 +8,7 @@ from typing import Literal
 import torch
 from deepinv.distributed import DistributedContext
 
-from .base_config import RunEIBaseConfig
+from .base_config import RunEIBaseConfig, amp_dtype_from_str
 from .dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders, _make_full_loader
 from .dataset.dataset_patch import (
     EIPatchDataConfig, build_ei_patch_dataloaders, extract_patches_at_positions,
@@ -152,10 +152,14 @@ def _configure_trainer(
     trainer._ckpt_dir           = ensure_dir(output_dir / "checkpoints") if rank == 0 else None
     trainer._grad_accum_steps   = max(1, int(cfg.grad_accumulation_steps))
     trainer.ckp_interval        = int(cfg.ckp_interval)
-    if cfg.use_mixed_precision:
-        trainer._enable_mixed_precision(dtype=cfg.mixed_precision_dtype)
+    # "off" leaves the trainer untouched: _autocast/_amp_dtype/_scaler all stay
+    # None, which every AMP site below treats as "do nothing".
+    if cfg.mixed_precision != "off":
+        trainer._enable_mixed_precision(dtype=cfg.mixed_precision)
         if rank == 0:
-            print(f"[ei] mixed precision enabled ({cfg.mixed_precision_dtype})", flush=True)
+            print(f"[ei] mixed precision enabled ({cfg.mixed_precision})", flush=True)
+    elif rank == 0:
+        print("[ei] mixed precision off (fp32)", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -501,4 +505,7 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
             pixel_size_angstrom=cfg.pixel_size_angstrom,
             save_mrc=bool(cfg.save_mrc),
             save_fsc_curves=bool(cfg.save_fsc_curves),
+            # Infer in the dtype the model was trained in — and in fp32 when
+            # the run is "off", rather than autocasting regardless as before.
+            amp_dtype=amp_dtype_from_str(cfg.mixed_precision),
         )

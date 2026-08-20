@@ -142,7 +142,7 @@ Uses deepinv's [distributed tiling framework](https://github.com/deepinv/deepinv
 | `eval_interval` | Run validation every N epochs |
 | `log_every_n_epochs` | Print loss summary and save figures every N epochs |
 | `infer_stride` | Sliding-window stride for post-training inference |
-| `use_mixed_precision` | fp16 forward pass + scaled backward |
+| `mixed_precision` | `"off"` \| `"fp16"` \| `"bf16"` — one switch for training, validation and inference. `"off"` is pure fp32; `"fp16"` adds a GradScaler; `"bf16"` needs none and does not overflow at native resolution |
 | `model_type` | `"unet"` or `"drunet"` |
 
 **`patch`**

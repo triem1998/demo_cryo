@@ -555,22 +555,28 @@ def denoise_patches(
     model: "torch.nn.Module",
     wedge: "torch.Tensor",
     device: "torch.device",
+    amp_dtype: "torch.dtype" = None,
 ) -> "torch.Tensor":
     """Run ``f(A(f(.)))`` on a batch of crops — mirrors the inference forward.
 
     :param crops: (B, D, H, W) float tensor of ``crop_size³`` patches.
     :param wedge: wedge mask (mask_size³) applied between the two model passes.
+    :param amp_dtype: autocast dtype, or ``None`` for pure fp32 (no autocast at
+        all). Comes from the run's ``mixed_precision`` setting, so validation
+        figures are produced in the same precision the model trained in.
     :returns: (B, D, H, W) float32 CPU tensor.  The model's train/eval mode is
         left unchanged — the caller manages it.
     """
-    use_amp = device.type == "cuda"
+    use_amp = device.type == "cuda" and amp_dtype is not None
     wedge_dev = wedge.to(device)
     batch = crops.to(device)
     with torch.no_grad():
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+        with torch.autocast(device_type=device.type,
+                            dtype=amp_dtype or torch.float16, enabled=use_amp):
             out = model(batch[:, None])[:, 0]
         out = _apply_wedge_batch(out.float(), wedge_dev)
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+        with torch.autocast(device_type=device.type,
+                            dtype=amp_dtype or torch.float16, enabled=use_amp):
             out = model(out[:, None])[:, 0]
     return out.float().cpu()
 

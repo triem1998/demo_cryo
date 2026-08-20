@@ -29,7 +29,7 @@ training:
   infer_train: true        # run inference on training volumes
   infer_val: true          # run inference on validation volumes
   save_mrc: false          # save reconstruction as .mrc file
-  use_mixed_precision: true  # true = fp16 forward + scaled backward (~2x faster, matches icecream default)
+  mixed_precision: "fp16"   # "off" | "fp16" | "bf16" — fp16 forward + scaled backward (icecream default)
   model_type: unet         # "unet" | "drunet"
   # torch.compile the denoiser (before the distribute()/DDP wrap). false = off.
   compile: false

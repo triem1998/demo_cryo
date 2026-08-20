@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from ..base_config import RunEIBaseConfig
+from ..base_config import RunEIBaseConfig, amp_dtype_from_str
 from ..dataset.dataset_patch import EIPatchDataConfig, build_ei_patch_dataloaders
 from ..physics import MissingWedge
 from ..losses.losses_equivariant_wedge import _initialize_window, _symmetrize_and_binarize
@@ -91,16 +91,20 @@ def patch_inference(
     infer_batch_size: int,
     device: torch.device,
     pre_pad: bool = True,
+    amp_dtype: torch.dtype | None = None,
 ) -> np.ndarray:
     """Sliding-window f(A(f(.))) inference — mirrors icecream's inference_util.inference exactly.
 
     :param vol: (D, H, W) CPU float32 tensor (globally normalised).
     :param wedge: wedge_input mask (mask_size³) on CPU.
+    :param amp_dtype: autocast dtype, or ``None`` for pure fp32. 
     :returns: (D, H, W) float32 numpy array.
     """
     pre_pad_size = crop_size // 4
 
-    vol_fbp = vol.to(torch.float16)
+    use_amp = device.type == "cuda" and amp_dtype is not None
+
+    vol_fbp = vol.to(amp_dtype) if use_amp else vol
     if pre_pad:
         vol_fbp = torch.nn.functional.pad(vol_fbp, (pre_pad_size, 0, pre_pad_size, 0, pre_pad_size, 0))
     wedge_dev = wedge.to(device)
@@ -132,7 +136,6 @@ def patch_inference(
         if i + crop_size <= N1 and j + crop_size <= N2 and k + crop_size <= N3
     ]
 
-    use_amp = device.type == "cuda"
     model.eval()
     with torch.no_grad():
         for batch_start in range(0, len(positions), infer_batch_size):
@@ -141,11 +144,13 @@ def patch_inference(
                 vol_fbp_pad[i:i + crop_size, j:j + crop_size, k:k + crop_size]
                 for i, j, k in batch_positions
             ]).to(device)
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            with torch.autocast(device_type=device.type,
+                                dtype=amp_dtype or torch.float16, enabled=use_amp):
                 output = model(batch[:, None])[:, 0]        # f(crop)
             output = output.float()
             output = _apply_wedge_batch(output, wedge_dev)  # A(f(crop))
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            with torch.autocast(device_type=device.type,
+                                dtype=amp_dtype or torch.float16, enabled=use_amp):
                 output = model(output[:, None])[:, 0]       # f(A(f(crop)))
             out_cpu = output.detach().cpu()
             for b, (i, j, k) in enumerate(batch_positions):
@@ -249,6 +254,7 @@ def _infer_one_volume(
         crop_size=int(cfg.crop_size), stride=stride,
         infer_batch_size=int(cfg.infer_batch_size),
         device=device, pre_pad=bool(cfg.pre_pad),
+        amp_dtype=amp_dtype_from_str(cfg.mixed_precision),
     )
     print("  running inference on EVN ...", flush=True)
     recon_evn = patch_inference(evn_vol, **infer_kw)
@@ -342,6 +348,7 @@ def run_post_training_inference(
     pixel_size_angstrom: float | None = None,
     save_mrc: bool = False,
     save_fsc_curves: bool = True,
+    amp_dtype: torch.dtype | None = None,
 ) -> None:
     """Sliding-window EVN+ODD inference over (train, val) datasets post-training.
 
@@ -402,7 +409,7 @@ def run_post_training_inference(
 
             infer_kw = dict(model=raw_model, wedge=wedge_i, crop_size=crop_size,
                             stride=stride, infer_batch_size=infer_batch_size,
-                            device=device, pre_pad=True)
+                            device=device, pre_pad=True, amp_dtype=amp_dtype)
 
             t0 = time.perf_counter()
             print(f"  [{tomo_name}] EVN inference ...", flush=True)

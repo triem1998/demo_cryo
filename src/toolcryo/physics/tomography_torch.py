@@ -116,7 +116,12 @@ def _work_dtype(t: torch.Tensor) -> torch.dtype:
     """Compute dtype: float64 is honoured (gradcheck), everything else is fp32.
 
     Line integrals in fp16 lose far too much precision, so an autocast region
-    must not drag the projector down with it.
+    must not drag the projector down with it. The three autograd wrappers above
+    also carry ``custom_fwd(cast_inputs=torch.float32)``, which makes the fp32
+    guarantee structural on CUDA — ``grid_sample`` is autocast-fallthrough and
+    returns whatever dtype it is handed, so without that this function is the
+    sole guard. It stays as the guard for CPU autocast and for the paths that
+    do not enter through the wrappers.
     """
     return torch.float64 if t.dtype == torch.float64 else torch.float32
 
@@ -132,6 +137,7 @@ class _Project(torch.autograd.Function):
     """
 
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
     def forward(ctx, x: torch.Tensor, op: "TomographyEMTorch") -> torch.Tensor:
         ctx.op = op
         return op._project(x)
@@ -145,6 +151,7 @@ class _Backproject(torch.autograd.Function):
     """``A_adjoint`` as an autograd op; its backward is the projection."""
 
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
     def forward(ctx, y: torch.Tensor, op: "TomographyEMTorch") -> torch.Tensor:
         ctx.op = op
         return op._backproject_dispatch(y)
@@ -173,6 +180,7 @@ class _BackprojectPixelDrivenAstraGrad(torch.autograd.Function):
     """
 
     @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
     def forward(ctx, y: torch.Tensor, op: "TomographyEMTorch") -> torch.Tensor:
         ctx.op = op
         return op._backproject_pixel_driven(y)

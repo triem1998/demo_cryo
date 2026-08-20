@@ -29,7 +29,7 @@ training:
   # Accumulate gradients over this many full volumes before each optimiser step.
   # Compensates for DataLoader batch_size=1.
   grad_accumulation_steps: 2
-  use_mixed_precision: true
+  mixed_precision: "fp16"   # "off" | "fp16" | "bf16" — fp16 forward + scaled backward (icecream default)
   model_type: unet         # "unet" | "drunet"
   # torch.compile the denoiser (before the distribute()/DDP wrap). false = off.
   compile: true

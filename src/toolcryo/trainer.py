@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from .base_config import amp_dtype_from_str
 from .forward import ei_denoiser_forward
 from .utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
 from .utils.utils import (
@@ -45,6 +46,7 @@ class BaseTrainer(dinv.Trainer):
         self._train_sampler = None
         self._scaler = None
         self._autocast = None
+        self._amp_dtype = None
         # per-step counters
         self._accum_count: int = 0
         self._current_train_epoch = None
@@ -129,6 +131,11 @@ class BaseTrainer(dinv.Trainer):
         loss_total = torch.tensor(0.0)
 
         with torch.enable_grad() if train else torch.no_grad():
+            # This block covers only the model passes reached through
+            # forward_pass -> model_inference. The losses call model(...)
+            # directly, bypassing it; those passes are covered by _amp_model()
+            # below. The two sites are disjoint, not redundant — dropping either
+            # one leaves half the step in fp32.
             with autocast_ctx:
                 x_net, y_net = self.forward_pass(x, y, physics, train=train)
             if x_net is not None:
@@ -140,7 +147,7 @@ class BaseTrainer(dinv.Trainer):
                 loss_total = torch.tensor(0.0, device=x.device)
                 for k, loss_fn in enumerate(self.losses):
                     loss = loss_fn(x=x, x_net=x_net, y=y, y_net=y_net,
-                                   physics=physics, model=self.model, epoch=epoch)
+                                   physics=physics, model=self._amp_model(), epoch=epoch)
                     loss_total = loss_total + loss.mean()
                     meters = self.logs_losses_train[k] if train else self.logs_losses_eval[k]
                     meters.update(loss.detach().cpu().numpy())
@@ -168,6 +175,7 @@ class BaseTrainer(dinv.Trainer):
                 if self._scaler is not None:
                     self._scaler.step(self.optimizer)
                     self._scaler.update()
+                    logs["amp_scale"] = self._scaler.get_scale()
                 else:
                     self.optimizer.step()
                 self._post_optimizer_step()
@@ -248,10 +256,12 @@ class BaseTrainer(dinv.Trainer):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    def _enable_mixed_precision(self, dtype: str = "fp16", device_type: str = "cuda") -> None:
-        if dtype not in ("fp16", "bf16"):
-            raise ValueError(f"mixed_precision_dtype must be 'fp16' or 'bf16', got {dtype!r}.")
-        amp_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
+    def _enable_mixed_precision(self, dtype: str = "fp16", device_type: str | None = None) -> None:
+        """Arm autocast (+ GradScaler for fp16). Never called when mixed_precision is "off"."""
+        if device_type is None:
+            device_type = self.device.type if hasattr(self, "device") else "cuda"
+        amp_dtype = amp_dtype_from_str(dtype)
+        self._amp_dtype = amp_dtype
         self._autocast = torch.amp.autocast(device_type, dtype=amp_dtype)
         # GradScaler exists to rescue tiny fp16 gradients from underflow via a
         # 65536x loss multiply. bf16 shares fp32's exponent range, so scaling is
@@ -259,6 +269,32 @@ class BaseTrainer(dinv.Trainer):
         # resolution. No scaler for bf16: the trainer already runs a plain
         # .backward() whenever self._scaler is None (the fp32 path).
         self._scaler = torch.amp.GradScaler(device_type) if dtype == "fp16" else None
+
+    def _amp_model(self):
+        """``self.model``, wrapped so each call autocasts and returns fp32.
+
+        The equivariance losses run a denoiser pass of their own
+        (losses_equivariant_wedge.py:339-340, losses_equivariant_tomo.py:43),
+        reached by calling ``model(...)`` directly rather than through
+        ``model_inference``. Without this they are the only fp32 model passes in
+        the step — roughly half of them.
+
+
+        A closure, not an ``nn.Module``: wrapping ``self.model`` in a module
+        would break the ``isinstance(self.model, DistributedDataParallel)``
+        check below and the ``self.model.module`` unwrap in the probe. Reading
+        ``self.model`` inside the closure also picks up any DDP/``torch.compile``
+        re-wrapping applied after the trainer was built.
+        """
+        if self._autocast is None:
+            return self.model                       # strict no-op on the fp32 path
+
+        def _call(*args, **kwargs):
+            with self._autocast:
+                out = self.model(*args, **kwargs)
+            return out.float()
+
+        return _call
 
     def plot(self, epoch, physics, x, y, x_net, train=True):  # type: ignore[override]
         """Suppress the default deepinv plot."""
@@ -419,8 +455,10 @@ class EIPatchTrainer(BaseTrainer):
         model.eval()
         epoch_dir = self._patch_probe_dir / f"epoch{epoch:04d}"
         for tomo_name, evn_crops, odd_crops, origins in self._patch_probes:
-            recon_evn = denoise_patches(evn_crops, model, self._patch_probe_wedge, self.device)
-            recon_odd = denoise_patches(odd_crops, model, self._patch_probe_wedge, self.device)
+            recon_evn = denoise_patches(evn_crops, model, self._patch_probe_wedge, self.device,
+                                        amp_dtype=self._amp_dtype)
+            recon_odd = denoise_patches(odd_crops, model, self._patch_probe_wedge, self.device,
+                                        amp_dtype=self._amp_dtype)
             recon = 0.5 * (recon_evn + recon_odd)
             for j, (d0, h0, w0) in enumerate(origins):
                 save_slice_figure(
