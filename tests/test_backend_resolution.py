@@ -50,7 +50,13 @@ def test_auto_on_cpu_is_torch():
     assert resolve_tomography_backend("auto", "cpu") == "torch"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+#: See the note in ``test_tomography_torch.py``: ROCm answers True here too, and
+#: ``auto`` is *meant* to return "torch" there — that is
+#: ``test_auto_falls_back_on_rocm`` below, not this test.
+CUDA_ASTRA = torch.cuda.is_available() and torch.version.hip is None
+
+
+@pytest.mark.skipif(not CUDA_ASTRA, reason="needs a real (non-ROCm) CUDA device")
 def test_auto_on_cuda_is_astra():
     assert resolve_tomography_backend("auto", "cuda") == "astra"
 

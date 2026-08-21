@@ -43,9 +43,15 @@ SHAPE = (4, 6, 10)
 ANGLES = [0.0, 25.0, -40.0, 62.0]
 DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
+#: A ROCm build reports ``cuda.is_available()`` True and imports astra fine, but
+#: astra ships only CUDA kernels — running them there yields garbage rather than
+#: an error, so the parity references must be gated on the same predicate
+#: ``resolve_tomography_backend`` uses, not on ``cuda.is_available()`` alone.
+CUDA_ASTRA = torch.cuda.is_available() and torch.version.hip is None
+
 astra_required = pytest.mark.skipif(
-    importlib.util.find_spec("astra") is None or not torch.cuda.is_available(),
-    reason="astra needs CUDA and is not importable on AMD/ROCm — parity is "
+    importlib.util.find_spec("astra") is None or not CUDA_ASTRA,
+    reason="astra needs CUDA and cannot run on AMD/ROCm — parity is "
            "established on the CUDA box instead",
 )
 
