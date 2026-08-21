@@ -289,14 +289,17 @@ def _infer_one_volume(
     # save_slice_figure shares one vmin/vmax across every column, so they must be
     # on a common scale: the raw model output has a far smaller std than the
     # on-disk volumes and would otherwise render as flat grey.
-    cols   = [_znorm(evn_np), _znorm(odd_np), _znorm(recon_np)]
-    labels = ["EVN", "ODD", "ours"]
-    if icecream_np is not None:
-        cols.append(_znorm(icecream_np))
-        labels.append("IceCream")
+    # Column order matches full inference / training: EVN, ODD, comparisons, ours last.
+    cols   = [_znorm(evn_np), _znorm(odd_np)]
+    labels = ["EVN", "ODD"]
     if isonet_np is not None:
         cols.append(_znorm(isonet_np))
         labels.append("IsoNet")
+    if icecream_np is not None:
+        cols.append(_znorm(icecream_np))
+        labels.append("IceCream")
+    cols.append(_znorm(recon_np))
+    labels.append("ours")
 
     save_slice_figure(
         images_dir, epoch=0, vol_idx=vol_idx,
@@ -473,15 +476,18 @@ def run_post_training_inference(
             icecream_np = _load_comparison(icecream_path)
             isonet_np   = _load_comparison(isonet_path)
 
-            cols, labels = [evn_crop, odd_crop, recon_crop], ["EVN", "ODD", "ours"]
-            if icecream_np is not None:
-                cols.append(_znorm(icecream_np))
-                labels.append("IceCream")
-            del icecream_np
+            # Column order matches full inference / training: EVN, ODD, comparisons, ours last.
+            cols, labels = [evn_crop, odd_crop], ["EVN", "ODD"]
             if isonet_np is not None:
                 cols.append(_znorm(isonet_np))
                 labels.append("IsoNet")
             del isonet_np
+            if icecream_np is not None:
+                cols.append(_znorm(icecream_np))
+                labels.append("IceCream")
+            del icecream_np
+            cols.append(recon_crop)
+            labels.append("ours")
 
             save_slice_figure(
                 images_dir, epoch=0, vol_idx=i,
