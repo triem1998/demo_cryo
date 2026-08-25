@@ -118,6 +118,12 @@ class RunEIBaseConfig(BaseModel):
     # resume tomo_ei training from its own (already astra-order) checkpoint.
     permute_native_to_astra: bool | None = None
 
+    # ── Resume vs warm-start ─────────────────────────────────────────────────
+    # False (default): pretrained_ckpt initialises the weights only 
+    # True: also restore optimizer + scheduler state and the global epoch
+    # counter — for continuing the *same* run after a timeout/crash. 
+    resume_optimizer: bool = False
+
     @model_validator(mode="before")
     @classmethod
     def _reject_legacy_amp_keys(cls, data):

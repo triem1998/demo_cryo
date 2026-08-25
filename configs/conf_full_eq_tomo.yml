@@ -14,9 +14,9 @@ general:
   preset: tomo_ei   # "missingwedge_ei" | "unrolled" | "tomo_ei" 
 
 training:
-  num_epochs: 100
+  num_epochs: 50
   learning_rate: 1.0e-4
-  grad_clip: 10.0
+  grad_clip: 10000.0
   # ReduceLROnPlateau on the training TotalLoss. false = off (default,
   # unchanged behaviour — flat learning_rate for the whole run).
   use_lr_scheduler: true
@@ -29,7 +29,7 @@ training:
   # Accumulate gradients over this many full volumes before each optimiser step.
   # Compensates for DataLoader batch_size=1.
   grad_accumulation_steps: 1
-  mixed_precision: "bf16"   # "off" | "fp16" | "bf16" — bf16: no loss scaling, no overflow at native resolution
+  mixed_precision: "off"   # "off" | "fp16" | "bf16" — bf16: no loss scaling, no overflow at native resolution
   model_type: unet         # "unet" | "drunet"
   # torch.compile the denoiser (before the distribute()/DDP wrap). false = off.
   compile: true

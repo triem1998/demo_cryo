@@ -132,6 +132,44 @@ def _build_plateau_scheduler(cfg: RunEIBaseConfig, optimizer):
     )
 
 
+def _resume_training_state(cfg, trainer, optimizer, ckpt_path, permute: bool, rank: int) -> None:
+    """Restore optimizer + scheduler + global epoch from a same-run checkpoint.
+
+    The weights themselves are loaded separately (build_distributed_denoiser /
+    the inline load in run_patch); this is everything *else* a resume needs.
+
+    """
+    if not cfg.resume_optimizer:
+        return
+    if ckpt_path is None:
+        raise ValueError("resume_optimizer=True but pretrained_ckpt is not set.")
+    if permute:
+        raise ValueError(
+            "resume_optimizer=True is incompatible with permute_native_to_astra=True: "
+            "the permutation reorders conv-kernel axes and Adam's moments are "
+            "per-element, so they would land on the wrong axes. Resume from an "
+            "astra-order tomo_ei checkpoint (permute_native_to_astra: false) instead."
+        )
+    ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+    # periodic checkpoints (trainer.log_metrics_mlops) use "optimizer";
+    # ckp_final.pth (below) uses "optimizer_state_dict".
+    opt_state = ckpt.get("optimizer") or ckpt.get("optimizer_state_dict")
+    if opt_state is None:
+        raise ValueError(f"{ckpt_path} carries no optimizer state — cannot resume from it.")
+    optimizer.load_state_dict(opt_state)
+    # Absent from checkpoints written before scheduler state was saved; those
+    # resume with a fresh plateau baseline, which is recoverable (a stale LR is not).
+    if trainer._plateau_scheduler is not None and ckpt.get("scheduler") is not None:
+        trainer._plateau_scheduler.load_state_dict(ckpt["scheduler"])
+        sched_msg = ""
+    else:
+        sched_msg = "  (no scheduler state — plateau baseline restarts)"
+    trainer._resume_epoch = ckpt.get("epoch")
+    if rank == 0:
+        print(f"[resume] optimizer state from {ckpt_path.name}  epoch={ckpt.get('epoch')}  "
+              f"lr={optimizer.param_groups[0]['lr']:.3g}{sched_msg}", flush=True)
+
+
 def _configure_trainer(
     trainer,
     cfg: RunEIBaseConfig,
@@ -204,6 +242,13 @@ def run_full(cfg: RunEIFullConfig) -> None:
         train_ds = data_bundle.train_loader.dataset
         val_ds   = data_bundle.val_loader.dataset
 
+        # Shared by both branches below and by _resume_training_state.
+        ckpt_path = Path(cfg.pretrained_ckpt) if cfg.pretrained_ckpt else None
+        if is_tomo and not is_unrolled:
+            permute = cfg.permute_native_to_astra if cfg.permute_native_to_astra is not None else True
+        else:
+            permute = False   # missingwedge_ei stays native-order throughout
+
         if is_tomo:
             physics = preset["physics"](
                 cfg, train_ds.evn_paths + val_ds.evn_paths, train_ds.odd_paths + val_ds.odd_paths, ctx.device, ctx)
@@ -216,11 +261,6 @@ def run_full(cfg: RunEIFullConfig) -> None:
                 # tomo_ei: plain denoiser on each half's FBP volume. Astra's
                 # volume isn't a cube, so Rotate3D must only use shape-preserving rotations.
                 transform = Rotate3D(n_trans=1, volume_shape=physics.physics_evn.volume_shape)
-                # Assumes a native-order patch checkpoint by default (permuted to
-                # astra order); set permute_native_to_astra=False when resuming
-                # from an already astra-order tomo_ei/unrolled checkpoint.
-                ckpt_path = Path(cfg.pretrained_ckpt) if cfg.pretrained_ckpt else None
-                permute = cfg.permute_native_to_astra if cfg.permute_native_to_astra is not None else True
                 model, model_info = build_distributed_denoiser(
                     cfg, ctx, rank, ckpt_path, permute_native_to_astra=permute, log_prefix="ei-full")
         else:
@@ -240,9 +280,8 @@ def run_full(cfg: RunEIFullConfig) -> None:
 
             physics   = preset["physics"](cfg, vol_size, ctx.device)
             transform = Rotate3D(n_trans=1)
-            ckpt_path = Path(cfg.pretrained_ckpt) if cfg.pretrained_ckpt else None
             model, model_info = build_distributed_denoiser(
-                cfg, ctx, rank, ckpt_path, permute_native_to_astra=False, log_prefix="ei-full")
+                cfg, ctx, rank, ckpt_path, permute_native_to_astra=permute, log_prefix="ei-full")
 
             if rank == 0:
                 print(f"[ei-full] vol_size={vol_size}  patch_size={cfg.patch_size}  "
@@ -299,6 +338,7 @@ def run_full(cfg: RunEIFullConfig) -> None:
                            images_subdir=f"{fsc_label}_fsc_images" if fsc_label == "train" else "val_images",
                            train_images_subdir="train_images")
         trainer._plateau_scheduler = _build_plateau_scheduler(cfg, optimizer)
+        _resume_training_state(cfg, trainer, optimizer, ckpt_path, permute, rank)
         trainer._forward_strategy = preset["forward"]
         trainer._post_optimizer_step = lambda: preset["post_optimizer_step"](model)
         trainer._recon_strategy      = preset["recon"]
@@ -330,7 +370,7 @@ def run_full(cfg: RunEIFullConfig) -> None:
             # unrolled keeps trainer.model as the PGD object itself.
             raw_model = trainer.model.processor if hasattr(trainer.model, "processor") else trainer.model
             torch.save({
-                "epoch": cfg.num_epochs,
+                "epoch": int(cfg.num_epochs) - 1,
                 "model_state_dict": raw_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
             }, ckpt_path)
@@ -438,6 +478,10 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
                            images_subdir="train_images",
                            train_sampler=data_bundle.train_sampler)
         trainer._plateau_scheduler = _build_plateau_scheduler(cfg, optimizer)
+        # run_patch never permutes — it trains and resumes in native axis order.
+        _resume_training_state(
+            cfg, trainer, optimizer,
+            Path(cfg.pretrained_ckpt) if cfg.pretrained_ckpt else None, False, rank)
 
         # ── Patch-position probe: pre-extract fixed crops once (rank 0) ──────
         # Evaluated on val volumes, falling back to train when val is empty.
@@ -467,7 +511,10 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
         if rank == 0 and trainer._ckpt_dir is not None:
             ckpt_path = Path(trainer._ckpt_dir) / "ckp_final.pth"
             torch.save({
-                "epoch": cfg.num_epochs,
+                # last *completed* epoch index, matching the periodic checkpoints
+                # written by trainer.log_metrics_mlops — _resume_training_state
+                # reads this and continues at epoch+1.
+                "epoch": int(cfg.num_epochs) - 1,
                 "model_state_dict": raw_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
             }, ckpt_path)

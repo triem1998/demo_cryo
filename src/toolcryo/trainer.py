@@ -80,6 +80,9 @@ class BaseTrainer(dinv.Trainer):
         # ReduceLROnPlateau, stepped manually from log_metrics_mlops (not
         # self.scheduler — see _build_plateau_scheduler in run.py).
         self._plateau_scheduler = None
+        # global epoch of a resumed checkpoint (see setup_train / run.py's
+        # _resume_training_state). None = fresh run, start at epoch 0.
+        self._resume_epoch: int | None = None
         # hook: called right after optimizer.step() (e.g. clamping trainable
         # algo params — unrolled preset's stepsize must stay positive). No-op
         # by default; harmless for missingwedge_ei.
@@ -88,6 +91,18 @@ class BaseTrainer(dinv.Trainer):
         # outputs (set from the preset in run.py; see utils.half_set_recon /
         # utils.unrolled_recon)
         self._recon_strategy = half_set_recon
+
+    def setup_train(self, train: bool = True, **kwargs) -> None:
+        """Continue a resumed run on the global epoch timeline.
+
+        dinv.Trainer.setup_train resets ``epoch_start`` to 0, so this has to
+        run after it. Keeping the global epoch keeps ckp_/fsc_epoch names, the
+        metrics CSV and the ``epoch % eval_interval`` phase continuous across
+        the restart.
+        """
+        super().setup_train(train=train, **kwargs)
+        if self._resume_epoch is not None:
+            self.epoch_start = int(self._resume_epoch) + 1
 
     # ------------------------------------------------------------------
     # EI forward pass — f(EVN) and f(ODD) independently
@@ -243,6 +258,8 @@ class BaseTrainer(dinv.Trainer):
                     "epoch": step,
                     "model_state_dict": getattr(raw_model, "processor", raw_model).state_dict(),
                     "optimizer": self.optimizer.state_dict() if self.optimizer else None,
+                    "scheduler": (self._plateau_scheduler.state_dict()
+                                  if self._plateau_scheduler is not None else None),
                 }
                 torch.save(state, self._ckpt_dir / f"ckp_{step:04d}.pth")
                 print(f"[ckpt] saved ckp_{step:04d}.pth", flush=True)

@@ -12,7 +12,7 @@ general:
   seed: 0
 
 training:
-  num_epochs: 5000
+  num_epochs: 20000
   learning_rate: 1.0e-4
   grad_clip: 1.0
   # ReduceLROnPlateau on the training TotalLoss. false = off (default,
@@ -47,7 +47,7 @@ patch:
   prefetch_factor: 1
   persistent_workers: true
   normalize: true            # whole-volume zero-mean, unit-std (matches icecream's load_volume normalization)
-  normalize_crops: false     # also re-normalise each crop (icecream's normalize_crops)
+  normalize_crops: true    # also re-normalise each crop (icecream's normalize_crops)
   # Crop origins [d, h, w] evaluated on the val set every log interval; saved to runs/.../patch_probe/
   patch_positions:
     - [628, 312, 256]
