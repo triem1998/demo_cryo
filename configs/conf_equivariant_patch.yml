@@ -40,6 +40,11 @@ training:
 
 patch:
   crop_size: 72             # cubic patch side length (icecream default)
+  # false = icecream: every optimizer step draws its crops from ONE volume and
+  # uses that volume's exact wedge. true = batches may mix volumes, and the
+  # shared wedge is the intersection of their tilt ranges.
+  # false requires n_crops_per_vol >= world_size * batch_size.
+  mix_volumes: false
   n_crops_per_vol: 8        # virtual crops per volume per epoch
   batch_size: 4
   num_workers: 1

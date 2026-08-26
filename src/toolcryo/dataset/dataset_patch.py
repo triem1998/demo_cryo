@@ -10,9 +10,13 @@ Differences from the full-volume variant:
   - Patches are random cubic crops of side ``crop_size`` extracted from the same
     coordinates in both EVN and ODD; this preserves the cross half-set pairing.
   - ``__len__`` = len(evn_paths) * n_crops_per_vol (virtual epoch length).
-  - Volumes are memory-mapped: only the OS pages covering each requested crop
-    (~1–3 MB) are read from disk per __getitem__ call.  The full volume is
-    never copied into RAM unless explicitly requested (e.g. inference).
+  - Volumes are memory-mapped in their on-disk dtype (these MRC files are
+    float16): only the OS pages covering each requested crop (~1-3 MB) are read
+    per __getitem__ call, and the cast to float32 is applied to the crop, not
+    to the volume.  Casting the volume would materialise a full anonymous copy
+    (2.15 GB for a 512x1024x1024 float16 volume) that the OS can never reclaim.
+    The full volume is never copied into RAM unless explicitly requested
+    (e.g. inference, via _LazyVolList).
 """
 from __future__ import annotations
 
@@ -24,7 +28,7 @@ from pathlib import Path
 import mrcfile
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from ..utils.utils import (
     EIDataBundle, _discover_pairs, _resolve_tlt_ranges, select_train_val_by_name,
@@ -41,6 +45,11 @@ class EIPatchDataConfig:
     crop_size: int = 72
     n_crops_per_vol: int = 10          # virtual epoch = n_vols * n_crops_per_vol
     batch_size: int = 4
+    # False = icecream's convention: every optimizer step draws its crops from a
+    # single volume, so the step uses that volume's exact wedge. True (default)
+    # lets a batch mix volumes, and the shared wedge becomes the intersection of
+    # their tilt ranges (see MissingWedge.update_parameters).
+    mix_volumes: bool = True
     num_workers: int = 1
     pin_memory: bool = True
     prefetch_factor: int = 1
@@ -69,19 +78,18 @@ def _open_mrc_mmap(path_str: str) -> tuple:
     """Open an MRC file as a memory-mapped (D, H, W) array; cache the handle.
 
     Returns ``(mrc_handle, vol_ndarray)`` where ``vol_ndarray`` is a strided
-    float32 view of shape (D, H, W) = (Y, X, Z) over the on-disk data.
-    The OS reads only the pages corresponding to whatever region is sliced —
-    the full volume is never copied into RAM by this call alone.
+    view of shape (D, H, W) = (Y, X, Z) over the on-disk data, in the file's
+    **native dtype** (float16 for this dataset).  The OS reads only the pages
+    corresponding to whatever region is sliced — the full volume is never
+    copied into RAM by this call alone.  Callers cast their own slice to
+    float32; casting here instead would defeat the mapping entirely.
 
     Both objects are cached so the mapping stays alive across calls and file
     descriptors are not repeatedly opened.  The cache is per-process, so each
     DataLoader worker maintains its own independent cache.
     """
     mrc = mrcfile.mmap(path_str, permissive=True, mode='r')
-    data = mrc.data  # numpy.memmap, shape (Z, Y, X)
-    if data.dtype != np.float32:
-        # Uncommon: force conversion only when needed (reads whole volume once)
-        data = data.astype(np.float32)
+    data = mrc.data  # numpy.memmap, shape (Z, Y, X), native dtype
     # moveaxis creates a non-contiguous view — no data pages are read here
     vol = np.moveaxis(data, 0, 2)   # (Z, Y, X) → (Y, X, Z) = (D, H, W)
     return mrc, vol
@@ -90,12 +98,28 @@ def _open_mrc_mmap(path_str: str) -> tuple:
 @lru_cache(maxsize=64)
 def _vol_mean_std(path_str: str) -> tuple[float, float]:
     """Whole-volume mean/std (icecream's ``load_volume`` normalisation),
-    computed once per (path, process) and cached. Reduces over the memmap
-    directly — no full-volume copy is materialised in RAM — so only the
-    first crop drawn from a given volume in a worker pays the one-time full
-    file read; every crop after that costs the same as it did before this."""
-    _, vol = _open_mrc_mmap(path_str)
-    return float(vol.mean()), float(vol.std())
+    computed once per (path, process) and cached.
+
+    Streams the file in blocks rather than calling ``vol.std()``: numpy's std
+    materialises a full-size ``arr - mean`` temporary (4.2 GB for one of these
+    volumes), which is exactly the kind of allocation this module exists to
+    avoid.  Accumulating sum and sum-of-squares in float64 keeps the peak at
+    one block while being *more* accurate than the previous float32 reduction.
+
+    Reduces over the on-disk ``(Z, Y, X)`` array rather than the transposed
+    view — mean and variance are order-independent, and the untransposed array
+    is contiguous, so the read is sequential.
+    """
+    mrc, _ = _open_mrc_mmap(path_str)
+    data = mrc.data
+    n = total = total_sq = 0.0
+    for i in range(0, data.shape[0], 8):          # ~67 MB per block as float64
+        blk = np.asarray(data[i:i + 8], dtype=np.float64)
+        n += blk.size
+        total += blk.sum()
+        total_sq += (blk * blk).sum()
+    mean = total / n
+    return float(mean), float(np.sqrt(max(total_sq / n - mean * mean, 0.0)))
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +145,8 @@ class _LazyVolList:
         if p is None:
             return None
         _, vol_np = _open_mrc_mmap(str(p))
-        vol_t = torch.from_numpy(np.ascontiguousarray(vol_np))  # reads all pages
+        # Inference wants the whole volume, so the full read is intentional here.
+        vol_t = torch.from_numpy(np.ascontiguousarray(vol_np, dtype=np.float32))
         if self._normalize:
             vol_t = (vol_t - vol_t.mean()) / (vol_t.std() + 1e-8)
         return vol_t
@@ -234,10 +259,12 @@ class CryoEIPatchDataset(Dataset):
         # of data covering this crop; np.ascontiguousarray materialises those
         # pages into a fresh contiguous array.
         evn_patch = torch.from_numpy(
-            np.ascontiguousarray(evn_vol[d0:d0 + cs, h0:h0 + cs, w0:w0 + cs])
+            np.ascontiguousarray(evn_vol[d0:d0 + cs, h0:h0 + cs, w0:w0 + cs],
+                                 dtype=np.float32)
         ).unsqueeze(0)  # (1, cs, cs, cs)
         odd_patch = torch.from_numpy(
-            np.ascontiguousarray(odd_vol[d0:d0 + cs, h0:h0 + cs, w0:w0 + cs])
+            np.ascontiguousarray(odd_vol[d0:d0 + cs, h0:h0 + cs, w0:w0 + cs],
+                                 dtype=np.float32)
         ).unsqueeze(0)
 
         if self.normalize:
@@ -272,37 +299,141 @@ def extract_patches_at_positions(
 ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int, int]]]:
     """Extract ``crop_size³`` EVN/ODD patches at the given (d, h, w) origins.
 
-    The whole volume is loaded and globally normalised first (matching the
-    inference-time loading), then each patch is sliced out.  Each origin is
-    clamped so a **full** ``crop_size³`` window fits inside the volume — the
-    model always receives a full-size crop.  The clamped origins are returned.
+    Each patch is sliced out of the memory-mapped volume and only then cast and
+    normalised, using the cached whole-volume statistics — normalising the whole
+    volume and cropping afterwards is the same operation, but it materialised
+    three full-volume copies per half-set (~6 GB), which OOM-killed rank 0 when
+    the training probe looped over a dozen tomograms.
+
+    Each origin is clamped so a **full** ``crop_size³`` window fits inside the
+    volume — the model always receives a full-size crop.  The clamped origins
+    are returned.
 
     :returns: ``(evn_crops, odd_crops, used_origins)`` where crops are
         (N, crop_size, crop_size, crop_size) tensors.
     """
     _, evn_vol = _open_mrc_mmap(str(evn_path))
-    evn_t = torch.from_numpy(np.ascontiguousarray(evn_vol))
-    if odd_path is not None:
-        _, odd_vol = _open_mrc_mmap(str(odd_path))
-        odd_t = torch.from_numpy(np.ascontiguousarray(odd_vol))
-    else:
-        odd_t = evn_t
+    odd_vol = evn_vol if odd_path is None else _open_mrc_mmap(str(odd_path))[1]
 
     if normalize:
-        evn_t = (evn_t - evn_t.mean()) / (evn_t.std() + 1e-8)
-        odd_t = evn_t if odd_path is None else (odd_t - odd_t.mean()) / (odd_t.std() + 1e-8)
+        evn_mu, evn_sigma = _vol_mean_std(str(evn_path))
+        odd_mu, odd_sigma = (
+            (evn_mu, evn_sigma) if odd_path is None else _vol_mean_std(str(odd_path))
+        )
 
-    D, H, W = evn_t.shape
+    D, H, W = evn_vol.shape
     cs = crop_size
     evn_crops, odd_crops, used = [], [], []
     for d0, h0, w0 in positions:
         d0 = int(min(max(0, d0), max(0, D - cs)))
         h0 = int(min(max(0, h0), max(0, H - cs)))
         w0 = int(min(max(0, w0), max(0, W - cs)))
-        evn_crops.append(evn_t[d0:d0 + cs, h0:h0 + cs, w0:w0 + cs])
-        odd_crops.append(odd_t[d0:d0 + cs, h0:h0 + cs, w0:w0 + cs])
+        sl = (slice(d0, d0 + cs), slice(h0, h0 + cs), slice(w0, w0 + cs))
+        evn_c = torch.from_numpy(np.ascontiguousarray(evn_vol[sl], dtype=np.float32))
+        odd_c = torch.from_numpy(np.ascontiguousarray(odd_vol[sl], dtype=np.float32))
+        if normalize:
+            evn_c = (evn_c - evn_mu) / (evn_sigma + 1e-8)
+            odd_c = (odd_c - odd_mu) / (odd_sigma + 1e-8)
+        evn_crops.append(evn_c)
+        odd_crops.append(odd_c)
         used.append((d0, h0, w0))
     return torch.stack(evn_crops), torch.stack(odd_crops), used
+
+
+# ---------------------------------------------------------------------------
+# Single-volume batching (icecream convention)
+# ---------------------------------------------------------------------------
+
+class SingleVolumeBatchSampler(Sampler[list[int]]):
+    """Batches whose crops all come from a single volume — icecream's convention.
+
+    ``CryoEIPatchDataset`` maps index ``i`` to volume ``i % n_vols``, so each
+    residue class mod ``n_vols`` is exactly that volume's pool of crop indices.
+    Keeping a batch inside one residue class therefore gives every crop in an
+    optimizer step the same tilt range, and ``MissingWedge.update_parameters``
+    reduces to the identity instead of intersecting several volumes' wedges.
+
+    Under DDP the ranks split *one* volume's global batch of
+    ``world_size * batch_size`` crops between them, so every rank sits on the
+    same volume — and hence the same wedge — at the same step, exactly as
+    icecream's single-process loop does.  Everything up to the final per-rank
+    slice is computed identically on every rank, which is what keeps them in
+    lockstep for the gradient all-reduce.
+
+    A volume contributes ``n_crops_per_vol // (world_size * batch_size)`` global
+    batches per epoch; any remainder is dropped so all ranks run the same number
+    of steps.
+
+    :param int n_vols: Number of volumes in the dataset.
+    :param int n_crops_per_vol: Crop indices available per volume per epoch.
+    :param int batch_size: Crops per rank per step.
+    :param bool shuffle: Shuffle crop order within a volume, and batch order.
+    :param int seed: Base seed, combined with the epoch set by ``set_epoch``.
+    :param int rank: This process's rank.
+    :param int world_size: Total number of processes.
+    """
+
+    def __init__(
+        self,
+        n_vols: int,
+        n_crops_per_vol: int,
+        batch_size: int,
+        shuffle: bool = True,
+        seed: int = 0,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> None:
+        global_batch = int(world_size) * int(batch_size)
+        if n_vols > 0 and n_crops_per_vol < global_batch:
+            raise ValueError(
+                "mix_volumes=False needs n_crops_per_vol >= world_size * batch_size "
+                f"({world_size} * {batch_size} = {global_batch}), got "
+                f"n_crops_per_vol={n_crops_per_vol}."
+            )
+        self.n_vols          = int(n_vols)
+        self.n_crops_per_vol = int(n_crops_per_vol)
+        self.batch_size      = int(batch_size)
+        self.global_batch    = global_batch
+        self.shuffle         = bool(shuffle)
+        self.seed            = int(seed)
+        self.rank            = int(rank)
+        self.world_size      = int(world_size)
+        self.epoch           = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        """Reshuffle for the next epoch — called by ``BaseTrainer.train``."""
+        self.epoch = int(epoch)
+
+    def _batches(self) -> list[list[int]]:
+        # Seeded without the rank, so every rank builds the same global batches.
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+
+        gbs = self.global_batch
+        global_batches: list[list[int]] = []
+        for vol_idx in range(self.n_vols):
+            pool = [vol_idx + k * self.n_vols for k in range(self.n_crops_per_vol)]
+            if self.shuffle:
+                pool = [pool[i] for i in torch.randperm(len(pool), generator=g).tolist()]
+            # Drop the remainder: a partial global batch would leave ranks with
+            # unequal step counts and hang the gradient all-reduce.
+            global_batches += [pool[s:s + gbs]
+                               for s in range(0, len(pool) - gbs + 1, gbs)]
+
+        if self.shuffle and global_batches:
+            order = torch.randperm(len(global_batches), generator=g).tolist()
+            global_batches = [global_batches[i] for i in order]
+
+        lo = self.rank * self.batch_size
+        return [gb[lo:lo + self.batch_size] for gb in global_batches]
+
+    def __iter__(self):
+        yield from self._batches()
+
+    def __len__(self) -> int:
+        if self.n_vols == 0:
+            return 0
+        return self.n_vols * (self.n_crops_per_vol // self.global_batch)
 
 
 # ---------------------------------------------------------------------------
@@ -314,16 +445,24 @@ def _make_patch_loader(
     shuffle: bool,
     cfg: EIPatchDataConfig,
     sampler=None,
+    batch_sampler=None,
 ) -> DataLoader:
     kwargs: dict = dict(
         dataset=dataset,
-        batch_size=int(cfg.batch_size),
-        shuffle=shuffle and len(dataset) > 0 if sampler is None else False,
-        sampler=sampler,
-        drop_last=False,
         num_workers=int(cfg.num_workers),
         pin_memory=bool(cfg.pin_memory),
     )
+    if batch_sampler is not None:
+        # DataLoader rejects batch_size / shuffle / sampler / drop_last alongside
+        # batch_sampler — the batch sampler already decides all four.
+        kwargs["batch_sampler"] = batch_sampler
+    else:
+        kwargs.update(
+            batch_size=int(cfg.batch_size),
+            shuffle=shuffle and len(dataset) > 0 if sampler is None else False,
+            sampler=sampler,
+            drop_last=False,
+        )
     if cfg.num_workers > 0:
         kwargs["persistent_workers"] = bool(cfg.persistent_workers)
         kwargs["prefetch_factor"]    = int(cfg.prefetch_factor)
@@ -361,6 +500,30 @@ def build_ei_patch_dataloaders(cfg: EIPatchDataConfig, rank: int = 0, world_size
         f"train_vols={len(train_evn)}  val_vols={len(val_evn)}  "
         f"train_patches={len(train_ds)}  val_patches={len(val_ds)}"
     )
+
+    if not cfg.mix_volumes:
+        # icecream convention: one volume per optimizer step, with its own wedge.
+        train_sampler = SingleVolumeBatchSampler(
+            n_vols=len(train_evn), n_crops_per_vol=int(cfg.n_crops_per_vol),
+            batch_size=int(cfg.batch_size), shuffle=True, seed=int(cfg.seed),
+            rank=rank, world_size=world_size,
+        )
+        # Val is not sharded across ranks today — every rank evaluates all of it.
+        val_sampler = SingleVolumeBatchSampler(
+            n_vols=len(val_evn), n_crops_per_vol=int(cfg.n_crops_per_vol),
+            batch_size=int(cfg.batch_size), shuffle=False, seed=int(cfg.seed),
+        )
+        if rank == 0:
+            print(f"[ei-patch] mix_volumes=False (icecream): one volume per step, "
+                  f"global batch={world_size * int(cfg.batch_size)}, "
+                  f"{len(train_sampler)} train step(s)/epoch")
+        return EIDataBundle(
+            train_loader=_make_patch_loader(train_ds, shuffle=True, cfg=cfg,
+                                            batch_sampler=train_sampler),
+            val_loader  =_make_patch_loader(val_ds, shuffle=False, cfg=cfg,
+                                            batch_sampler=val_sampler),
+            train_sampler=train_sampler,
+        )
 
     train_sampler = None
     if world_size > 1:

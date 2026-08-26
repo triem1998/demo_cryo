@@ -84,6 +84,9 @@ class RunEIPatchConfig(RunEIBaseConfig):
     crop_size: int = 72
     n_crops_per_vol: int = 10
     batch_size: int = 4
+    # False = icecream: one volume per optimizer step, using its exact wedge.
+    # True = a batch may mix volumes and shares the intersected wedge.
+    mix_volumes: bool = True
     num_workers: int = 1
     prefetch_factor: int = 1
     normalize: bool = True
@@ -389,6 +392,7 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
         crop_size=int(cfg.crop_size),
         n_crops_per_vol=int(cfg.n_crops_per_vol),
         batch_size=int(cfg.batch_size),
+        mix_volumes=bool(cfg.mix_volumes),
         num_workers=int(cfg.num_workers),
         pin_memory=bool(cfg.pin_memory),
         prefetch_factor=int(cfg.prefetch_factor),
