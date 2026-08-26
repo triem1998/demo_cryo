@@ -47,9 +47,9 @@ patch:
   mix_volumes: false
   n_crops_per_vol: 8        # virtual crops per volume per epoch
   batch_size: 4
-  num_workers: 1
+  num_workers: 4
   pin_memory: true
-  prefetch_factor: 1
+  prefetch_factor: 2
   persistent_workers: true
   normalize: true            # whole-volume zero-mean, unit-std (matches icecream's load_volume normalization)
   normalize_crops: true    # also re-normalise each crop (icecream's normalize_crops)
