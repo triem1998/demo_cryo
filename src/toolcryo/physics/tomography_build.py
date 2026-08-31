@@ -277,21 +277,17 @@ def build_one_tomography_em(
     if ang_matches:
         angles = np.loadtxt(str(ang_matches[0]))
     else:
-        # Some tomograms ship only the full-series tlt. Re-derive the half-set
-        # angles exactly as icecream's split_tilt_series cut the mrc: drop the
-        # first tilt when the count is odd, then interleave (split1 -> even
-        # indices, split2 -> odd).
+        # Some tomograms ship only the full-series tlt. The half-sets split each
+        # tilt's frames (dose), not the tilt list, so both keep every angle —
+        # the full series file is the right angle list for either split.
         full = [p for p in sorted(tomo_dir.glob("angles_*.tlt"))
                 if not p.stem.endswith(("_split1", "_split2"))]
         if not full:
             raise FileNotFoundError(
                 f"build_unrolled_physics: no angles_*_{split}.tlt in {tomo_dir}")
         angles = np.loadtxt(str(full[0]))
-        if len(angles) % 2 == 1:
-            angles = angles[1:]
-        angles = angles[(0 if split == "split1" else 1)::2]
-        print(f"[physics] {tomo_dir.name}: no angles_*_{split}.tlt, derived "
-              f"{len(angles)} angles from {full[0].name}")
+        print(f"[physics] {tomo_dir.name}: no angles_*_{split}.tlt, using the "
+              f"{len(angles)} angles of {full[0].name}")
 
     if num_operators is not None:
         # The tilt count is the hard ceiling: more shards than angles would build
