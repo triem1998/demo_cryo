@@ -55,8 +55,24 @@ class RunEIBaseConfig(BaseModel):
     wedge_low_support: float = 0.0
     ref_wedge_support: float = 1.0
 
-    # ── EI loss ─────────────────────────────────────────────────────────────
+    # ── loss ─────────────────────────────────────────────────────────────
     eq_weight: float = 2.0
+    # Obs scale calibration c, applied to a = A(x_net). Pin it: it changes
+    # ObsLoss's minimiser.
+    #   none                = c = 1
+    #   znorm               = z-norm both sides, in-graph (not a scalar c)
+    #   leastsq_xnet        = <a,y>/<a,a>, refit every step
+    #   leastsq_xnet_frozen = the same, computed once per tomogram and held
+    obs_gain: Literal["none", "znorm",
+                      "leastsq_xnet", "leastsq_xnet_frozen"] = "none"
+    # Weight the Obs residual by |k| along the detector axis (unit mean square,
+    # so a white residual keeps its scale). Shifts the Obs/Eq balance, and
+    # tomo_ei configs disable grad clipping — re-tune eq_weight.
+    obs_ramp: bool = True
+    # tomo_ei EqLoss coupling. True = one shared rotation, each half's target is
+    # the OTHER half's rotated reconstruction. False = a rotation per half, each
+    # its own target.
+    eq_cross_coupled: bool = True
 
     # ── Training ────────────────────────────────────────────────────────────
     learning_rate: float = 1e-4
@@ -103,6 +119,14 @@ class RunEIBaseConfig(BaseModel):
     fsc_threshold: float = 0.143
     pixel_size_angstrom: float | None = None
     save_fsc_curves: bool = True   # write the full per-shell FSC curve, not just the resolution
+    # Reference volume for the val PSNR, globbed inside each tomo_* dir and
+    # tried in order: a ground truth if the dataset ships one, else icecream.
+    # The file actually picked is printed at startup and named in the
+    # psnr_ref column, since PSNR against different references is not
+    # comparable. null (or an empty list) = no PSNR at all.
+    psnr_ref_globs: list[str] | None = ["vol*[Gg]round*[Tt]ruth*.mrc",
+                                        "vol*_[Gg][Tt].mrc",
+                                        "vol*[Ii]cecream*.mrc"]
 
     # ── Pretrained init ──────────────────────────────────────────────────────
     pretrained_ckpt: str | None = None

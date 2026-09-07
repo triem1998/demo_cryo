@@ -22,6 +22,10 @@ import numpy as np
 import pandas as pd
 
 
+#: Written by EIFullTrainer against psnr_ref_globs — panel 3, not panel 2.
+REF_PSNR = ("psnr_1pass", "psnr_2pass")
+
+
 def plot_metrics(run_dir: Path, save: Path | str | None = None) -> None:
     """Load CSVs from *run_dir*/metrics/ and save (or show) a summary figure."""
     metrics_dir = Path(run_dir) / "metrics"
@@ -44,8 +48,8 @@ def plot_metrics(run_dir: Path, save: Path | str | None = None) -> None:
         and "fsc" not in c.lower()
         and not train_df.empty
     ]
-    # Layout: [losses (total + components) | PSNR]
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    # Layout: [losses (total + components) | FSC or supervised PSNR | ref PSNR]
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
     fig.suptitle("Training summary", fontsize=13)
 
     # ── Train losses (total + components) in log scale ──────────────────────
@@ -70,8 +74,11 @@ def plot_metrics(run_dir: Path, save: Path | str | None = None) -> None:
     # ── Val metric: FSC (equivariant) or PSNR (supervised) ─────────────────
     ax = axes[1]
     fsc_col_val  = next((c for c in val_df.columns  if "fsc"  in c.lower()), None)
-    psnr_col_val = next((c for c in val_df.columns  if "psnr" in c.lower()), None)
-    psnr_col_trn = next((c for c in train_df.columns if "psnr" in c.lower()), None)
+    # REF_PSNR belongs to panel 3; panel 2's PSNR is the supervised-training one.
+    psnr_col_val = next((c for c in val_df.columns
+                         if "psnr" in c.lower() and c not in REF_PSNR), None)
+    psnr_col_trn = next((c for c in train_df.columns
+                         if "psnr" in c.lower() and c not in REF_PSNR), None)
 
     if not val_df.empty and fsc_col_val:
         # ── Equivariant: FSC resolution in Å ──
@@ -111,6 +118,35 @@ def plot_metrics(run_dir: Path, save: Path | str | None = None) -> None:
 
     ax.set_xlabel("Epoch")
     ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # ── PSNR against the reference volume, + the amplitude ratio ────────────
+    ax = axes[2]
+    have = [c for c in REF_PSNR if c in val_df.columns] if not val_df.empty else []
+    if have:
+        for col, style, color in (("psnr_1pass", "o-", "darkorange"),
+                                  ("psnr_2pass", "s-", "seagreen")):
+            if col in have:
+                ax.plot(val_df["epoch"], val_df[col], style, color=color, label=col)
+        ax.set_ylabel("PSNR (dB)  ↑ better")
+        ref = next((r for r in val_df.get("psnr_ref", []) if isinstance(r, str) and r), "")
+        ax.set_title(f"Val PSNR vs {ref or 'reference'}", fontsize=10)
+        if "std_ratio" in val_df.columns:
+            # PSNR z-normalises, so it cannot see the output amplitude drifting.
+            ax2 = ax.twinx()
+            ax2.plot(val_df["epoch"], val_df["std_ratio"], ":", color="crimson",
+                     linewidth=1.5, label="std_ratio")
+            ax2.axhline(1.0, color="crimson", alpha=0.25, linewidth=1)
+            ax2.set_ylabel("std(recon)/std(ref)", color="crimson")
+            ax2.tick_params(axis="y", labelcolor="crimson")
+            ax2.legend(loc="lower right", fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "No reference PSNR", ha="center", va="center",
+                transform=ax.transAxes, color="gray")
+        ax.set_title("Val PSNR vs reference")
+    ax.set_xlabel("Epoch")
+    if have:
+        ax.legend(loc="lower left", fontsize=8)
     ax.grid(True, alpha=0.3)
 
     fig.tight_layout()

@@ -58,7 +58,7 @@ patch:
     - [628, 312, 256]
     - [576, 572, 256]
 
-equivariant:
+loss:
   tilt_max: 60.0
   tilt_min: -60.0
   use_spherical_support: true

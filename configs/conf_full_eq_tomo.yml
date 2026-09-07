@@ -14,7 +14,7 @@ general:
   preset: tomo_ei   # "missingwedge_ei" | "unrolled" | "tomo_ei" 
 
 training:
-  num_epochs: 50
+  num_epochs: 10
   learning_rate: 1.0e-4
   grad_clip: 10000.0
   # ReduceLROnPlateau on the training TotalLoss. false = off (default,
@@ -23,7 +23,7 @@ training:
   lr_scheduler_factor: 0.5
   lr_scheduler_patience: 10
   ckp_interval: 50
-  eval_interval: 5
+  eval_interval: 1
   crop_size: 512   # random training crop side for missingwedge_ei ; eval always sees the whole volume
   normalize_crops: false   # also re-normalise each crop (missingwedge_ei)
   # Accumulate gradients over this many full volumes before each optimiser step.
@@ -81,12 +81,29 @@ distributed:
   # AMD-ROCm capable). torch matches astra's adjoint; torch_exact is the true
   # transpose (a real PGD gradient, ~4x slower at native resolution).
   tomography_backend: auto
+loss:
+  # tomo_ei builds the cross half-set ObsLoss (losses_unrolled.py) plus the
+  # true-physics EqLoss (losses_equivariant_tomo.py); it reads all four keys.
+  #
+  # Obs scale calibration c, applied to a = A(x_net). Pin it: it changes
+  # ObsLoss's minimiser.
+  #   none                = c = 1
+  #   znorm               = z-norm both sides, in-graph (not a scalar c)
+  #   leastsq_xnet        = <a,y>/<a,a>, refit every step
+  #   leastsq_xnet_frozen = the same, computed once per tomogram and held
+  obs_gain: none
+  # Weight the Obs residual by |k| along the detector axis (unit mean square,
+  # so a white residual keeps its scale). Shifts the Obs/Eq balance.
+  obs_ramp: true
 
-# Equivariance loss weight — shared by missingwedge_ei's Fourier EqLoss and
-# tomo_ei's true-physics EqLoss (losses_equivariant_wedge.py / losses_equivariant_tomo.py).
-
-equivariant:
+  # EqLoss weight. At 0 the term is skipped entirely, not zero-weighted --
+  # each Eq term costs a full A + fbp + denoiser pass per half.
   eq_weight: 2
+  # true  = cross-coupled: one shared rotation, each half's target is the OTHER
+  #         half's rotated reconstruction (icecream).
+  # false = previous self-coupled form: own rotation per half, itself as target.
+  eq_cross_coupled: true
+
 
 # missingwedge_ei preset only — ignored by unrolled/tomo_ei (both read real
 # angles from each tomogram's own .tlt files instead)
@@ -112,7 +129,7 @@ slurm:
   ntasks_per_node: 4
   cpus_per_task: 24
   time: "02:00:00"
-  account: # your account here
+  account:  # your account here
   constraint: "h100"
   qos: "qos_gpu_h100-dev"
   stderr_to_stdout: true
@@ -122,4 +139,3 @@ slurm:
     - "module load pytorch-gpu/py3/2.7.0"
     - "export NCCL_DEBUG=INFO"
     - "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
-

@@ -72,16 +72,9 @@ distributed:
   # operator per rank, no collective (default); "auto" = one per rank; int = that
   # many. Capped at the tilt-angle count, so "auto" on 64 ranks builds 41.
   num_operators: null
-
-# Equivariance loss weight — shared by missingwedge_ei's Fourier EqLoss and
-# tomo_ei's true-physics EqLoss. Not read by unrolled (no Eq term, v1 scope).
-# For tomo_ei: Eq is skipped entirely (not zero-weighted) when this is 0 —
-# it roughly doubles astra's GPU memory/compute vs Obs-only.
-equivariant:
+loss:
   eq_weight: 2
 
-# missingwedge_ei preset only — ignored by unrolled/tomo_ei (both read real
-# angles from each tomogram's own .tlt files instead)
 missingwedge_ei:
   tilt_max: 60.0
   tilt_min: -60.0

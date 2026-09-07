@@ -74,6 +74,20 @@ FSC_CSV_COLUMNS = [
 ]
 
 
+def psnr(recon: np.ndarray, ref: np.ndarray) -> float:
+    """PSNR of two volumes, each z-normalised first so neither's scale counts.
+
+    ``data_range`` is the normalised reference's own span. Both operands must
+    already be in the same axis order and shape.
+    """
+    if recon.shape != ref.shape:
+        raise ValueError(f"psnr shape mismatch: {recon.shape} vs {ref.shape}")
+    zn = lambda a: (a - a.mean()) / (a.std() + 1e-8)   # noqa: E731
+    a, b = zn(recon.astype(np.float32)), zn(ref.astype(np.float32))
+    mse = float(((a - b) ** 2).mean())
+    return float(10.0 * np.log10((b.max() - b.min()) ** 2 / max(mse, 1e-12)))
+
+
 def append_fsc_row(path: Path | str, curve=None, curve_1pass=None, **fields) -> None:
     """Append one per-volume FSC record, padded to FSC_CSV_COLUMNS.
 

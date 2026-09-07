@@ -21,7 +21,7 @@ from .forward import ei_denoiser_forward
 from .utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
 from .utils.utils import (
     GpuFSC, PerfProbe, append_fsc_row, append_metrics_row, denoise_patches, fsc_resolution, half_set_recon,
-    recon_panels, to_canonical_np,
+    load_mrc_volume, psnr, recon_panels, to_canonical_np,
 )
 
 
@@ -67,6 +67,9 @@ class BaseTrainer(dinv.Trainer):
         self._val_vol_idx: int = 0
         self._val_fsc_epoch = None
         self._fsc_tomo_names: list[str] = []
+        self._psnr_refs: list = []          # one Path (or None) per FSC volume
+        self._psnr_cache: dict = {}         # vol_idx -> loaded reference array
+        self._val_psnr: list = []           # per-volume (psnr_1, psnr_2, std_ratio)
         # figure tracking
         self._train_slice_epoch = None
         self._train_vol_idx: int = 0
@@ -250,19 +253,24 @@ class BaseTrainer(dinv.Trainer):
             self._val_probe.__enter__()
             self._val_batch_count = 0
 
-            if self._ckpt_dir is not None and step % self.ckp_interval == 0:
+            # step is the epoch just finished, 0-based, so step+1 are done. The
+            # file is named for that; "epoch" stays 0-based because resume does
+            # epoch_start = ckpt["epoch"] + 1.
+            done = step + 1
+            if self._ckpt_dir is not None and done % self.ckp_interval == 0:
                 self._ckpt_dir.mkdir(parents=True, exist_ok=True)
                 raw_model = self.model.module if isinstance(
                     self.model, nn.parallel.DistributedDataParallel) else self.model
                 state = {
                     "epoch": step,
+                    "epochs_completed": done,
                     "model_state_dict": getattr(raw_model, "processor", raw_model).state_dict(),
                     "optimizer": self.optimizer.state_dict() if self.optimizer else None,
                     "scheduler": (self._plateau_scheduler.state_dict()
                                   if self._plateau_scheduler is not None else None),
                 }
-                torch.save(state, self._ckpt_dir / f"ckp_{step:04d}.pth")
-                print(f"[ckpt] saved ckp_{step:04d}.pth", flush=True)
+                torch.save(state, self._ckpt_dir / f"ckp_{done:04d}.pth")
+                print(f"[ckpt] saved ckp_{done:04d}.pth", flush=True)
         else:
             if self._val_probe is not None and step % self._log_every_n_epochs == 0:
                 self._val_probe.__exit__(None, None, None)
@@ -322,11 +330,39 @@ class BaseTrainer(dinv.Trainer):
 class EIFullTrainer(BaseTrainer):
     """Full-volume trainer. Val: FSC(f(EVN), f(ODD)) + figures."""
 
+    def _psnr_ref(self, vol_idx: int, shape):
+        """Reference volume for ``vol_idx``, canonical order, loaded once.
+
+        Resampled to ``shape`` when the run sets ``target_shape``, then
+        z-normalised. A shape that still disagrees means the axis order does, so
+        ``psnr`` raises rather than scoring a transposed volume. Rank 0 only.
+        """
+        if vol_idx in self._psnr_cache:
+            return self._psnr_cache[vol_idx]
+        path = self._psnr_refs[vol_idx] if vol_idx < len(self._psnr_refs) else None
+        ref = None
+        if path is not None:
+            ref = load_mrc_volume(path, order="native")     # (Y, X, Z) = canonical
+            if ref.shape != tuple(shape):
+                t = torch.from_numpy(ref)[None, None]
+                ref = torch.nn.functional.interpolate(
+                    t, size=tuple(shape), mode="trilinear", align_corners=False
+                ).squeeze().numpy()
+            # z-normalised like every other volume, so std_ratio is std(recon)
+            # against a unit-variance reference and 1.0 is the neutral value.
+            # dtype=float32: a float16 accumulator overflows to inf here.
+            mu = float(np.mean(ref, dtype=np.float32))
+            sd = float(np.std(ref, dtype=np.float32))
+            ref = ((ref - mu) / (sd + 1e-8)).astype(np.float16)
+        self._psnr_cache[vol_idx] = ref
+        return ref
+
     def compute_loss(self, physics, x, y, train=True, epoch=None, step=False):  # type: ignore[override]
         if not train:
             if epoch != self._val_fsc_epoch:
                 self._val_fsc_epoch = epoch
                 self._val_resolutions = []
+                self._val_psnr = []
                 self._val_vol_idx = 0
 
             vol_idx = self._val_vol_idx
@@ -360,6 +396,24 @@ class EIFullTrainer(BaseTrainer):
 
             name = (self._fsc_tomo_names[vol_idx] if vol_idx < len(self._fsc_tomo_names)
                     else f"vol{vol_idx:02d}")
+
+            recon_2 = 0.5 * (r_evn + r_odd)
+            recon_1 = 0.5 * (f_evn_t + f_odd_t) if has_round_trip else None
+            can = lambda t: to_canonical_np(t.squeeze().float().cpu().numpy(), physics)  # noqa: E731
+
+            # Rank 0 only: the epoch row it feeds is rank-0 only too, and no
+            # collective runs here, so other ranks skip the read and the reference.
+            if self._is_rank0:
+                can_2 = can(recon_2)
+                ref = self._psnr_ref(vol_idx, can_2.shape)
+                if ref is not None:
+                    # dtype: the cached ref is fp16 and its default accumulator
+                    # overflows to inf on a real volume.
+                    self._val_psnr.append((
+                        psnr(can(recon_1), ref) if recon_1 is not None else None,
+                        psnr(can_2, ref),
+                        float(recon_2.std()) / (float(np.std(ref, dtype=np.float32)) + 1e-12),
+                    ))
             if self._is_rank0:
                 _p = getattr(physics, "physics_evn", physics)   # TomographyEMPair holds the operator
                 print(f"[physics] {name}  tilt=[{_p._tilt_min:.1f}, {_p._tilt_max:.1f}]°", flush=True)
@@ -375,7 +429,7 @@ class EIFullTrainer(BaseTrainer):
                                **({"fsc_shell_1pass": int(k_1),
                                    "fsc_res_1pass_angstrom": float(res_1)} if has_round_trip else {}))
 
-            recon_t = 0.5 * (r_evn + r_odd)
+            recon_t = recon_2
             if self._images_dir is not None:
                 save_fsc_figure(self._images_dir, epoch, f"{name}.png",
                                 fsc_curve, k, res, f"Epoch {epoch} | {name}",
@@ -385,7 +439,6 @@ class EIFullTrainer(BaseTrainer):
                 pa, pb, pl = recon_panels(x, y, physics)
                 cols, labels = [pa, pb], list(pl)
                 if has_round_trip:
-                    recon_1 = 0.5 * (f_evn_t + f_odd_t)
                     cols.append(_znorm_np(to_canonical_np(recon_1.squeeze().cpu().numpy(), physics)))
                     labels.append(f"1 pass  f(.)\n{res_1:.1f} Å")
                 cols.append(_znorm_np(to_canonical_np(recon_t.squeeze().cpu().numpy(), physics)))
@@ -445,6 +498,20 @@ class EIFullTrainer(BaseTrainer):
             if self.verbose:
                 print(f"[fsc-eval] epoch={step}  mean={mean_res:.1f} Å  median={median_res:.1f} Å  "
                       f"Q1={q1_res:.1f} Å  Q3={q3_res:.1f} Å  (lower=better)", flush=True)
+
+        if not train and self._val_psnr:
+            # Mean over volumes, as above. psnr_ref names the file the numbers
+            # are against; PSNR to a ground truth and to icecream do not compare.
+            p1 = [v[0] for v in self._val_psnr if v[0] is not None]
+            logs.update(psnr_2pass=float(np.mean([v[1] for v in self._val_psnr])),
+                        std_ratio=float(np.mean([v[2] for v in self._val_psnr])),
+                        psnr_ref=(self._psnr_refs[0].name if self._psnr_refs
+                                  and self._psnr_refs[0] else ""))
+            if p1:
+                logs.update(psnr_1pass=float(np.mean(p1)))
+            if self.verbose:
+                print(f"[psnr] epoch={step}  2-pass={logs['psnr_2pass']:.2f} dB  "
+                      f"std_ratio={logs['std_ratio']:.3f}  (higher=better)", flush=True)
         super().log_metrics_mlops(logs, step, train=train)
 
 

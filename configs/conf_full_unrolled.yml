@@ -74,6 +74,21 @@ distributed:
   # AMD-ROCm capable). torch matches astra's adjoint; torch_exact is the true
   # transpose (a real PGD gradient, ~4x slower at native resolution).
   tomography_backend: auto
+loss:
+  # unrolled trains on the cross half-set ObsLoss alone (losses_unrolled.py) --
+  # there is no equivariance term, so eq_weight and eq_cross_coupled are ignored.
+  #
+  # Obs scale calibration c, applied to a = A(x_net). Pin it: it changes
+  # ObsLoss's minimiser.
+  #   none                = c = 1
+  #   znorm               = z-norm both sides, in-graph (not a scalar c)
+  #   leastsq_xnet        = <a,y>/<a,a>, refit every step
+  #   leastsq_xnet_frozen = the same, computed once per tomogram and held
+  obs_gain: none
+  # Weight the Obs residual by |k| along the detector axis (unit mean square,
+  # so a white residual keeps its scale). Shifts the Obs/Eq balance.
+  obs_ramp: true
+
 
 # missingwedge_ei preset only — ignored by unrolled (it reads real angles
 # from each tomogram's own .tlt files instead)

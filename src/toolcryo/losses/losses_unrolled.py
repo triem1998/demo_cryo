@@ -1,26 +1,41 @@
-"""losses_unrolled.py — self-supervised data-fidelity loss for the unrolled preset.
+"""Cross half-set data-fidelity loss (unrolled + tomo_ei).
 
-Cross half-set consistency in the measurement (sinogram) domain, mirroring
-losses_equivariant_wedge.py's ObsLoss structure but using the real TomographyEM operators
-(each half-set's own operator, since split1/split2 use different interleaved
-tilt angles) instead of a synthetic Fourier wedge mask:
+    L = MSE(c_odd * physics_odd.A(f(x)), y) + MSE(c_evn * physics_evn.A(f(y)), x)
 
-    L = MSE(physics_odd.A(f(x)), y) + MSE(physics_evn.A(f(y)), x)
+``x``/``y`` are the EVN/ODD sinograms, ``f(x)``/``f(y)`` the reconstructions from
+each; every half is re-projected through its own operator, at native resolution.
+``obs_gain`` sets the calibration of ``a = A(x_net)`` against its target, and
+is refitted on every call except where noted::
 
-where x/y are the EVN/ODD real sinograms and f(x)/f(y) are the unrolled
-model's reconstructions from each. No equivariance term (v1 scope) and no
-cropping — everything operates at native resolution.
+    none                  c = 1.
+    znorm                 both operands z-normalised, residual zn(a) - zn(y);
+                          the only mode kept in the graph, and the only one that
+                          also rescales the target.
+    leastsq_xnet          c = <a, y> / <a, a>, under no_grad.
+    leastsq_xnet_frozen   same, computed once per tomogram and cached on
+                          ``physics.init_*``.
 
-Also reused as-is by ``tomo_ei`` (build_tomo_ei_losses) — same cross
-half-set data-fidelity structure applies whether the reconstruction comes
-from PGD-unfolding or a plain denoiser. ``tomo_ei``'s equivariance term
-lives separately in ``losses_equivariant_tomo.py``.
+``obs_ramp`` multiplies the residual by ``sqrt(|k|)`` along the detector axis
+before it is squared, so the squared residual carries the full ramp ``|k|``.
+``|k|`` is ``rfftfreq(n)`` for ``n`` the detector length, normalised to unit
+mean square.
 """
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 from deepinv.loss import Loss
+
+
+def _ramp_half(t: torch.Tensor) -> torch.Tensor:
+    """Multiply by ``sqrt(|k|)`` along the detector axis; the caller squares.
+
+    ``w`` is normalised to unit mean square, so a white residual keeps its scale.
+    ``w(0) = 0``, so DC is dropped. Transformed in fp32 and cast back.
+    """
+    n = t.shape[-1]
+    w = torch.fft.rfftfreq(n, device=t.device, dtype=torch.float32).abs().sqrt()
+    w = w / w.pow(2).mean().sqrt().clamp_min(1e-12)
+    return torch.fft.irfft(torch.fft.rfft(t.float(), dim=-1) * w, n=n, dim=-1).to(t.dtype)
 
 
 def _as_sinogram(pred) -> torch.Tensor:
@@ -37,15 +52,47 @@ def _as_sinogram(pred) -> torch.Tensor:
 
 
 class ObsLoss(Loss):
-    """Cross half-set data-fidelity loss in the measurement domain.
+    """Cross half-set data-fidelity loss.
 
     :param float weight: loss weight (default 1.0).
+    :param str gain: scale calibration, one of :attr:`GAINS` — see :meth:`_gains`.
+    :param bool ramp: weight the residual by ``|k|`` across the detector axis,
+        see :func:`_ramp_half`.
     """
 
-    def __init__(self, weight: float = 1.0) -> None:
+    #: Accepted ``obs_gain`` values.
+    GAINS = ("none", "znorm", "leastsq_xnet", "leastsq_xnet_frozen")
+
+    def __init__(self, weight: float = 1.0, gain: str = "none",
+                 ramp: bool = False) -> None:
         super().__init__()
+        if gain not in self.GAINS:
+            raise ValueError(f"obs_gain must be one of {self.GAINS}, got {gain!r}.")
         self.weight = weight
-        self._criteria = nn.MSELoss(reduction="mean")
+        self.gain = gain
+        self.ramp = ramp
+        self._gain_cache = None     # (init_evn, init_odd, c_odd, c_evn)
+
+    def _gains(self, physics, x, y, a_odd_net, a_evn_net):
+        """Least-squares ``c`` per half, fitted to ``a = A(x_net)``.
+
+        ``leastsq_xnet_frozen`` computes it once and caches it on the ``init_*``
+        tensors, which ``TomographyEMPair.update()`` rebinds per tomogram;
+        ``leastsq_xnet`` refits on every call. Taken under ``no_grad``, so ``c``
+        is a constant of the step and carries no gradient.
+        """
+        if self.gain == "none":
+            return 1.0, 1.0
+        c = self._gain_cache
+        if (c is not None and self.gain == "leastsq_xnet_frozen"
+                and c[0] is physics.init_evn and c[1] is physics.init_odd):
+            return c[2], c[3]
+        with torch.no_grad():
+            c_odd = (a_odd_net * y).sum() / ((a_odd_net * a_odd_net).sum() + 1e-8)
+            c_evn = (a_evn_net * x).sum() / ((a_evn_net * a_evn_net).sum() + 1e-8)
+        if self.gain == "leastsq_xnet_frozen":
+            self._gain_cache = (physics.init_evn, physics.init_odd, c_odd, c_evn)
+        return c_odd, c_evn
 
     def forward(
         self,
@@ -56,8 +103,18 @@ class ObsLoss(Loss):
         **kwargs,
     ) -> torch.Tensor:
         y_net = kwargs["y_net"]  # reconstruction from y, pre-computed by forward_pass
-        loss = (
-            self._criteria(_as_sinogram(physics.physics_odd.A(x_net)), y)
-            + self._criteria(_as_sinogram(physics.physics_evn.A(y_net)), x)
-        )
-        return self.weight * loss
+        pe, po = physics.physics_evn, physics.physics_odd
+        # Projected first so the gains reuse these rather than re-running A.
+        a_odd = _as_sinogram(po.A(x_net))
+        a_evn = _as_sinogram(pe.A(y_net))
+        if self.gain == "znorm":
+            # In-graph: c is not the least-squares optimum here, so detaching
+            # would change the gradient.
+            zn = lambda t: (t - t.mean()) / (t.std() + 1e-8)   # noqa: E731
+            r_odd, r_evn = zn(a_odd) - zn(y), zn(a_evn) - zn(x)
+        else:
+            c_odd, c_evn = self._gains(physics, x, y, a_odd, a_evn)
+            r_odd, r_evn = c_odd * a_odd - y, c_evn * a_evn - x
+        if self.ramp:
+            r_odd, r_evn = _ramp_half(r_odd), _ramp_half(r_evn)
+        return self.weight * ((r_odd ** 2).mean() + (r_evn ** 2).mean())

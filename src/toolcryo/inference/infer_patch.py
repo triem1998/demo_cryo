@@ -92,13 +92,18 @@ def patch_inference(
     device: torch.device,
     pre_pad: bool = True,
     amp_dtype: torch.dtype | None = None,
+    return_1pass: bool = False,
 ) -> np.ndarray:
     """Sliding-window f(A(f(.))) inference — mirrors icecream's inference_util.inference exactly.
 
     :param vol: (D, H, W) CPU float32 tensor (globally normalised).
     :param wedge: wedge_input mask (mask_size³) on CPU.
-    :param amp_dtype: autocast dtype, or ``None`` for pure fp32. 
-    :returns: (D, H, W) float32 numpy array.
+    :param amp_dtype: autocast dtype, or ``None`` for pure fp32.
+    :param return_1pass: also return the ``f(.)`` result from before the round
+        trip, as ``(two_pass, one_pass)``. Default ``False`` keeps the
+        single-array return. Costs one extra accumulator, no extra model passes.
+    :returns: (D, H, W) float32 array, or a ``(two_pass, one_pass)`` tuple when
+        ``return_1pass``.
     """
     pre_pad_size = crop_size // 4
 
@@ -128,6 +133,8 @@ def patch_inference(
     mask = torch.zeros_like(vol_est)
     window = _initialize_window(crop_size).cpu()
 
+    vol_est_1 = torch.zeros_like(vol_est) if return_1pass else None
+
     positions = [
         (i, j, k)
         for i in range(0, N1, stride)
@@ -148,6 +155,7 @@ def patch_inference(
                                 dtype=amp_dtype or torch.float16, enabled=use_amp):
                 output = model(batch[:, None])[:, 0]        # f(crop)
             output = output.float()
+            out1_cpu = output.detach().cpu() if return_1pass else None
             output = _apply_wedge_batch(output, wedge_dev)  # A(f(crop))
             with torch.autocast(device_type=device.type,
                                 dtype=amp_dtype or torch.float16, enabled=use_amp):
@@ -156,12 +164,24 @@ def patch_inference(
             for b, (i, j, k) in enumerate(batch_positions):
                 vol_est[i:i + crop_size, j:j + crop_size, k:k + crop_size] += out_cpu[b] * window
                 mask[  i:i + crop_size, j:j + crop_size, k:k + crop_size] += window
+                if return_1pass:
+                    vol_est_1[i:i + crop_size, j:j + crop_size, k:k + crop_size] += out1_cpu[b] * window
 
     del vol_fbp_pad, wedge_dev
     torch.cuda.empty_cache()
 
     mask[mask == 0] = 1
     vol_est = vol_est / mask
+
+    # Same normalise / crop / unpad as the 2-pass result, so the two align.
+    vol_est_1_np = None
+    if return_1pass:
+        vol_est_1 = (vol_est_1 / mask)[:N1_pad, :N2_pad, :N3_pad]
+        vol_est_1_np = vol_est_1.numpy().copy()
+        del vol_est_1
+        if pre_pad:
+            vol_est_1_np = vol_est_1_np[pre_pad_size:, pre_pad_size:, pre_pad_size:]
+
     del mask
     vol_est = vol_est[:N1_pad, :N2_pad, :N3_pad]
     vol_est_np = vol_est.numpy().copy()
@@ -170,7 +190,7 @@ def patch_inference(
     if pre_pad:
         vol_est_np = vol_est_np[pre_pad_size:, pre_pad_size:, pre_pad_size:]
 
-    return vol_est_np
+    return (vol_est_np, vol_est_1_np) if return_1pass else vol_est_np
 
 
 # ---------------------------------------------------------------------------
@@ -254,12 +274,18 @@ def _infer_one_volume(
         crop_size=int(cfg.crop_size), stride=stride,
         infer_batch_size=int(cfg.infer_batch_size),
         device=device, pre_pad=bool(cfg.pre_pad),
+        return_1pass=bool(cfg.save_recon_mrc),
         amp_dtype=amp_dtype_from_str(cfg.mixed_precision),
     )
     print("  running inference on EVN ...", flush=True)
     recon_evn = patch_inference(evn_vol, **infer_kw)
     print("  running inference on ODD ...", flush=True)
     recon_odd = patch_inference(odd_vol, **infer_kw)
+
+    recon_evn_1 = recon_odd_1 = None
+    if cfg.save_recon_mrc:                      # patch_inference returned tuples
+        recon_evn, recon_evn_1 = recon_evn
+        recon_odd, recon_odd_1 = recon_odd
 
     recon_np = 0.5 * (recon_evn + recon_odd)
 
@@ -319,6 +345,11 @@ def _infer_one_volume(
         mrc_path = images_dir / f"{tomo_name}_recon.mrc"
         _save_mrc(mrc_path, recon_np)
         print(f"  saved {mrc_path.name}", flush=True)
+
+        # The 1-pass f(.), matching what infer_full writes for the full path.
+        p1 = images_dir / f"{tomo_name}_recon_1pass.mrc"
+        _save_mrc(p1, 0.5 * (recon_evn_1 + recon_odd_1))
+        print(f"  saved {p1.name}", flush=True)
 
     return {
         "vol_idx": vol_idx, "tomo": tomo_name,

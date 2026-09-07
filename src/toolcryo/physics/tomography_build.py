@@ -227,10 +227,14 @@ def load_fbp_init(
 ) -> torch.Tensor:
     """Load a precomputed FBP volume as the PGD iteration's ``x_init``.
 
-    Physics rather than dataset code on purpose: this is set up once alongside
-    the operator, not fetched per batch, and the z-normalisation below is what
-    puts ``A(x)`` on the same scale as the z-normalised sinogram. The generic
-    "read an MRC and reorient it" step is shared — ``utils.utils.load_mrc_volume``.
+    Physics rather than dataset code on purpose: set up once alongside the
+    operator, not fetched per batch. Reading and reorienting the MRC is shared —
+    ``utils.utils.load_mrc_volume``.
+
+    The z-normalisation below does **not** put ``A(x)`` on the sinogram's scale:
+    this volume, the sinogram and ``A`` are normalised independently and nothing
+    composes them (measured ``std(A(init)) ~ 0.13`` against ``std(y) ~ 0.92``).
+    ``ObsLoss._gains`` supplies the missing constant.
     """
     # (Y, Z, X), no crop — the reorder is a real copy done once here rather than
     # as a permute inside A()/A_adjoint(); see the TomographyEM docstring.

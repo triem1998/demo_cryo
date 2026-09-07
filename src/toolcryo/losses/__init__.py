@@ -25,7 +25,8 @@ def build_ei_losses(cfg: RunEIBaseConfig, physics, transform) -> list:
 
 def build_tomography_losses(cfg: RunEIBaseConfig, physics=None, transform=None) -> list:
     """Obs-only cross-half-set consistency loss (no equivariance term)."""
-    return [UnrolledObsLoss(weight=1.0)]
+    return [UnrolledObsLoss(weight=1.0, gain=str(cfg.obs_gain),
+                            ramp=bool(cfg.obs_ramp))]
 
 
 def build_tomo_ei_losses(cfg: RunEIBaseConfig, physics=None, transform=None) -> list:
@@ -35,7 +36,9 @@ def build_tomo_ei_losses(cfg: RunEIBaseConfig, physics=None, transform=None) -> 
     Eq term costs a full A + fbp + denoiser pass per half, unlike the cheap
     FFT-based EqLoss in build_ei_losses.
     """
-    losses = [UnrolledObsLoss(weight=1.0)]
+    losses = [UnrolledObsLoss(weight=1.0, gain=str(cfg.obs_gain),
+                              ramp=bool(cfg.obs_ramp))]
     if float(cfg.eq_weight) > 0.0:
-        losses.append(TomoEqLoss(transform, weight=float(cfg.eq_weight)))
+        losses.append(TomoEqLoss(transform, weight=float(cfg.eq_weight),
+                                 cross_coupled=bool(cfg.eq_cross_coupled)))
     return losses

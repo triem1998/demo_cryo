@@ -135,6 +135,23 @@ def _build_plateau_scheduler(cfg: RunEIBaseConfig, optimizer):
     )
 
 
+def _find_psnr_ref(tomo_dir, globs, rank: int):
+    """First file in ``tomo_dir`` matching ``globs`` in order, or None.
+
+    The globs are ordered ground-truth-first, so a dataset that ships one is
+    scored against it and everything else falls back to icecream.
+    """
+    for pattern in globs or []:
+        hit = next(iter(sorted(tomo_dir.glob(pattern))), None)
+        if hit is not None:
+            if rank == 0:
+                print(f"[psnr] {tomo_dir.name}: reference {hit.name}", flush=True)
+            return hit
+    if rank == 0 and globs:
+        print(f"[psnr] {tomo_dir.name}: no reference matched {globs} — PSNR off", flush=True)
+    return None
+
+
 def _resume_training_state(cfg, trainer, optimizer, ckpt_path, permute: bool, rank: int) -> None:
     """Restore optimizer + scheduler + global epoch from a same-run checkpoint.
 
@@ -346,6 +363,8 @@ def run_full(cfg: RunEIFullConfig) -> None:
         trainer._post_optimizer_step = lambda: preset["post_optimizer_step"](model)
         trainer._recon_strategy      = preset["recon"]
         trainer._fsc_tomo_names  = [p.parent.name for p in fsc_ds.evn_paths]
+        trainer._psnr_refs = [_find_psnr_ref(p.parent, cfg.psnr_ref_globs, rank)
+                              for p in fsc_ds.evn_paths]
         trainer._fsc_split       = fsc_label
         trainer._save_fsc_curves = bool(cfg.save_fsc_curves)
 

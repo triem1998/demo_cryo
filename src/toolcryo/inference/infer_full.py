@@ -372,6 +372,12 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
                         _save_mrc(recon_mrc_path, recon_np)
                         print(f"  [recon mrc] saved {recon_mrc_path.name}", flush=True)
 
+                        # The 1-pass f(init), before the f(fbp(A(.))) round trip.
+                        p1 = images_dir / f"{tomo_name}_recon_1pass.mrc"
+                        _save_mrc(p1, to_canonical_np(
+                            (0.5 * (f_evn_t + f_odd_t)).squeeze().cpu().numpy(), physics))
+                        print(f"  [recon mrc] saved {p1.name}", flush=True)
+
                 all_rows.append({
                     "checkpoint":       ckpt_name,
                     "vol_idx":          vol_idx,
