@@ -61,6 +61,8 @@ class EIPatchDataConfig:
     val_names: list[str] | None = None     # select val vols by name; None = split
     normalize: bool = True              # whole-volume zero-mean, unit-std (icecream's load_volume)
     normalize_crops: bool = False       # also re-normalise each crop (icecream's normalize_crops)
+    use_mask: bool = True               # sample crops inside the specimen mask
+    mask_frac: float = 0.5              # min fraction of a crop inside the mask
     # Glob patterns — same as CryoEIFullDataset
     evn_glob: str = "vol*split1*.mrc"
     odd_glob: str = "vol*split2*.mrc"
@@ -160,6 +162,20 @@ class _LazyVolList:
 # Dataset
 # ---------------------------------------------------------------------------
 
+@lru_cache(maxsize=2)
+def _vol_mask(evn_path: str, odd_path: str) -> np.ndarray:
+    """IsoNet-style specimen mask of the EVN/ODD average, as icecream builds it.
+
+    Full-size uint8, cached per (pair, process): ~0.5 GB for a 512x1024x1024
+    volume, and several GB transient while it is built.
+    """
+    from ..icecream_orig.utils.mask_util import make_mask
+    _, evn = _open_mrc_mmap(evn_path)
+    _, odd = _open_mrc_mmap(odd_path)
+    avg = (np.asarray(evn, np.float32) + np.asarray(odd, np.float32)) / 2
+    return make_mask(avg, side=5, density_percentage=50., std_percentage=50.)
+
+
 class CryoEIPatchDataset(Dataset):
     """Yields ``(evn_patch, odd_patch, tilt_params)`` random cubic crops.
 
@@ -202,6 +218,8 @@ class CryoEIPatchDataset(Dataset):
         n_crops_per_vol: int = 10,
         normalize: bool = False,
         normalize_crops: bool = False,
+        use_mask: bool = True,
+        mask_frac: float = 0.5,
         tilt_ranges: list[tuple[float, float] | None] | None = None,
         fallback_tilt_min: float = -60.0,
         fallback_tilt_max: float = 60.0,
@@ -213,6 +231,8 @@ class CryoEIPatchDataset(Dataset):
         self.n_crops_per_vol   = n_crops_per_vol
         self.normalize         = normalize
         self.normalize_crops   = normalize_crops
+        self.use_mask          = use_mask
+        self.mask_frac         = mask_frac
         self.fallback_tilt_min = fallback_tilt_min
         self.fallback_tilt_max = fallback_tilt_max
         self._tilt_ranges: list[tuple[float, float] | None] = (
@@ -251,9 +271,16 @@ class CryoEIPatchDataset(Dataset):
 
         D, H, W = evn_vol.shape
         cs = self.crop_size
-        d0 = random.randint(0, max(0, D - cs))
-        h0 = random.randint(0, max(0, H - cs))
-        w0 = random.randint(0, max(0, W - cs))
+        # Retry until the crop is mask_frac inside the specimen; after 100
+        # rejections keep the last draw rather than loop forever.
+        mask = _vol_mask(evn_path, odd_path) if self.use_mask else None
+        for _ in range(100):
+            d0 = random.randint(0, max(0, D - cs))
+            h0 = random.randint(0, max(0, H - cs))
+            w0 = random.randint(0, max(0, W - cs))
+            if mask is None or mask[d0:d0 + cs, h0:h0 + cs,
+                                    w0:w0 + cs].mean() >= self.mask_frac:
+                break
 
         # Slicing the memmap triggers OS page faults for only the ~1–3 MB
         # of data covering this crop; np.ascontiguousarray materialises those
@@ -489,6 +516,8 @@ def build_ei_patch_dataloaders(cfg: EIPatchDataConfig, rank: int = 0, world_size
         n_crops_per_vol=int(cfg.n_crops_per_vol),
         normalize=bool(cfg.normalize),
         normalize_crops=bool(cfg.normalize_crops),
+        use_mask=bool(cfg.use_mask),
+        mask_frac=float(cfg.mask_frac),
         fallback_tilt_min=cfg.fallback_tilt_min,
         fallback_tilt_max=cfg.fallback_tilt_max,
     )

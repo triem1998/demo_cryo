@@ -52,7 +52,9 @@ patch:
   prefetch_factor: 2
   persistent_workers: true
   normalize: true            # whole-volume zero-mean, unit-std (matches icecream's load_volume normalization)
-  normalize_crops: true    # also re-normalise each crop (icecream's normalize_crops)
+  normalize_crops: false   # also re-normalise each crop (icecream's normalize_crops)
+  use_mask: true            # sample crops inside the specimen mask (icecream default)
+  mask_frac: 0.5            # min fraction of a crop inside the mask
   # Crop origins [d, h, w] evaluated on the val set every log interval; saved to runs/.../patch_probe/
   patch_positions:
     - [628, 312, 256]

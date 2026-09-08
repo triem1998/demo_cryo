@@ -91,6 +91,11 @@ class RunEIPatchConfig(RunEIBaseConfig):
     prefetch_factor: int = 1
     normalize: bool = True
     normalize_crops: bool = False
+    # Reject crops less than mask_frac inside the specimen mask (icecream's
+    # crop_volumes_mask). After 100 rejected draws the last one is kept, so a
+    # mask no crop can satisfy cannot hang the loader.
+    use_mask: bool = True
+    mask_frac: float = 0.5
 
     # Crop origins [d, h, w] to evaluate every log interval on the val (fallback
     # train) volumes; empty = no probe. Saved under runs/.../patch_probe/.
@@ -423,6 +428,8 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
         val_names=cfg.val_names,
         normalize=bool(cfg.normalize),
         normalize_crops=bool(cfg.normalize_crops),
+        use_mask=bool(cfg.use_mask),
+        mask_frac=float(cfg.mask_frac),
         fallback_tilt_min=cfg.tilt_min,
         fallback_tilt_max=cfg.tilt_max,
     )
