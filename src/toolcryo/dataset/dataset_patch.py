@@ -102,7 +102,10 @@ def _open_mrc_mmap(path_str: str) -> tuple:
 @lru_cache(maxsize=64)
 def _vol_mean_std(path_str: str) -> tuple[float, float]:
     """Whole-volume mean/std (icecream's ``load_volume`` normalisation),
-    computed once per (path, process) and cached.
+    computed once per volume and cached on disk beside it as two floats.
+    Without the sidecar the stream is repeated once per loader process (8
+    under DDP) and once per run; one process computes, the rest wait on the
+    lock, same discipline as _vol_mask.
 
     Streams the file in blocks rather than calling ``vol.std()``: numpy's std
     materialises a full-size ``arr - mean`` temporary (4.2 GB for one of these
@@ -114,16 +117,36 @@ def _vol_mean_std(path_str: str) -> tuple[float, float]:
     view — mean and variance are order-independent, and the untransposed array
     is contiguous, so the read is sequential.
     """
-    mrc, _ = _open_mrc_mmap(path_str)
-    data = mrc.data
-    n = total = total_sq = 0.0
-    for i in range(0, data.shape[0], 8):          # ~67 MB per block as float64
-        blk = np.asarray(data[i:i + 8], dtype=np.float64)
-        n += blk.size
-        total += blk.sum()
-        total_sq += (blk * blk).sum()
-    mean = total / n
-    return float(mean), float(np.sqrt(max(total_sq / n - mean * mean, 0.0)))
+    cache = Path(path_str).with_suffix(".stats.npy")
+    if not cache.exists():
+        try:
+            lf = open(cache.with_suffix(".lock"), "w")
+            fcntl.flock(lf, fcntl.LOCK_EX)      # one process computes, the rest wait
+        except OSError:
+            lf = None                           # no flock here: everyone computes
+        try:
+            if not cache.exists():              # a waiter re-checks and skips the read
+                mrc, _ = _open_mrc_mmap(path_str)
+                data = mrc.data
+                n = total = total_sq = 0.0
+                for i in range(0, data.shape[0], 8):  # ~67 MB per block as float64
+                    blk = np.asarray(data[i:i + 8], dtype=np.float64)
+                    n += blk.size
+                    total += blk.sum()
+                    total_sq += (blk * blk).sum()
+                mean = total / n
+                std = np.sqrt(max(total_sq / n - mean * mean, 0.0))
+                try:
+                    tmp = cache.with_suffix(f".{os.getpid()}.tmp.npy")
+                    np.save(tmp, np.array([mean, std]))
+                    tmp.replace(cache)
+                except OSError:
+                    return float(mean), float(std)   # read-only dir
+        finally:
+            if lf is not None:
+                lf.close()                      # releases the lock
+    mean, std = np.load(cache)
+    return float(mean), float(std)
 
 
 # ---------------------------------------------------------------------------

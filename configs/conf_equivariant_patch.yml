@@ -46,7 +46,7 @@ patch:
   # false requires n_crops_per_vol >= world_size * batch_size.
   mix_volumes: false
   n_crops_per_vol: 8        # virtual crops per volume per epoch
-  batch_size: 4
+  batch_size: 8
   num_workers: 4
   pin_memory: true
   prefetch_factor: 2
@@ -76,8 +76,8 @@ loss:
 slurm:
   job_name: demo-cryo-ei-patch
   nodes: 1
-  gpus_per_node: 2
-  ntasks_per_node: 2   # one task per GPU 
+  gpus_per_node: 1
+  ntasks_per_node: 1   # one task per GPU 
   cpus_per_task: 20    
   time: "02:00:00"
   account:   # your account here

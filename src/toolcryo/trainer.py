@@ -55,6 +55,7 @@ class BaseTrainer(dinv.Trainer):
         self._train_batch_count: int = 0
         self._val_batch_count: int = 0
         self._block_start_time: float | None = None
+        self._block_start_epoch: int = 0
         # EI forward pass outputs
         self._last_train_xnet = None
         self._last_train_ynet = None
@@ -238,7 +239,10 @@ class BaseTrainer(dinv.Trainer):
             n = max(1, self._train_batch_count)
             t, peak_mb = self._epoch_probe.elapsed_s, self._epoch_probe.peak_mb
             if self._block_start_time is None:
+                # seeded mid-epoch, so this window includes `step` itself; -1
+                # makes the count exact here and after a resume.
                 self._block_start_time = time.perf_counter() - t
+                self._block_start_epoch = step - 1
             if step % self._log_every_n_epochs == 0:
                 block_elapsed = time.perf_counter() - self._block_start_time
                 loss_str = "  ".join(f"{k}={v:.4f}" for k, v in logs.items() if isinstance(v, float))
@@ -248,10 +252,14 @@ class BaseTrainer(dinv.Trainer):
                            f"(reserved {self._epoch_probe.peak_reserved_mb/1024:.2f})/"
                            f"{torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB"
                            if torch.cuda.is_available() else "")
-                n_ep = self._log_every_n_epochs
-                block_str = f"  [{n_ep}ep: {block_elapsed:.1f}s, {block_elapsed/n_ep:.2f}s/ep]" if n_ep > 1 else ""
-                print(f"[train ep={step}]  {loss_str}  total={t:.1f}s  per_img={t/n:.2f}s{gpu_str}{block_str}", flush=True)
+                # actual epochs in the window, not the nominal interval: the
+                # first window is a single epoch (block start is seeded above).
+                n_ep = max(1, step - self._block_start_epoch)
+                block_str = (f"  [{n_ep}ep: {block_elapsed:.1f}s, {block_elapsed/n_ep:.2f}s/ep]"
+                             if self._log_every_n_epochs > 1 else "")
+                print(f"[train ep={step}]  {loss_str}  total={t:.1f}s  per_step={t/n:.2f}s{gpu_str}{block_str}", flush=True)
                 self._block_start_time = time.perf_counter()
+                self._block_start_epoch = step
             self._val_probe = PerfProbe()
             self._val_probe.__enter__()
             self._val_batch_count = 0
