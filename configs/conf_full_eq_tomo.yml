@@ -29,7 +29,7 @@ training:
   # Accumulate gradients over this many full volumes before each optimiser step.
   # Compensates for DataLoader batch_size=1.
   grad_accumulation_steps: 1
-  mixed_precision: "off"   # "off" | "fp16" | "bf16" — bf16: no loss scaling, no overflow at native resolution
+  mixed_precision: "bf16"   # "off" | "fp16" | "bf16" — bf16: no loss scaling, no overflow at native resolution
   model_type: unet         # "unet" | "drunet"
   # torch.compile the denoiser (before the distribute()/DDP wrap). false = off.
   compile: true
@@ -52,7 +52,7 @@ unrolled:
   init_stepsize: 0.9       # demo_tomo default; operators are built with
                             # normalize=True (unit spectral norm), so this is
                             # used directly, no per-tomogram rescaling needed
-  train_algo_params: true  # learn stepsize (+ g_param for drunet) jointly
+  train_algo_params: false  # learn stepsize (+ g_param for drunet) jointly
                             # with the denoiser
   stepsize_learning_rate: null   # null = share `training.learning_rate`
 
@@ -72,6 +72,9 @@ distributed:
   max_batch_size: 1
   # Gradient checkpointing inside the distributed tiled forward pass.
   checkpoint_batches: "auto"
+  # Ranks cooperating on one volume. null = all of them (no data parallelism).
+  # N = N ranks per volume and world/N replicas, each training on its own volume.
+  inner_world_size: null
   # Angle-sharded tomography physics (unrolled / tomo_ei only). null = one full
   # operator per rank, no collective (default); "auto" = one per rank; int = that
   # many. Capped at the tilt-angle count, so "auto" on 64 ranks builds 41.
@@ -82,27 +85,27 @@ distributed:
   # transpose (a real PGD gradient, ~4x slower at native resolution).
   tomography_backend: auto
 loss:
-  # tomo_ei builds the cross half-set ObsLoss (losses_unrolled.py) plus the
-  # true-physics EqLoss (losses_equivariant_tomo.py); it reads all four keys.
-  #
-  # Obs scale calibration c, applied to a = A(x_net). Pin it: it changes
-  # ObsLoss's minimiser.
+  # Rescales a = A(x_net) onto y's scale (they are normalised independently).
   #   none                = c = 1
-  #   znorm               = z-norm both sides, in-graph (not a scalar c)
-  #   leastsq_xnet        = <a,y>/<a,a>, refit every step
-  #   leastsq_xnet_frozen = the same, computed once per tomogram and held
+  #   znorm               = z-norm both sides, in-graph
+  #   leastsq_xnet        = <a,y>/<a,a> refit each step; leaves amplitude
+  #                         free, so the model can shrink
+  #   leastsq_xnet_frozen = fit once per tomogram, then held
   obs_gain: none
-  # Weight the Obs residual by |k| along the detector axis (unit mean square,
-  # so a white residual keeps its scale). Shifts the Obs/Eq balance.
+  # Weight the residual by |k| across the detector, so fine detail counts more
+  # than coarse. Without it blur is cheap. Changes the loss scale.
   obs_ramp: true
 
-  # EqLoss weight. At 0 the term is skipped entirely, not zero-weighted --
-  # each Eq term costs a full A + fbp + denoiser pass per half.
+  # EqLoss weight. 0 skips the term (it costs an extra pass per half).
   eq_weight: 2
-  # true  = cross-coupled: one shared rotation, each half's target is the OTHER
-  #         half's rotated reconstruction (icecream).
-  # false = previous self-coupled form: own rotation per half, itself as target.
-  eq_cross_coupled: true
+  # Noise on Eq's simulated measurement, which is otherwise clean while f is
+  # deployed on noisy data. A multiple of the level measured from the EVN/ODD
+  # difference: 0 = clean, 1 = matched. Changes the loss scale.
+  eq_noise: 0.0
+  # z-norm both MSE operands, so Eq scores shape and ObsLoss owns amplitude —
+  # Eq's target is the model's own output, so its amplitude means nothing.
+  # Changes the loss scale.
+  eq_scale_free: false
 
 
 # missingwedge_ei preset only — ignored by unrolled/tomo_ei (both read real

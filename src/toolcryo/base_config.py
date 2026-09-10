@@ -56,23 +56,27 @@ class RunEIBaseConfig(BaseModel):
     ref_wedge_support: float = 1.0
 
     # ── loss ─────────────────────────────────────────────────────────────
+    # EqLoss weight. 0 skips the term (it costs an extra pass per half).
     eq_weight: float = 2.0
-    # Obs scale calibration c, applied to a = A(x_net). Pin it: it changes
-    # ObsLoss's minimiser.
+    # Rescales a = A(x_net) onto y's scale (they are normalised independently).
     #   none                = c = 1
-    #   znorm               = z-norm both sides, in-graph (not a scalar c)
-    #   leastsq_xnet        = <a,y>/<a,a>, refit every step
-    #   leastsq_xnet_frozen = the same, computed once per tomogram and held
+    #   znorm               = z-norm both sides, in-graph
+    #   leastsq_xnet        = <a,y>/<a,a> refit each step; leaves amplitude
+    #                         free, so the model can shrink
+    #   leastsq_xnet_frozen = fit once per tomogram, then held
     obs_gain: Literal["none", "znorm",
                       "leastsq_xnet", "leastsq_xnet_frozen"] = "none"
-    # Weight the Obs residual by |k| along the detector axis (unit mean square,
-    # so a white residual keeps its scale). Shifts the Obs/Eq balance, and
-    # tomo_ei configs disable grad clipping — re-tune eq_weight.
+    # Weight the residual by |k| across the detector, so fine detail counts more
+    # than coarse. Without it blur is cheap. Changes the loss scale.
     obs_ramp: bool = True
-    # tomo_ei EqLoss coupling. True = one shared rotation, each half's target is
-    # the OTHER half's rotated reconstruction. False = a rotation per half, each
-    # its own target.
-    eq_cross_coupled: bool = True
+    # Noise on Eq's simulated measurement, which is otherwise clean while f is
+    # deployed on noisy data. A multiple of the level measured from the EVN/ODD
+    # difference: 0 = clean, 1 = matched. Changes the loss scale.
+    eq_noise: float = 0.0
+    # z-norm both MSE operands, so Eq scores shape and ObsLoss owns amplitude —
+    # Eq's target is the model's own output, so its amplitude means nothing.
+    # Changes the loss scale.
+    eq_scale_free: bool = False
 
     # ── Training ────────────────────────────────────────────────────────────
     learning_rate: float = 1e-4

@@ -113,9 +113,9 @@ class ShardedTomography(DistributedStackedLinearPhysics):
 
 
 # ---------------------------------------------------------------------------
-# A tomogram's two half-set (EVN/ODD) TomographyEM operators — split1/split2
-# use different interleaved tilt angles, so each half gets its own operator —
-# bundled with their FBP-init volumes. Method-agnostic physics: consumed by the
+# A tomogram's two half-set (EVN/ODD) TomographyEM operators, bundled with
+# their FBP-init volumes. Each half is built from its own .tlt, so differing
+# angle lists are supported. Method-agnostic physics: consumed by the
 # unrolled and tomo_ei presets, reusable by future tomography-domain presets.
 # ---------------------------------------------------------------------------
 

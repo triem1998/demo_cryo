@@ -85,7 +85,7 @@ def build_tomography_physics(
     # first place ctx.world_size is known.
     n_ops = getattr(cfg, "num_operators", None)
     if n_ops == "auto":
-        n_ops = int(ctx.world_size)
+        n_ops = int(ctx.inner_world_size)
     elif n_ops is not None:
         n_ops = int(n_ops)
 
@@ -112,7 +112,7 @@ def build_tomography_physics(
         normalize_sharded(physics_odd, init_odd)
         if ctx.rank == 0:
             capped = f" (capped from {requested} by the tilt count)" if n_ops != requested else ""
-            print(f"[physics] sharded into {n_ops} operator(s) over {ctx.world_size} rank(s)"
+            print(f"[physics] sharded into {n_ops} operator(s) over {ctx.inner_world_size} rank(s)"
                   f"{capped}  ||A^T A||_2={sq_evn:.4g} -> normalised", flush=True)
 
     return TomographyEMPair(

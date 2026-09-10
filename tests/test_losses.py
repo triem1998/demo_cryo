@@ -22,10 +22,19 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
-from toolcryo.losses.losses_equivariant_tomo import EqLoss
-from toolcryo.losses.losses_unrolled import ObsLoss, _ramp_half
-from toolcryo.utils.utils import psnr
+import numpy as np
+from deepinv.distributed import DistributedContext
+from deepinv.utils.tensorlist import TensorList
+
+from main import load_config
+from toolcryo.dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
+from toolcryo.losses import build_tomo_losses
+from toolcryo.losses.losses_equivariant_tomo import EqLoss, ObsLoss, _ramp_half
+from toolcryo.models import build_distributed_denoiser
+from toolcryo.registry import get_preset
+from toolcryo.run import RunEIFullConfig
 from toolcryo.transform import Rotate3D
+from toolcryo.utils.utils import psnr
 
 CONFIG = ROOT / "configs" / "conf_tomo_ei_local.yml"
 MSE = torch.nn.MSELoss()
@@ -87,9 +96,8 @@ def test_none_is_a_true_no_op_and_costs_nothing():
 
 
 def test_frozen_gain_is_held_and_invalidated_on_tomogram_swap():
-    """``A(x_net)`` changes every step, so a frozen ``c`` is only meaningful if
-    it is genuinely held — and only correct if it is dropped when the volume
-    changes, which ``TomographyEMPair.update()`` signals by rebinding ``init_*``."""
+    """A frozen ``c`` must be genuinely held, and dropped when the volume changes
+    (``TomographyEMPair.update()`` rebinds ``init_*``)."""
     physics = _ToyPair()
     x, y, x_net, y_net = _batch()
     crit = ObsLoss(weight=1.0, gain="leastsq_xnet_frozen")
@@ -136,9 +144,8 @@ def test_gain_is_detached_but_the_loss_still_reaches_the_model():
 
 @pytest.mark.parametrize("gain", ["znorm", "leastsq_xnet", "leastsq_xnet_frozen"])
 def test_calibrated_gains_make_the_loss_scale_invariant(gain):
-    """Scale ``x_net`` by ``s`` and ``c`` scales by ``1/s``, so the product is
-    untouched. It breaks the moment ``c`` stops being refitted from ``A(x_net)``
-    — which is what would let the network optimise its own amplitude instead."""
+    """Scale ``x_net`` by ``s`` and ``c`` scales by ``1/s``, leaving the product
+    untouched. Breaks if ``c`` stops being refitted from ``A(x_net)``."""
     physics = _ToyPair()
     x, y, x_net, y_net = _batch()
     base = ObsLoss(weight=1.0, gain=gain)(
@@ -161,9 +168,7 @@ def test_unknown_gain_is_rejected():
 
 def test_ramp_reweights_toward_fine_detail_at_the_same_scale():
     """A high-frequency residual must cost more than an equal-energy coarse one,
-    while a white residual keeps its scale — ``w`` is normalised to unit mean
-    square. Fails if the filter axis is wrong, if the exponent is 1 instead of
-    1/2, or if the weighting is not applied at all."""
+    while a white residual keeps its scale. Catches a wrong axis or exponent."""
     n = 64
     k = torch.arange(n, dtype=torch.float32)
     lo = torch.sin(2 * torch.pi * k / n).expand(1, 1, 1, 1, n)        # 1 cycle
@@ -197,12 +202,9 @@ def _eq_fixtures():
     return x_net, y_net, _ToyPair(), Rotate3D(n_trans=1, volume_shape=x_net.shape[-3:])
 
 
-def test_cross_coupled_shares_one_rotation_and_swaps_the_targets():
-    """Pins the whole formula: one k for both halves, each half re-simulated
-    through its own operator, and the *other* half's reconstruction as target —
-    so the target's noise is independent of the estimate's. The self-coupled
-    form (EVN against EVN) is satisfiable by the model merely becoming
-    predictable on its own output."""
+def test_eq_shares_one_rotation_and_swaps_the_targets():
+    """Pins the formula: one k for both halves, each through its own operator, the
+    *other* half as target — so the target's noise is independent."""
     x_net, y_net, physics, tr = _eq_fixtures()
 
     torch.manual_seed(7)
@@ -217,34 +219,226 @@ def test_cross_coupled_shares_one_rotation_and_swaps_the_targets():
     assert torch.allclose(loss, 2.0 * expected)
 
 
-def test_self_coupled_branch_restores_the_previous_form():
-    """``eq_cross_coupled=False`` must be a *true* revert, not a third variant:
-    each half samples its own rotation (``_term`` calls ``get_params`` per half)
-    and is its own target."""
+class _RecordingUnrolled:
+    """Stands in for the PGD net: ``f(y, physics, init=...)``, recording both."""
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def __call__(self, y, physics, init=None):
+        self.calls.append((y, physics, init))
+        return _model(init)
+
+
+def test_unrolled_hands_f_the_simulated_sinogram_and_an_init_built_from_it():
+    """The unrolled net is measurement-conditioned: it needs ``A(x_rot)`` *and* an
+    init built from that sinogram by ``fbp``, the map the deployed net uses."""
+    x_net, y_net, physics, tr = _eq_fixtures()
+    model = _RecordingUnrolled()
+
+    torch.manual_seed(7)
+    EqLoss(tr, weight=1.0, unrolled=True)(
+        x_net=x_net, y_net=y_net, physics=physics, model=model)
+
+    torch.manual_seed(7)
+    k = tr.get_params(x_net)["k_idx"]
+    rots = [tr.transform(x_net, k_idx=k), tr.transform(y_net, k_idx=k)]
+    halves = [physics.physics_evn, physics.physics_odd]
+
+    assert len(model.calls) == 2
+    for (y_seen, p_seen, init_seen), v_rot, p in zip(model.calls, rots, halves):
+        assert p_seen is p                                  # each half its own operator
+        assert torch.allclose(y_seen, p.A(v_rot))           # the simulated sinogram
+        assert torch.allclose(init_seen, p.fbp(p.A(v_rot)))  # init from that sinogram
+
+
+def test_unrolled_false_is_bit_identical_to_the_denoiser_form():
+    """Regression pin for the merge: the flag defaults off, and off must
+    reproduce the pre-change value exactly, both couplings."""
+    x_net, y_net, physics, tr = _eq_fixtures()
+    kw = dict(x_net=x_net, y_net=y_net, physics=physics, model=_model)
+
+    torch.manual_seed(7)
+    default = EqLoss(tr, weight=1.0)(**kw)
+    torch.manual_seed(7)
+    explicit = EqLoss(tr, weight=1.0, unrolled=False)(**kw)
+    assert torch.equal(default, explicit)
+
+
+# --------------------------------------------------------------------------- #
+# EqLoss — eq_noise
+# --------------------------------------------------------------------------- #
+def test_zero_noise_is_bit_identical_and_never_touches_the_sinograms():
+    """The default must reproduce the clean form exactly, so runs predating
+    ``eq_noise`` stay comparable."""
+    x, y, _, _ = _batch()
     x_net, y_net, physics, tr = _eq_fixtures()
 
     torch.manual_seed(7)
-    loss = EqLoss(tr, weight=1.0, cross_coupled=False)(
-        x_net=x_net, y_net=y_net, physics=physics, model=_model)
+    clean = EqLoss(tr, weight=1.0)(x_net=x_net, y_net=y_net, physics=physics, model=_model)
+    torch.manual_seed(7)
+    zero = EqLoss(tr, weight=1.0, noise=0.0)(
+        x=x, y=y, x_net=x_net, y_net=y_net, physics=physics, model=_model)
+    assert torch.equal(clean, zero)
+
+
+def test_noise_ratio_recovers_a_known_noise_to_signal_ratio():
+    """``x - y`` cancels the signal. The ``var(y) - sigma^2`` correction is what
+    keeps the estimate unbiased."""
+    g = torch.Generator().manual_seed(3)
+    signal = torch.randn((1, 1, 64, 4, 64), generator=g) * 5.0   # per-angle common signal
+    sigma = 2.0
+    x = signal + sigma * torch.randn(signal.shape, generator=g)
+    y = signal + sigma * torch.randn(signal.shape, generator=g)
+
+    _, _, _, tr = _eq_fixtures()
+    ratio = EqLoss(tr)._noise_ratio(x, y)
+
+    assert ratio.shape == (1, 1, 1, 4, 1)          # one value per tilt angle
+    assert torch.allclose(ratio, torch.full_like(ratio, sigma / 5.0), rtol=0.1)
+
+
+def test_noise_scales_with_the_flag_and_is_drawn_independently_per_half():
+    """The multiplier must reach the sinogram, and the halves must not share eps —
+    that independence is what cross-coupling uses."""
+    _, _, physics, tr = _eq_fixtures()
+    x, y, x_net, y_net = _batch()
+    crit = EqLoss(tr, noise=1.0)
+    ratio = crit._noise_ratio(x, y)
+
+    pe = physics.physics_evn
+    clean = pe.A(x_net)
+    torch.manual_seed(0)
+    a = crit._add_noise(clean, ratio)
+    b = crit._add_noise(clean, ratio)
+    assert not torch.allclose(a, b)                       # independent draws
+
+    crit.noise = 2.0
+    torch.manual_seed(0)
+    doubled = crit._add_noise(clean, ratio)
+    torch.manual_seed(0)
+    crit.noise = 1.0
+    single = crit._add_noise(clean, ratio)
+    assert torch.allclose(doubled - clean, 2.0 * (single - clean))
+
+
+def test_sharded_noise_slices_the_ratio_to_match_each_shard():
+    """A misaligned shard slice applies another angle's noise level and is invisible
+    in the loss, so pin it: angles 0-1 get ratio 0, angles 2-4 a large one."""
+    _, _, _, tr = _eq_fixtures()
+    crit = EqLoss(tr, noise=1.0)
+    ratio = torch.tensor([0.0, 0.0, 5.0, 5.0, 5.0]).reshape(1, 1, 1, 5, 1)
+    shards = TensorList([torch.randn(1, 1, 6, 2, 6), torch.randn(1, 1, 6, 3, 6)])
+
+    out = crit._add_noise(shards, ratio)
+
+    assert len(out) == 2
+    assert torch.equal(out[0], shards[0])            # ratio 0 -> untouched
+    assert not torch.allclose(out[1], shards[1])     # ratio 5 -> visibly noised
+
+
+def test_noise_needs_the_sinograms_and_says_so():
+    """The trainer always passes x/y; a direct call may not. Fail loudly rather
+    than silently training with a clean y_sim."""
+    x_net, y_net, physics, tr = _eq_fixtures()
+    with pytest.raises(ValueError, match="x= and y="):
+        EqLoss(tr, noise=1.0)(x_net=x_net, y_net=y_net, physics=physics, model=_model)
+
+
+# --------------------------------------------------------------------------- #
+# EqLoss — eq_scale_free
+# --------------------------------------------------------------------------- #
+def _model_h(v):
+    """Homogeneous stand-in for the real (bias-free) UNet: f(a*v) == a*f(v)."""
+    return v * 3.0
+
+
+def test_scale_free_eq_has_zero_gradient_along_the_output_scale():
+    """Assert the *gradient*: a detached z-norm is value-invariant and still leaks
+    the shrink direction, so a value-only test passes for the broken form."""
+    x_net, y_net, physics, tr = _eq_fixtures()
+    lam = torch.tensor(1.0, requires_grad=True)
 
     torch.manual_seed(7)
-    k1 = tr.get_params(x_net)["k_idx"]       # first draw: the EVN half
-    k2 = tr.get_params(y_net)["k_idx"]       # second draw: the ODD half
-    x_rot, y_rot = tr.transform(x_net, k_idx=k1), tr.transform(y_net, k_idx=k2)
-    pe, po = physics.physics_evn, physics.physics_odd
-    expected = (MSE(_model(pe.fbp(pe.A(x_rot))), x_rot)
-                + MSE(_model(po.fbp(po.A(y_rot))), y_rot))
-    assert torch.allclose(loss, expected)
+    loss = EqLoss(tr, weight=1.0, scale_free=True)(
+        x_net=lam * x_net, y_net=lam * y_net, physics=physics, model=_model_h)
+    grad = torch.autograd.grad(loss, lam)[0]
+    assert grad.abs().item() < 1e-5
+
+
+def test_checkpointed_scale_free_matches_the_uncheckpointed_form():
+    """The checkpoint is a pure memory trade. Assert the GRADIENT: checkpointing
+    re-runs the forward, so impurity in the region shows up only there."""
+    x_net, y_net, physics, tr = _eq_fixtures()
+    xn = x_net.clone().requires_grad_(True)
+    crit = EqLoss(tr, weight=1.0, scale_free=True)
+    kw = dict(y_net=y_net, physics=physics, model=_model_h)
+
+    torch.manual_seed(7)
+    a = crit(x_net=xn, **kw)
+    ga = torch.autograd.grad(a, xn)[0]
+
+    crit._mse = crit._mse_scale_free          # bypass the checkpoint
+    torch.manual_seed(7)
+    b = crit(x_net=xn, **kw)
+    gb = torch.autograd.grad(b, xn)[0]
+
+    assert torch.equal(a, b)
+    assert torch.allclose(ga, gb, atol=1e-6)
+
+
+def test_scale_free_is_off_by_default_and_the_default_still_sees_scale():
+    """The default must be a true no-op, and with it off the amplitude channel is
+    still open."""
+    x_net, y_net, physics, tr = _eq_fixtures()
+    assert EqLoss(tr).scale_free is False
+
+    kw = dict(physics=physics, model=_model_h)
+    torch.manual_seed(7)
+    at_1 = EqLoss(tr, weight=1.0)(x_net=x_net, y_net=y_net, **kw)
+    torch.manual_seed(7)
+    at_01 = EqLoss(tr, weight=1.0)(x_net=0.1 * x_net, y_net=0.1 * y_net, **kw)
+    assert not torch.allclose(at_1, at_01)          # off: shrinking changes it
+
+    torch.manual_seed(7)
+    sf_1 = EqLoss(tr, weight=1.0, scale_free=True)(x_net=x_net, y_net=y_net, **kw)
+    torch.manual_seed(7)
+    sf_01 = EqLoss(tr, weight=1.0, scale_free=True)(
+        x_net=0.1 * x_net, y_net=0.1 * y_net, **kw)
+    assert torch.allclose(sf_1, sf_01, atol=1e-5)   # on: shrinking is invisible
+
+
+# --------------------------------------------------------------------------- #
+# build_tomo_losses
+# --------------------------------------------------------------------------- #
+class _Cfg:
+    obs_gain, obs_ramp = "none", False
+    eq_noise, eq_scale_free = 0.0, False
+
+    def __init__(self, preset, eq_weight):
+        self.preset, self.eq_weight = preset, eq_weight
+
+
+@pytest.mark.parametrize("preset", ["unrolled", "tomo_ei"])
+def test_eq_is_skipped_entirely_at_zero_weight(preset):
+    """Skipped, not zero-weighted — the term costs an extra A+fbp+denoiser per
+    half (tomo_ei) or a whole extra unroll per half (unrolled)."""
+    assert len(build_tomo_losses(_Cfg(preset, 0.0), transform=None)) == 1
+    assert len(build_tomo_losses(_Cfg(preset, 2.0), transform=None)) == 2
+
+
+def test_the_preset_selects_how_eq_calls_the_model():
+    """One builder for both presets; ``cfg.preset`` is the only difference."""
+    assert build_tomo_losses(_Cfg("unrolled", 2.0), transform=None)[1].unrolled is True
+    assert build_tomo_losses(_Cfg("tomo_ei", 2.0), transform=None)[1].unrolled is False
 
 
 # --------------------------------------------------------------------------- #
 # psnr
 # --------------------------------------------------------------------------- #
 def test_psnr_is_scale_free_and_ranks_by_error():
-    """Both operands are z-normalised, so PSNR sees shape and not amplitude —
-    which is why the CSV carries ``std_ratio`` beside it. A shape mismatch is an
-    axis-order error, not something to score."""
-    import numpy as np
+    """Both operands are z-normalised, so PSNR sees shape not amplitude — which is
+    why the CSV carries ``std_ratio`` beside it."""
     g = np.random.default_rng(0)
     ref = g.standard_normal((4, 5, 6)).astype(np.float32)
 
@@ -269,19 +463,7 @@ def _grad_norm(model, term):
 
 def report():
     """Print each term's raw MSE and ``||d term / d theta||`` on a real tomogram.
-
-    Loads ``configs/conf_tomo_ei_local.yml`` and builds the real astra/torch
-    operators and denoiser. The gradient norm is the only column comparable
-    across terms; the MSE column is not.
-    """
-    from deepinv.distributed import DistributedContext
-
-    from main import load_config
-    from toolcryo.run import RunEIFullConfig
-    from toolcryo.dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
-    from toolcryo.models import build_distributed_denoiser
-    from toolcryo.registry import get_preset
-
+    The gradient norm is the only column comparable across terms."""
     cfg = RunEIFullConfig.from_yaml(load_config(str(CONFIG)))
 
     with DistributedContext(seed=int(cfg.seed), seed_offset=False, cleanup=True) as ctx:

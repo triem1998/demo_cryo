@@ -70,6 +70,11 @@ FSC_CSV_COLUMNS = [
     # only, and only for presets whose recon has a real round trip. Blank
     # elsewhere. Lets one CSV track both numbers per (epoch, volume).
     "fsc_shell_1pass", "fsc_res_1pass_angstrom",
+    # PSNR against a ground-truth volume, written by inference when the tomo
+    # directory ships one (see gt_glob). psnr_ref names the file it scored
+    # against — PSNR to a ground truth and PSNR to icecream are not the same
+    # number, so a row without it cannot be read.
+    "psnr_gt", "psnr_1pass_gt", "psnr_ref",
     "fsc_curve", "fsc_curve_1pass",
 ]
 

@@ -6,7 +6,7 @@ or a small standalone glue function (forward.py). Nothing is defined here.
 """
 from .physics import build_missingwedge_physics, build_tomography_physics
 from .models import build_ei_model, build_unrolled_model, clamp_stepsize
-from .losses import build_ei_losses, build_tomography_losses, build_tomo_ei_losses
+from .losses import build_ei_losses, build_tomo_losses
 from .forward import ei_denoiser_forward, tomo_ei_forward, unrolled_forward
 from .utils.utils import half_set_recon, unrolled_recon
 
@@ -25,7 +25,7 @@ PRESETS = {
     "unrolled": {
         "physics": build_tomography_physics,
         "model": build_unrolled_model,
-        "losses": build_tomography_losses,
+        "losses": build_tomo_losses,
         "forward": unrolled_forward,
         "post_optimizer_step": clamp_stepsize,
         "recon": unrolled_recon,
@@ -38,7 +38,7 @@ PRESETS = {
     "tomo_ei": {
         "physics": build_tomography_physics,
         "model": build_ei_model,
-        "losses": build_tomo_ei_losses,
+        "losses": build_tomo_losses,
         "forward": tomo_ei_forward,
         "post_optimizer_step": lambda model: None,
         # Same two-pass round trip as missingwedge_ei — half_set_recon routes

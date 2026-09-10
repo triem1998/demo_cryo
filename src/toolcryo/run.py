@@ -51,6 +51,9 @@ class RunEIFullConfig(RunEIBaseConfig):
     overlap: tuple[int, int, int] = (8, 8, 8)
     max_batch_size: int | None = 1
     checkpoint_batches: str | int | None = "auto"
+    # Ranks cooperating on one volume. null = all of them (no data parallelism).
+    # N = N ranks per volume and world/N replicas, each on its own volume.
+    inner_world_size: int | None = None
 
     # ── Training ────────────────────────────────────────────────────────────
     num_epochs: int = 10
@@ -203,15 +206,20 @@ def _configure_trainer(
     images_subdir: str,
     train_images_subdir: str | None = None,
     train_sampler=None,
+    ctx=None,
 ) -> None:
     trainer._init_trainer_state()
     trainer._is_rank0           = (rank == 0)
+    trainer._ctx                = ctx
     trainer._log_every_n_epochs = int(cfg.eval_interval)
     trainer._train_sampler      = train_sampler
     trainer._metrics_dir        = ensure_dir(output_dir / "metrics")
-    trainer._images_dir         = ensure_dir(output_dir / images_subdir) if rank == 0 else None
+    # Per-volume figures are named after the volume, so one writer per replica
+    # saves its own without collisions. Per-epoch files stay on rank 0.
+    writes_figures = (rank == 0) if ctx is None else ctx.is_inner_main
+    trainer._images_dir         = ensure_dir(output_dir / images_subdir) if writes_figures else None
     if train_images_subdir is not None:
-        trainer._train_images_dir = ensure_dir(output_dir / train_images_subdir) if rank == 0 else None
+        trainer._train_images_dir = ensure_dir(output_dir / train_images_subdir) if writes_figures else None
     trainer._ckpt_dir           = ensure_dir(output_dir / "checkpoints") if rank == 0 else None
     trainer._grad_accum_steps   = max(1, int(cfg.grad_accumulation_steps))
     trainer.ckp_interval        = int(cfg.ckp_interval)
@@ -260,10 +268,11 @@ def run_full(cfg: RunEIFullConfig) -> None:
 
     preset = get_preset(cfg.preset)
 
-    with DistributedContext(seed=int(cfg.seed), seed_offset=False, cleanup=True) as ctx:
+    with DistributedContext(seed=int(cfg.seed), seed_offset=False, cleanup=True,
+                            inner_world_size=cfg.inner_world_size) as ctx:
         rank = int(ctx.rank)
 
-        data_bundle = build_ei_full_dataloaders(data_cfg)
+        data_bundle = build_ei_full_dataloaders(data_cfg, ctx=ctx)
         train_ds = data_bundle.train_loader.dataset
         val_ds   = data_bundle.val_loader.dataset
 
@@ -278,14 +287,14 @@ def run_full(cfg: RunEIFullConfig) -> None:
             physics = preset["physics"](
                 cfg, train_ds.evn_paths + val_ds.evn_paths, train_ds.odd_paths + val_ds.odd_paths, ctx.device, ctx)
 
+            # Both tomo presets can carry EqLoss. Astra's volume isn't a cube,
+            # so Rotate3D must only use shape-preserving rotations.
+            transform = Rotate3D(n_trans=1, volume_shape=physics.physics_evn.volume_shape)
             if is_unrolled:
-                transform = None  # no equivariance term in v1
                 # tiles the denoiser across ranks; physics stays local per rank
                 model, model_info = preset["model"](cfg, physics, ctx)
             else:
-                # tomo_ei: plain denoiser on each half's FBP volume. Astra's
-                # volume isn't a cube, so Rotate3D must only use shape-preserving rotations.
-                transform = Rotate3D(n_trans=1, volume_shape=physics.physics_evn.volume_shape)
+                # tomo_ei: plain denoiser on each half's FBP volume.
                 model, model_info = build_distributed_denoiser(
                     cfg, ctx, rank, ckpt_path, permute_native_to_astra=permute, log_prefix="ei-full")
         else:
@@ -313,16 +322,24 @@ def run_full(cfg: RunEIFullConfig) -> None:
                       f"overlap={cfg.overlap}  max_batch_size={cfg.max_batch_size}  "
                       f"checkpoint_batches={cfg.checkpoint_batches}", flush=True)
 
+        # DDP syncs gradients across replicas; distribute() already syncs within one.
+        # `core` stays unwrapped: DDP hides attributes behind .module. Graph splitting
+        # would reorder the tiling checkpoint's saved tensors (CheckpointError).
+        torch._dynamo.config.optimize_ddp = False
+        core = model
+        model = ctx.distributed_data_parallel(model)
+
         if rank == 0:
-            n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            print(f"[ei-full] model={model_info}  params={n_params:,}", flush=True)
+            n_params = sum(p.numel() for p in core.parameters() if p.requires_grad)
+            print(f"[ei-full] model={model_info}  params={n_params:,}"
+                  f"  inner={ctx.inner_world_size} replicas={ctx.dp_world_size}", flush=True)
 
         losses = preset["losses"](cfg, physics, transform)
         if is_unrolled and cfg.train_algo_params:
             # stepsize gets its own LR (cfg.stepsize_learning_rate, falls back to learning_rate)
-            stepsize_params = list(model.params_algo["stepsize"])
+            stepsize_params = list(core.params_algo["stepsize"])
             stepsize_ids = {id(p) for p in stepsize_params}
-            other_params = [p for p in model.parameters() if id(p) not in stepsize_ids]
+            other_params = [p for p in core.parameters() if id(p) not in stepsize_ids]
             stepsize_lr = (float(cfg.stepsize_learning_rate)
                            if cfg.stepsize_learning_rate is not None else float(cfg.learning_rate))
             optimizer = torch.optim.Adam([
@@ -346,6 +363,11 @@ def run_full(cfg: RunEIFullConfig) -> None:
             fsc_loader = _make_full_loader(fsc_ds, shuffle=False, cfg=data_cfg)
             fsc_label  = "train"
         n_paired_fsc    = sum(1 for p in fsc_ds.odd_paths if p is not None)
+        if ctx.dp_world_size > 1:
+            # Shard eval across replicas too; scores are gathered at epoch end.
+            fsc_loader = _make_full_loader(
+                fsc_ds, shuffle=False, cfg=data_cfg,
+                sampler=ctx.distributed_data_sampler(fsc_ds, shuffle=False))
         eval_dataloader = fsc_loader if n_paired_fsc > 0 else None
 
         trainer = EIFullTrainer(
@@ -361,11 +383,13 @@ def run_full(cfg: RunEIFullConfig) -> None:
         )
         _configure_trainer(trainer, cfg, output_dir, rank,
                            images_subdir=f"{fsc_label}_fsc_images" if fsc_label == "train" else "val_images",
-                           train_images_subdir="train_images")
+                           train_images_subdir="train_images",
+                           train_sampler=data_bundle.train_sampler, ctx=ctx)
+        trainer._fsc_index_offset = int(getattr(fsc_ds, "index_offset", 0))
         trainer._plateau_scheduler = _build_plateau_scheduler(cfg, optimizer)
         _resume_training_state(cfg, trainer, optimizer, ckpt_path, permute, rank)
         trainer._forward_strategy = preset["forward"]
-        trainer._post_optimizer_step = lambda: preset["post_optimizer_step"](model)
+        trainer._post_optimizer_step = lambda: preset["post_optimizer_step"](core)
         trainer._recon_strategy      = preset["recon"]
         trainer._fsc_tomo_names  = [p.parent.name for p in fsc_ds.evn_paths]
         trainer._psnr_refs = [_find_psnr_ref(p.parent, cfg.psnr_ref_globs, rank)
@@ -395,7 +419,7 @@ def run_full(cfg: RunEIFullConfig) -> None:
             ckpt_path = Path(trainer._ckpt_dir) / "ckp_final.pth"
             # .processor exists for a tiled bare denoiser (missingwedge_ei/tomo_ei);
             # unrolled keeps trainer.model as the PGD object itself.
-            raw_model = trainer.model.processor if hasattr(trainer.model, "processor") else trainer.model
+            raw_model = core.processor if hasattr(core, "processor") else core
             torch.save({
                 "epoch": int(cfg.num_epochs) - 1,
                 "model_state_dict": raw_model.state_dict(),

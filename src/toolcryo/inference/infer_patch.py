@@ -34,6 +34,7 @@ from ..utils.utils import (
     dump_config_json,
     ensure_dir,
     load_mrc_volume,
+    psnr,
     seed_everything,
 )
 from ..utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
@@ -63,6 +64,9 @@ class RunEIPatchInferenceConfig(RunEIBaseConfig):
     icecream_glob: str = "vol_*[Ii]cecream*"
     isonet_glob: str = "vol_*[Ii]so[Nn]et*"
     isonet_fallback_glob: str = "vol_*DDW*"
+    # Ground truth, when the dataset ships one (dataset/synthetic). Scored by
+    # PSNR into fsc.csv, not just drawn — the point of a synthetic tomogram.
+    gt_glob: str = "vol_*_[Gg][Tt].mrc"
 
     # ── Output ───────────────────────────────────────────────────────────────
     save_recon_mrc: bool = False
@@ -217,6 +221,22 @@ def _load_comparison(path: Path | None) -> np.ndarray | None:
         return None
 
 
+def _find_gt(tomo_dir: Path, glob: str, shape) -> tuple[np.ndarray | None, str]:
+    """Ground-truth volume resampled to ``shape``, and the file name it came from.
+
+    The resample is not cosmetic: ``psnr`` raises on a shape mismatch, so a
+    downsampled or cropped inference run would lose the score entirely rather
+    than report it against a stretched reference.
+    """
+    path = _find_mrc(tomo_dir, glob)
+    gt = _load_comparison(path)
+    if gt is not None and gt.shape != tuple(shape):
+        gt = nn.functional.interpolate(
+            torch.from_numpy(gt)[None, None], size=tuple(shape),
+            mode="trilinear", align_corners=False).squeeze().numpy()
+    return gt, (path.name if path is not None else "")
+
+
 # ---------------------------------------------------------------------------
 # Per-volume inference  (function scope = automatic memory cleanup on return)
 # ---------------------------------------------------------------------------
@@ -298,6 +318,15 @@ def _infer_one_volume(
     fsc_str = f"FSC@{cfg.fsc_threshold}={res:.1f} Å (shell {k})"
     print(f"  {fsc_str}", flush=True)
 
+    # Loaded before the row is written, not with the other comparison volumes
+    # below, because its PSNR goes into that row.
+    gt_np, gt_name = _find_gt(tomo_dir, cfg.gt_glob, recon_np.shape)
+    psnr_gt = psnr(recon_np, gt_np) if gt_np is not None else ""
+    psnr_1p = (psnr(0.5 * (recon_evn_1 + recon_odd_1), gt_np)
+               if gt_np is not None and recon_evn_1 is not None else "")
+    if gt_np is not None:
+        print(f"  PSNR vs {gt_name} = {psnr_gt:.2f} dB", flush=True)
+
     if metrics_dir is not None:
         append_fsc_row(metrics_dir / "fsc.csv",
                        curve=fsc_curve if cfg.save_fsc_curves else None,
@@ -305,7 +334,8 @@ def _infer_one_volume(
                        checkpoint=checkpoint, vol_idx=vol_idx, tomo=tomo_name,
                        pixel_size=float(px), n_ref=D,
                        fsc_threshold=cfg.fsc_threshold,
-                       fsc_shell=int(k), fsc_res_angstrom=float(res))
+                       fsc_shell=int(k), fsc_res_angstrom=float(res),
+                       psnr_gt=psnr_gt, psnr_1pass_gt=psnr_1p, psnr_ref=gt_name)
 
     evn_np      = evn_vol.numpy()
     odd_np      = odd_vol.numpy()
@@ -324,6 +354,9 @@ def _infer_one_volume(
     if icecream_np is not None:
         cols.append(_znorm(icecream_np))
         labels.append("IceCream")
+    if gt_np is not None:
+        cols.append(_znorm(gt_np))
+        labels.append("GT")
     cols.append(_znorm(recon_np))
     labels.append("ours")
 
@@ -354,6 +387,7 @@ def _infer_one_volume(
     return {
         "vol_idx": vol_idx, "tomo": tomo_name,
         "fsc_shell": int(k), "fsc_res_angstrom": float(res), "pixel_size": float(px),
+        "psnr_gt": psnr_gt, "psnr_1pass_gt": psnr_1p, "psnr_ref": gt_name,
     }
 
 
@@ -380,6 +414,7 @@ def run_post_training_inference(
     ref_wedge_support: float = 1.0,
     fsc_threshold: float = 0.143,
     pixel_size_angstrom: float | None = None,
+    gt_glob: str = "vol_*_[Gg][Tt].mrc",
     save_mrc: bool = False,
     save_fsc_curves: bool = True,
     amp_dtype: torch.dtype | None = None,
@@ -470,13 +505,21 @@ def run_post_training_inference(
             fsc_str = f"FSC@{fsc_threshold}={res_i:.1f} Å (shell {k_i})"
             print(f"  [{tomo_name}] {fsc_str}", flush=True)
 
+            # Before the row is written, since its PSNR goes into that row. No
+            # 1-pass here: this path runs the two-pass recon only.
+            gt_np, gt_name = _find_gt(ds.evn_paths[i].parent, gt_glob, recon.shape)
+            psnr_gt = psnr(recon, gt_np) if gt_np is not None else ""
+            if gt_np is not None:
+                print(f"  [{tomo_name}] PSNR vs {gt_name} = {psnr_gt:.2f} dB", flush=True)
+
             # Volumes are sharded across ranks, so each rank writes its own file.
             append_fsc_row(output_dir / "metrics" / f"fsc_rank{rank}.csv",
                            curve=fsc_curve_i if save_fsc_curves else None,
                            mode="train", regime="patch", split=split_label,
                            vol_idx=i, tomo=tomo_name, pixel_size=px_i, n_ref=D_i,
                            fsc_threshold=fsc_threshold,
-                           fsc_shell=int(k_i), fsc_res_angstrom=float(res_i))
+                           fsc_shell=int(k_i), fsc_res_angstrom=float(res_i),
+                           psnr_gt=psnr_gt, psnr_ref=gt_name)
 
             save_fsc_figure(
                 images_dir, epoch=0,
@@ -517,6 +560,10 @@ def run_post_training_inference(
                 cols.append(_znorm(icecream_np))
                 labels.append("IceCream")
             del icecream_np
+            if gt_np is not None:
+                cols.append(_znorm(gt_np))
+                labels.append("GT")
+            del gt_np
             cols.append(recon_crop)
             labels.append("ours")
 

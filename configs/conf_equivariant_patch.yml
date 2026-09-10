@@ -65,6 +65,7 @@ loss:
   tilt_min: -60.0
   use_spherical_support: true
   wedge_double_size: true
+  # EqLoss weight. 0 skips the term (it costs an extra pass per half).
   eq_weight: 2.0
 
 

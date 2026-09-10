@@ -20,6 +20,8 @@ Differences from the full-volume variant:
 """
 from __future__ import annotations
 
+import fcntl
+import os
 import random
 from dataclasses import dataclass
 from functools import lru_cache
@@ -162,18 +164,52 @@ class _LazyVolList:
 # Dataset
 # ---------------------------------------------------------------------------
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=16)
 def _vol_mask(evn_path: str, odd_path: str) -> np.ndarray:
     """IsoNet-style specimen mask of the EVN/ODD average, as icecream builds it.
 
-    Full-size uint8, cached per (pair, process): ~0.5 GB for a 512x1024x1024
-    volume, and several GB transient while it is built.
+    Stored half-res: make_mask duplicates every value into a 2x2x2 block, so
+    full-res is 8x redundant. Cached on disk beside the volume and memory-mapped
+    -- a rebuild costs ~30s and several GB. Read it through _mask_crop_mean.
     """
-    from ..icecream_orig.utils.mask_util import make_mask
-    _, evn = _open_mrc_mmap(evn_path)
-    _, odd = _open_mrc_mmap(odd_path)
-    avg = (np.asarray(evn, np.float32) + np.asarray(odd, np.float32)) / 2
-    return make_mask(avg, side=5, density_percentage=50., std_percentage=50.)
+    cache = Path(evn_path).with_suffix(".mask.npy")
+    if not cache.exists():
+        try:
+            lf = open(cache.with_suffix(".lock"), "w")
+            fcntl.flock(lf, fcntl.LOCK_EX)      # one process builds, the rest wait
+        except OSError:
+            lf = None                           # no flock here: everyone builds
+        try:
+            if not cache.exists():              # a waiter re-checks and skips the build
+                from ..icecream_orig.utils.mask_util import make_mask
+                _, evn = _open_mrc_mmap(evn_path)
+                _, odd = _open_mrc_mmap(odd_path)
+                avg = (np.asarray(evn, np.float32) + np.asarray(odd, np.float32)) / 2
+                mask = make_mask(avg, side=5, density_percentage=50., std_percentage=50.)
+                mask = mask[::2, ::2, ::2]
+                try:
+                    tmp = cache.with_suffix(f".{os.getpid()}.tmp.npy")
+                    np.save(tmp, mask)
+                    tmp.replace(cache)
+                except OSError:
+                    return mask                 # read-only dir
+        finally:
+            if lf is not None:
+                lf.close()                      # releases the lock
+    return np.load(cache, mmap_mode="r")
+
+
+def _mask_crop_mean(half: np.ndarray, d0: int, h0: int, w0: int, cs: int) -> float:
+    """Full-res mask fraction of a crop, from the half-res store.
+
+    Expands only the covering block, so odd offsets stay exact -- indexing the
+    half-res array directly with //2 drops an edge cell and flips ~0.4% of the
+    accept/reject decisions.
+    """
+    sl = lambda x: slice(x // 2, (x + cs + 1) // 2)   # noqa: E731
+    b = half[sl(d0), sl(h0), sl(w0)]
+    b = np.repeat(np.repeat(np.repeat(b, 2, 0), 2, 1), 2, 2)
+    return b[d0 % 2:d0 % 2 + cs, h0 % 2:h0 % 2 + cs, w0 % 2:w0 % 2 + cs].mean()
 
 
 class CryoEIPatchDataset(Dataset):
@@ -278,8 +314,7 @@ class CryoEIPatchDataset(Dataset):
             d0 = random.randint(0, max(0, D - cs))
             h0 = random.randint(0, max(0, H - cs))
             w0 = random.randint(0, max(0, W - cs))
-            if mask is None or mask[d0:d0 + cs, h0:h0 + cs,
-                                    w0:w0 + cs].mean() >= self.mask_frac:
+            if mask is None or _mask_crop_mean(mask, d0, h0, w0, cs) >= self.mask_frac:
                 break
 
         # Slicing the memmap triggers OS page faults for only the ~1–3 MB
