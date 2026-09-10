@@ -46,23 +46,26 @@ patch:
   # false requires n_crops_per_vol >= world_size * batch_size.
   mix_volumes: false
   n_crops_per_vol: 8        # virtual crops per volume per epoch
-  batch_size: 4
+  batch_size: 8
   num_workers: 4
   pin_memory: true
   prefetch_factor: 2
   persistent_workers: true
   normalize: true            # whole-volume zero-mean, unit-std (matches icecream's load_volume normalization)
-  normalize_crops: true    # also re-normalise each crop (icecream's normalize_crops)
+  normalize_crops: false   # also re-normalise each crop (icecream's normalize_crops)
+  use_mask: true            # sample crops inside the specimen mask (icecream default)
+  mask_frac: 0.5            # min fraction of a crop inside the mask
   # Crop origins [d, h, w] evaluated on the val set every log interval; saved to runs/.../patch_probe/
   patch_positions:
     - [628, 312, 256]
     - [576, 572, 256]
 
-equivariant:
+loss:
   tilt_max: 60.0
   tilt_min: -60.0
   use_spherical_support: true
   wedge_double_size: true
+  # EqLoss weight. 0 skips the term (it costs an extra pass per half).
   eq_weight: 2.0
 
 
@@ -73,8 +76,8 @@ equivariant:
 slurm:
   job_name: demo-cryo-ei-patch
   nodes: 1
-  gpus_per_node: 2
-  ntasks_per_node: 2   # one task per GPU 
+  gpus_per_node: 1
+  ntasks_per_node: 1   # one task per GPU 
   cpus_per_task: 20    
   time: "02:00:00"
   account:   # your account here

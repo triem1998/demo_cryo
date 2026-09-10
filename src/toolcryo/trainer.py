@@ -21,7 +21,7 @@ from .forward import ei_denoiser_forward
 from .utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
 from .utils.utils import (
     GpuFSC, PerfProbe, append_fsc_row, append_metrics_row, denoise_patches, fsc_resolution, half_set_recon,
-    recon_panels, to_canonical_np,
+    load_mrc_volume, psnr, recon_panels, to_canonical_np,
 )
 
 
@@ -55,6 +55,7 @@ class BaseTrainer(dinv.Trainer):
         self._train_batch_count: int = 0
         self._val_batch_count: int = 0
         self._block_start_time: float | None = None
+        self._block_start_epoch: int = 0
         # EI forward pass outputs
         self._last_train_xnet = None
         self._last_train_ynet = None
@@ -64,9 +65,15 @@ class BaseTrainer(dinv.Trainer):
         self._save_fsc_curves: bool = True
         self._val_pixel_sizes: list = []
         self._val_resolutions: list = []
+        self._val_records: list = []       # one per volume, gathered across replicas
+        self._ctx = None                   # DistributedContext, for the val gather
+        self._fsc_index_offset: int = 0    # fsc_ds.index_offset
         self._val_vol_idx: int = 0
         self._val_fsc_epoch = None
         self._fsc_tomo_names: list[str] = []
+        self._psnr_refs: list = []          # one Path (or None) per FSC volume
+        self._psnr_cache: dict = {}         # vol_idx -> loaded reference array
+        self._val_psnr: list = []           # per-volume (psnr_1, psnr_2, std_ratio)
         # figure tracking
         self._train_slice_epoch = None
         self._train_vol_idx: int = 0
@@ -232,7 +239,10 @@ class BaseTrainer(dinv.Trainer):
             n = max(1, self._train_batch_count)
             t, peak_mb = self._epoch_probe.elapsed_s, self._epoch_probe.peak_mb
             if self._block_start_time is None:
+                # seeded mid-epoch, so this window includes `step` itself; -1
+                # makes the count exact here and after a resume.
                 self._block_start_time = time.perf_counter() - t
+                self._block_start_epoch = step - 1
             if step % self._log_every_n_epochs == 0:
                 block_elapsed = time.perf_counter() - self._block_start_time
                 loss_str = "  ".join(f"{k}={v:.4f}" for k, v in logs.items() if isinstance(v, float))
@@ -242,27 +252,36 @@ class BaseTrainer(dinv.Trainer):
                            f"(reserved {self._epoch_probe.peak_reserved_mb/1024:.2f})/"
                            f"{torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB"
                            if torch.cuda.is_available() else "")
-                n_ep = self._log_every_n_epochs
-                block_str = f"  [{n_ep}ep: {block_elapsed:.1f}s, {block_elapsed/n_ep:.2f}s/ep]" if n_ep > 1 else ""
-                print(f"[train ep={step}]  {loss_str}  total={t:.1f}s  per_img={t/n:.2f}s{gpu_str}{block_str}", flush=True)
+                # actual epochs in the window, not the nominal interval: the
+                # first window is a single epoch (block start is seeded above).
+                n_ep = max(1, step - self._block_start_epoch)
+                block_str = (f"  [{n_ep}ep: {block_elapsed:.1f}s, {block_elapsed/n_ep:.2f}s/ep]"
+                             if self._log_every_n_epochs > 1 else "")
+                print(f"[train ep={step}]  {loss_str}  total={t:.1f}s  per_step={t/n:.2f}s{gpu_str}{block_str}", flush=True)
                 self._block_start_time = time.perf_counter()
+                self._block_start_epoch = step
             self._val_probe = PerfProbe()
             self._val_probe.__enter__()
             self._val_batch_count = 0
 
-            if self._ckpt_dir is not None and step % self.ckp_interval == 0:
+            # step is the epoch just finished, 0-based, so step+1 are done. The
+            # file is named for that; "epoch" stays 0-based because resume does
+            # epoch_start = ckpt["epoch"] + 1.
+            done = step + 1
+            if self._ckpt_dir is not None and done % self.ckp_interval == 0:
                 self._ckpt_dir.mkdir(parents=True, exist_ok=True)
                 raw_model = self.model.module if isinstance(
                     self.model, nn.parallel.DistributedDataParallel) else self.model
                 state = {
                     "epoch": step,
+                    "epochs_completed": done,
                     "model_state_dict": getattr(raw_model, "processor", raw_model).state_dict(),
                     "optimizer": self.optimizer.state_dict() if self.optimizer else None,
                     "scheduler": (self._plateau_scheduler.state_dict()
                                   if self._plateau_scheduler is not None else None),
                 }
-                torch.save(state, self._ckpt_dir / f"ckp_{step:04d}.pth")
-                print(f"[ckpt] saved ckp_{step:04d}.pth", flush=True)
+                torch.save(state, self._ckpt_dir / f"ckp_{done:04d}.pth")
+                print(f"[ckpt] saved ckp_{done:04d}.pth", flush=True)
         else:
             if self._val_probe is not None and step % self._log_every_n_epochs == 0:
                 self._val_probe.__exit__(None, None, None)
@@ -291,7 +310,7 @@ class BaseTrainer(dinv.Trainer):
         """``self.model``, wrapped so each call autocasts and returns fp32.
 
         The equivariance losses run a denoiser pass of their own
-        (losses_equivariant_wedge.py:339-340, losses_equivariant_tomo.py:43),
+        (losses_equivariant_wedge.py, losses_equivariant_tomo.py),
         reached by calling ``model(...)`` directly rather than through
         ``model_inference``. Without this they are the only fp32 model passes in
         the step — roughly half of them.
@@ -322,14 +341,76 @@ class BaseTrainer(dinv.Trainer):
 class EIFullTrainer(BaseTrainer):
     """Full-volume trainer. Val: FSC(f(EVN), f(ODD)) + figures."""
 
+    def _psnr_ref(self, vol_idx: int, shape):
+        """Reference volume for ``vol_idx``, canonical order, loaded once.
+
+        Resampled to ``shape`` when the run sets ``target_shape``, then
+        z-normalised. A shape that still disagrees means the axis order does, so
+        ``psnr`` raises rather than scoring a transposed volume. Rank 0 only.
+        """
+        if vol_idx in self._psnr_cache:
+            return self._psnr_cache[vol_idx]
+        path = self._psnr_refs[vol_idx] if vol_idx < len(self._psnr_refs) else None
+        ref = None
+        if path is not None:
+            ref = load_mrc_volume(path, order="native")     # (Y, X, Z) = canonical
+            if ref.shape != tuple(shape):
+                t = torch.from_numpy(ref)[None, None]
+                ref = torch.nn.functional.interpolate(
+                    t, size=tuple(shape), mode="trilinear", align_corners=False
+                ).squeeze().numpy()
+            # z-normalised like every other volume, so std_ratio is std(recon)
+            # against a unit-variance reference and 1.0 is the neutral value.
+            # dtype=float32: a float16 accumulator overflows to inf here.
+            mu = float(np.mean(ref, dtype=np.float32))
+            sd = float(np.std(ref, dtype=np.float32))
+            ref = ((ref - mu) / (sd + 1e-8)).astype(np.float16)
+        self._psnr_cache[vol_idx] = ref
+        return ref
+
+    @property
+    def _is_eval_writer(self) -> bool:
+        """Rank that scores this replica's volumes: inner rank 0 of each.
+
+        These are exactly ``ctx.dp_group``, so a gather over that group is
+        collective across precisely the ranks that enter the branch.
+        """
+        return self._is_rank0 if self._ctx is None else self._ctx.is_inner_main
+
+    def _gather_val_records(self) -> list:
+        """Per-volume records from every replica, deduped by volume.
+
+        DistributedSampler pads an uneven split by repeating volumes, so the
+        same volume can be scored twice; keyed by vol_idx the repeat collapses.
+        """
+        recs = self._val_records
+        ctx = self._ctx
+        if ctx is not None and ctx.use_dist and ctx.dp_world_size > 1:
+            parts = [None] * ctx.dp_world_size
+            ctx.all_gather_object(parts, recs, group=ctx.dp_group)
+            recs = [r for part in parts for r in part]
+        return list({r["vol_idx"]: r for r in recs}.values())
+
+    def _eval_vol_idx(self, physics) -> int:
+        """Position of this volume in the FSC dataset.
+
+        Read from the physics, not from a local counter: with data-parallel
+        replicas each one sees a different subset, so a counter would label
+        every replica's first volume 0.
+        """
+        gid = getattr(physics, "_tomo_idx", None)
+        return self._val_vol_idx if gid is None else int(gid) - self._fsc_index_offset
+
     def compute_loss(self, physics, x, y, train=True, epoch=None, step=False):  # type: ignore[override]
         if not train:
             if epoch != self._val_fsc_epoch:
                 self._val_fsc_epoch = epoch
                 self._val_resolutions = []
+                self._val_psnr = []
+                self._val_records = []
                 self._val_vol_idx = 0
 
-            vol_idx = self._val_vol_idx
+            vol_idx = self._eval_vol_idx(physics)
             px      = self._val_pixel_sizes[vol_idx] if vol_idx < len(self._val_pixel_sizes) else 1.0
 
             with torch.no_grad():
@@ -347,7 +428,6 @@ class EIFullTrainer(BaseTrainer):
             fsc_curve  = self._gpu_fsc(r_evn, r_odd)
             k, res, D  = fsc_resolution(fsc_curve, r_evn.squeeze().shape,
                                         px, self._fsc_threshold)
-            self._val_resolutions.append(res)
 
             # 1-pass f(.) score, before the round trip — guards against the Eq
             # term's collapse mode (2-pass score rising while this one falls).
@@ -360,22 +440,42 @@ class EIFullTrainer(BaseTrainer):
 
             name = (self._fsc_tomo_names[vol_idx] if vol_idx < len(self._fsc_tomo_names)
                     else f"vol{vol_idx:02d}")
+
+            recon_2 = 0.5 * (r_evn + r_odd)
+            recon_1 = 0.5 * (f_evn_t + f_odd_t) if has_round_trip else None
+            can = lambda t: to_canonical_np(t.squeeze().float().cpu().numpy(), physics)  # noqa: E731
+
+            # One rank per replica: its scores are gathered at epoch end, and
+            # the other inner ranks hold the same volume, so they would duplicate it.
+            psnr_rec = None
+            if self._is_eval_writer:
+                can_2 = can(recon_2)
+                ref = self._psnr_ref(vol_idx, can_2.shape)
+                if ref is not None:
+                    # dtype: the cached ref is fp16 and its default accumulator
+                    # overflows to inf on a real volume.
+                    psnr_rec = (
+                        psnr(can(recon_1), ref) if recon_1 is not None else None,
+                        psnr(can_2, ref),
+                        float(recon_2.std()) / (float(np.std(ref, dtype=np.float32)) + 1e-12),
+                    )
             if self._is_rank0:
                 _p = getattr(physics, "physics_evn", physics)   # TomographyEMPair holds the operator
                 print(f"[physics] {name}  tilt=[{_p._tilt_min:.1f}, {_p._tilt_max:.1f}]°", flush=True)
-            if self._is_rank0 and self._metrics_dir is not None:
-                append_fsc_row(self._metrics_dir / "fsc_per_volume.csv",
-                               curve=fsc_curve if self._save_fsc_curves else None,
-                               curve_1pass=fsc_curve_1 if self._save_fsc_curves else None,
-                               mode="train", regime="full", split=self._fsc_split,
-                               epoch=epoch, vol_idx=vol_idx, tomo=name,
-                               pixel_size=px, n_ref=D,
-                               fsc_threshold=self._fsc_threshold,
-                               fsc_shell=int(k), fsc_res_angstrom=float(res),
-                               **({"fsc_shell_1pass": int(k_1),
-                                   "fsc_res_1pass_angstrom": float(res_1)} if has_round_trip else {}))
+            if self._is_eval_writer:
+                self._val_records.append(dict(
+                    vol_idx=vol_idx, res=float(res), psnr=psnr_rec,
+                    row=dict(curve=fsc_curve if self._save_fsc_curves else None,
+                             curve_1pass=fsc_curve_1 if self._save_fsc_curves else None,
+                             mode="train", regime="full", split=self._fsc_split,
+                             epoch=epoch, vol_idx=vol_idx, tomo=name,
+                             pixel_size=px, n_ref=D,
+                             fsc_threshold=self._fsc_threshold,
+                             fsc_shell=int(k), fsc_res_angstrom=float(res),
+                             **({"fsc_shell_1pass": int(k_1),
+                                 "fsc_res_1pass_angstrom": float(res_1)} if has_round_trip else {}))))
 
-            recon_t = 0.5 * (r_evn + r_odd)
+            recon_t = recon_2
             if self._images_dir is not None:
                 save_fsc_figure(self._images_dir, epoch, f"{name}.png",
                                 fsc_curve, k, res, f"Epoch {epoch} | {name}",
@@ -385,7 +485,6 @@ class EIFullTrainer(BaseTrainer):
                 pa, pb, pl = recon_panels(x, y, physics)
                 cols, labels = [pa, pb], list(pl)
                 if has_round_trip:
-                    recon_1 = 0.5 * (f_evn_t + f_odd_t)
                     cols.append(_znorm_np(to_canonical_np(recon_1.squeeze().cpu().numpy(), physics)))
                     labels.append(f"1 pass  f(.)\n{res_1:.1f} Å")
                 cols.append(_znorm_np(to_canonical_np(recon_t.squeeze().cpu().numpy(), physics)))
@@ -407,7 +506,10 @@ class EIFullTrainer(BaseTrainer):
         if epoch != self._train_slice_epoch:
             self._train_slice_epoch = epoch
             self._train_vol_idx = 0
-        vol_idx = self._train_vol_idx
+        # Train volumes are the un-offset ones (train_ds.index_offset == 0), so the
+        # global index is the position directly -- _eval_vol_idx's offset is the FSC set's.
+        gid = getattr(physics, "_tomo_idx", None)
+        vol_idx = self._train_vol_idx if gid is None else int(gid)
         self._train_vol_idx += 1
         if epoch % self.eval_interval != 0:
             return
@@ -428,6 +530,14 @@ class EIFullTrainer(BaseTrainer):
         )
 
     def log_metrics_mlops(self, logs: dict, step: int, train: bool = True) -> None:  # type: ignore[override]
+        if not train:
+            recs = sorted(self._gather_val_records(), key=lambda r: r["vol_idx"])
+            self._val_resolutions = [r["res"] for r in recs]
+            self._val_psnr = [r["psnr"] for r in recs if r["psnr"] is not None]
+            if self._is_rank0 and self._metrics_dir is not None:
+                for r in recs:
+                    append_fsc_row(self._metrics_dir / "fsc_per_volume.csv", **r["row"])
+
         if not train and self._val_resolutions:
             res_arr    = np.array(self._val_resolutions)
             mean_res   = float(np.mean(res_arr))
@@ -436,7 +546,7 @@ class EIFullTrainer(BaseTrainer):
             q3_res     = float(np.percentile(res_arr, 75))
             logs.update(fsc_res_angstrom=mean_res, fsc_res_median=median_res,
                         fsc_res_q1=q1_res, fsc_res_q3=q3_res, fsc_split=self._fsc_split)
-            if self._images_dir is not None:
+            if self._is_rank0 and self._images_dir is not None:
                 save_resolution_histogram(
                     self._images_dir, step, self._val_resolutions,
                     mean_res, median_res, q1_res, q3_res,
@@ -445,6 +555,20 @@ class EIFullTrainer(BaseTrainer):
             if self.verbose:
                 print(f"[fsc-eval] epoch={step}  mean={mean_res:.1f} Å  median={median_res:.1f} Å  "
                       f"Q1={q1_res:.1f} Å  Q3={q3_res:.1f} Å  (lower=better)", flush=True)
+
+        if not train and self._val_psnr:
+            # Mean over volumes, as above. psnr_ref names the file the numbers
+            # are against; PSNR to a ground truth and to icecream do not compare.
+            p1 = [v[0] for v in self._val_psnr if v[0] is not None]
+            logs.update(psnr_2pass=float(np.mean([v[1] for v in self._val_psnr])),
+                        std_ratio=float(np.mean([v[2] for v in self._val_psnr])),
+                        psnr_ref=(self._psnr_refs[0].name if self._psnr_refs
+                                  and self._psnr_refs[0] else ""))
+            if p1:
+                logs.update(psnr_1pass=float(np.mean(p1)))
+            if self.verbose:
+                print(f"[psnr] epoch={step}  2-pass={logs['psnr_2pass']:.2f} dB  "
+                      f"std_ratio={logs['std_ratio']:.3f}  (higher=better)", flush=True)
         super().log_metrics_mlops(logs, step, train=train)
 
 

@@ -49,7 +49,7 @@ _METHODS: dict[str, tuple] = {
 # Required YAML sections per method
 _REQUIRED_SECTIONS: dict[str, list[str]] = {
     "equivariant_full":   ["general", "training", "distributed", "slurm"],
-    "equivariant_patch":  ["general", "training", "patch", "equivariant", "slurm"],
+    "equivariant_patch":  ["general", "training", "patch", ("loss", "equivariant"), "slurm"],
     "ei_inference":       ["general", "distributed", "slurm"],
     "ei_patch_inference": ["general", "slurm"],
 }
@@ -122,10 +122,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _require_section(conf: dict, name: str) -> dict:
-    section = conf.get(name)
-    if not isinstance(section, dict):
-        raise ValueError(f"Missing or invalid '{name}' section in config.")
+def _require_section(conf: dict, name: str | tuple[str, ...]) -> dict:
+    """The named section, or the first present when several names are accepted."""
+    names = (name,) if isinstance(name, str) else name
+    section = next((conf[n] for n in names if isinstance(conf.get(n), dict)), None)
+    if section is None:
+        raise ValueError(
+            f"Missing or invalid {' or '.join(repr(n) for n in names)} section in config.")
     return section
 
 

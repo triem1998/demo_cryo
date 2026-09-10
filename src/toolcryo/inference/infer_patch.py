@@ -34,6 +34,7 @@ from ..utils.utils import (
     dump_config_json,
     ensure_dir,
     load_mrc_volume,
+    psnr,
     seed_everything,
 )
 from ..utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
@@ -63,6 +64,9 @@ class RunEIPatchInferenceConfig(RunEIBaseConfig):
     icecream_glob: str = "vol_*[Ii]cecream*"
     isonet_glob: str = "vol_*[Ii]so[Nn]et*"
     isonet_fallback_glob: str = "vol_*DDW*"
+    # Ground truth, when the dataset ships one (dataset/synthetic). Scored by
+    # PSNR into fsc.csv, not just drawn — the point of a synthetic tomogram.
+    gt_glob: str = "vol_*_[Gg][Tt].mrc"
 
     # ── Output ───────────────────────────────────────────────────────────────
     save_recon_mrc: bool = False
@@ -92,13 +96,18 @@ def patch_inference(
     device: torch.device,
     pre_pad: bool = True,
     amp_dtype: torch.dtype | None = None,
+    return_1pass: bool = False,
 ) -> np.ndarray:
     """Sliding-window f(A(f(.))) inference — mirrors icecream's inference_util.inference exactly.
 
     :param vol: (D, H, W) CPU float32 tensor (globally normalised).
     :param wedge: wedge_input mask (mask_size³) on CPU.
-    :param amp_dtype: autocast dtype, or ``None`` for pure fp32. 
-    :returns: (D, H, W) float32 numpy array.
+    :param amp_dtype: autocast dtype, or ``None`` for pure fp32.
+    :param return_1pass: also return the ``f(.)`` result from before the round
+        trip, as ``(two_pass, one_pass)``. Default ``False`` keeps the
+        single-array return. Costs one extra accumulator, no extra model passes.
+    :returns: (D, H, W) float32 array, or a ``(two_pass, one_pass)`` tuple when
+        ``return_1pass``.
     """
     pre_pad_size = crop_size // 4
 
@@ -128,6 +137,8 @@ def patch_inference(
     mask = torch.zeros_like(vol_est)
     window = _initialize_window(crop_size).cpu()
 
+    vol_est_1 = torch.zeros_like(vol_est) if return_1pass else None
+
     positions = [
         (i, j, k)
         for i in range(0, N1, stride)
@@ -148,6 +159,7 @@ def patch_inference(
                                 dtype=amp_dtype or torch.float16, enabled=use_amp):
                 output = model(batch[:, None])[:, 0]        # f(crop)
             output = output.float()
+            out1_cpu = output.detach().cpu() if return_1pass else None
             output = _apply_wedge_batch(output, wedge_dev)  # A(f(crop))
             with torch.autocast(device_type=device.type,
                                 dtype=amp_dtype or torch.float16, enabled=use_amp):
@@ -156,12 +168,24 @@ def patch_inference(
             for b, (i, j, k) in enumerate(batch_positions):
                 vol_est[i:i + crop_size, j:j + crop_size, k:k + crop_size] += out_cpu[b] * window
                 mask[  i:i + crop_size, j:j + crop_size, k:k + crop_size] += window
+                if return_1pass:
+                    vol_est_1[i:i + crop_size, j:j + crop_size, k:k + crop_size] += out1_cpu[b] * window
 
     del vol_fbp_pad, wedge_dev
     torch.cuda.empty_cache()
 
     mask[mask == 0] = 1
     vol_est = vol_est / mask
+
+    # Same normalise / crop / unpad as the 2-pass result, so the two align.
+    vol_est_1_np = None
+    if return_1pass:
+        vol_est_1 = (vol_est_1 / mask)[:N1_pad, :N2_pad, :N3_pad]
+        vol_est_1_np = vol_est_1.numpy().copy()
+        del vol_est_1
+        if pre_pad:
+            vol_est_1_np = vol_est_1_np[pre_pad_size:, pre_pad_size:, pre_pad_size:]
+
     del mask
     vol_est = vol_est[:N1_pad, :N2_pad, :N3_pad]
     vol_est_np = vol_est.numpy().copy()
@@ -170,7 +194,7 @@ def patch_inference(
     if pre_pad:
         vol_est_np = vol_est_np[pre_pad_size:, pre_pad_size:, pre_pad_size:]
 
-    return vol_est_np
+    return (vol_est_np, vol_est_1_np) if return_1pass else vol_est_np
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +219,22 @@ def _load_comparison(path: Path | None) -> np.ndarray | None:
     except Exception as exc:
         print(f"  WARNING: could not load {path}: {exc}", flush=True)
         return None
+
+
+def _find_gt(tomo_dir: Path, glob: str, shape) -> tuple[np.ndarray | None, str]:
+    """Ground-truth volume resampled to ``shape``, and the file name it came from.
+
+    The resample is not cosmetic: ``psnr`` raises on a shape mismatch, so a
+    downsampled or cropped inference run would lose the score entirely rather
+    than report it against a stretched reference.
+    """
+    path = _find_mrc(tomo_dir, glob)
+    gt = _load_comparison(path)
+    if gt is not None and gt.shape != tuple(shape):
+        gt = nn.functional.interpolate(
+            torch.from_numpy(gt)[None, None], size=tuple(shape),
+            mode="trilinear", align_corners=False).squeeze().numpy()
+    return gt, (path.name if path is not None else "")
 
 
 # ---------------------------------------------------------------------------
@@ -254,12 +294,18 @@ def _infer_one_volume(
         crop_size=int(cfg.crop_size), stride=stride,
         infer_batch_size=int(cfg.infer_batch_size),
         device=device, pre_pad=bool(cfg.pre_pad),
+        return_1pass=bool(cfg.save_recon_mrc),
         amp_dtype=amp_dtype_from_str(cfg.mixed_precision),
     )
     print("  running inference on EVN ...", flush=True)
     recon_evn = patch_inference(evn_vol, **infer_kw)
     print("  running inference on ODD ...", flush=True)
     recon_odd = patch_inference(odd_vol, **infer_kw)
+
+    recon_evn_1 = recon_odd_1 = None
+    if cfg.save_recon_mrc:                      # patch_inference returned tuples
+        recon_evn, recon_evn_1 = recon_evn
+        recon_odd, recon_odd_1 = recon_odd
 
     recon_np = 0.5 * (recon_evn + recon_odd)
 
@@ -272,6 +318,15 @@ def _infer_one_volume(
     fsc_str = f"FSC@{cfg.fsc_threshold}={res:.1f} Å (shell {k})"
     print(f"  {fsc_str}", flush=True)
 
+    # Loaded before the row is written, not with the other comparison volumes
+    # below, because its PSNR goes into that row.
+    gt_np, gt_name = _find_gt(tomo_dir, cfg.gt_glob, recon_np.shape)
+    psnr_gt = psnr(recon_np, gt_np) if gt_np is not None else ""
+    psnr_1p = (psnr(0.5 * (recon_evn_1 + recon_odd_1), gt_np)
+               if gt_np is not None and recon_evn_1 is not None else "")
+    if gt_np is not None:
+        print(f"  PSNR vs {gt_name} = {psnr_gt:.2f} dB", flush=True)
+
     if metrics_dir is not None:
         append_fsc_row(metrics_dir / "fsc.csv",
                        curve=fsc_curve if cfg.save_fsc_curves else None,
@@ -279,7 +334,8 @@ def _infer_one_volume(
                        checkpoint=checkpoint, vol_idx=vol_idx, tomo=tomo_name,
                        pixel_size=float(px), n_ref=D,
                        fsc_threshold=cfg.fsc_threshold,
-                       fsc_shell=int(k), fsc_res_angstrom=float(res))
+                       fsc_shell=int(k), fsc_res_angstrom=float(res),
+                       psnr_gt=psnr_gt, psnr_1pass_gt=psnr_1p, psnr_ref=gt_name)
 
     evn_np      = evn_vol.numpy()
     odd_np      = odd_vol.numpy()
@@ -298,6 +354,9 @@ def _infer_one_volume(
     if icecream_np is not None:
         cols.append(_znorm(icecream_np))
         labels.append("IceCream")
+    if gt_np is not None:
+        cols.append(_znorm(gt_np))
+        labels.append("GT")
     cols.append(_znorm(recon_np))
     labels.append("ours")
 
@@ -320,9 +379,15 @@ def _infer_one_volume(
         _save_mrc(mrc_path, recon_np)
         print(f"  saved {mrc_path.name}", flush=True)
 
+        # The 1-pass f(.), matching what infer_full writes for the full path.
+        p1 = images_dir / f"{tomo_name}_recon_1pass.mrc"
+        _save_mrc(p1, 0.5 * (recon_evn_1 + recon_odd_1))
+        print(f"  saved {p1.name}", flush=True)
+
     return {
         "vol_idx": vol_idx, "tomo": tomo_name,
         "fsc_shell": int(k), "fsc_res_angstrom": float(res), "pixel_size": float(px),
+        "psnr_gt": psnr_gt, "psnr_1pass_gt": psnr_1p, "psnr_ref": gt_name,
     }
 
 
@@ -349,6 +414,7 @@ def run_post_training_inference(
     ref_wedge_support: float = 1.0,
     fsc_threshold: float = 0.143,
     pixel_size_angstrom: float | None = None,
+    gt_glob: str = "vol_*_[Gg][Tt].mrc",
     save_mrc: bool = False,
     save_fsc_curves: bool = True,
     amp_dtype: torch.dtype | None = None,
@@ -439,13 +505,21 @@ def run_post_training_inference(
             fsc_str = f"FSC@{fsc_threshold}={res_i:.1f} Å (shell {k_i})"
             print(f"  [{tomo_name}] {fsc_str}", flush=True)
 
+            # Before the row is written, since its PSNR goes into that row. No
+            # 1-pass here: this path runs the two-pass recon only.
+            gt_np, gt_name = _find_gt(ds.evn_paths[i].parent, gt_glob, recon.shape)
+            psnr_gt = psnr(recon, gt_np) if gt_np is not None else ""
+            if gt_np is not None:
+                print(f"  [{tomo_name}] PSNR vs {gt_name} = {psnr_gt:.2f} dB", flush=True)
+
             # Volumes are sharded across ranks, so each rank writes its own file.
             append_fsc_row(output_dir / "metrics" / f"fsc_rank{rank}.csv",
                            curve=fsc_curve_i if save_fsc_curves else None,
                            mode="train", regime="patch", split=split_label,
                            vol_idx=i, tomo=tomo_name, pixel_size=px_i, n_ref=D_i,
                            fsc_threshold=fsc_threshold,
-                           fsc_shell=int(k_i), fsc_res_angstrom=float(res_i))
+                           fsc_shell=int(k_i), fsc_res_angstrom=float(res_i),
+                           psnr_gt=psnr_gt, psnr_ref=gt_name)
 
             save_fsc_figure(
                 images_dir, epoch=0,
@@ -486,6 +560,10 @@ def run_post_training_inference(
                 cols.append(_znorm(icecream_np))
                 labels.append("IceCream")
             del icecream_np
+            if gt_np is not None:
+                cols.append(_znorm(gt_np))
+                labels.append("GT")
+            del gt_np
             cols.append(recon_crop)
             labels.append("ours")
 

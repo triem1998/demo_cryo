@@ -20,6 +20,8 @@ Differences from the full-volume variant:
 """
 from __future__ import annotations
 
+import fcntl
+import os
 import random
 from dataclasses import dataclass
 from functools import lru_cache
@@ -61,6 +63,8 @@ class EIPatchDataConfig:
     val_names: list[str] | None = None     # select val vols by name; None = split
     normalize: bool = True              # whole-volume zero-mean, unit-std (icecream's load_volume)
     normalize_crops: bool = False       # also re-normalise each crop (icecream's normalize_crops)
+    use_mask: bool = True               # sample crops inside the specimen mask
+    mask_frac: float = 0.5              # min fraction of a crop inside the mask
     # Glob patterns — same as CryoEIFullDataset
     evn_glob: str = "vol*split1*.mrc"
     odd_glob: str = "vol*split2*.mrc"
@@ -98,7 +102,10 @@ def _open_mrc_mmap(path_str: str) -> tuple:
 @lru_cache(maxsize=64)
 def _vol_mean_std(path_str: str) -> tuple[float, float]:
     """Whole-volume mean/std (icecream's ``load_volume`` normalisation),
-    computed once per (path, process) and cached.
+    computed once per volume and cached on disk beside it as two floats.
+    Without the sidecar the stream is repeated once per loader process (8
+    under DDP) and once per run; one process computes, the rest wait on the
+    lock, same discipline as _vol_mask.
 
     Streams the file in blocks rather than calling ``vol.std()``: numpy's std
     materialises a full-size ``arr - mean`` temporary (4.2 GB for one of these
@@ -110,16 +117,36 @@ def _vol_mean_std(path_str: str) -> tuple[float, float]:
     view — mean and variance are order-independent, and the untransposed array
     is contiguous, so the read is sequential.
     """
-    mrc, _ = _open_mrc_mmap(path_str)
-    data = mrc.data
-    n = total = total_sq = 0.0
-    for i in range(0, data.shape[0], 8):          # ~67 MB per block as float64
-        blk = np.asarray(data[i:i + 8], dtype=np.float64)
-        n += blk.size
-        total += blk.sum()
-        total_sq += (blk * blk).sum()
-    mean = total / n
-    return float(mean), float(np.sqrt(max(total_sq / n - mean * mean, 0.0)))
+    cache = Path(path_str).with_suffix(".stats.npy")
+    if not cache.exists():
+        try:
+            lf = open(cache.with_suffix(".lock"), "w")
+            fcntl.flock(lf, fcntl.LOCK_EX)      # one process computes, the rest wait
+        except OSError:
+            lf = None                           # no flock here: everyone computes
+        try:
+            if not cache.exists():              # a waiter re-checks and skips the read
+                mrc, _ = _open_mrc_mmap(path_str)
+                data = mrc.data
+                n = total = total_sq = 0.0
+                for i in range(0, data.shape[0], 8):  # ~67 MB per block as float64
+                    blk = np.asarray(data[i:i + 8], dtype=np.float64)
+                    n += blk.size
+                    total += blk.sum()
+                    total_sq += (blk * blk).sum()
+                mean = total / n
+                std = np.sqrt(max(total_sq / n - mean * mean, 0.0))
+                try:
+                    tmp = cache.with_suffix(f".{os.getpid()}.tmp.npy")
+                    np.save(tmp, np.array([mean, std]))
+                    tmp.replace(cache)
+                except OSError:
+                    return float(mean), float(std)   # read-only dir
+        finally:
+            if lf is not None:
+                lf.close()                      # releases the lock
+    mean, std = np.load(cache)
+    return float(mean), float(std)
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +186,54 @@ class _LazyVolList:
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=16)
+def _vol_mask(evn_path: str, odd_path: str) -> np.ndarray:
+    """IsoNet-style specimen mask of the EVN/ODD average, as icecream builds it.
+
+    Stored half-res: make_mask duplicates every value into a 2x2x2 block, so
+    full-res is 8x redundant. Cached on disk beside the volume and memory-mapped
+    -- a rebuild costs ~30s and several GB. Read it through _mask_crop_mean.
+    """
+    cache = Path(evn_path).with_suffix(".mask.npy")
+    if not cache.exists():
+        try:
+            lf = open(cache.with_suffix(".lock"), "w")
+            fcntl.flock(lf, fcntl.LOCK_EX)      # one process builds, the rest wait
+        except OSError:
+            lf = None                           # no flock here: everyone builds
+        try:
+            if not cache.exists():              # a waiter re-checks and skips the build
+                from ..icecream_orig.utils.mask_util import make_mask
+                _, evn = _open_mrc_mmap(evn_path)
+                _, odd = _open_mrc_mmap(odd_path)
+                avg = (np.asarray(evn, np.float32) + np.asarray(odd, np.float32)) / 2
+                mask = make_mask(avg, side=5, density_percentage=50., std_percentage=50.)
+                mask = mask[::2, ::2, ::2]
+                try:
+                    tmp = cache.with_suffix(f".{os.getpid()}.tmp.npy")
+                    np.save(tmp, mask)
+                    tmp.replace(cache)
+                except OSError:
+                    return mask                 # read-only dir
+        finally:
+            if lf is not None:
+                lf.close()                      # releases the lock
+    return np.load(cache, mmap_mode="r")
+
+
+def _mask_crop_mean(half: np.ndarray, d0: int, h0: int, w0: int, cs: int) -> float:
+    """Full-res mask fraction of a crop, from the half-res store.
+
+    Expands only the covering block, so odd offsets stay exact -- indexing the
+    half-res array directly with //2 drops an edge cell and flips ~0.4% of the
+    accept/reject decisions.
+    """
+    sl = lambda x: slice(x // 2, (x + cs + 1) // 2)   # noqa: E731
+    b = half[sl(d0), sl(h0), sl(w0)]
+    b = np.repeat(np.repeat(np.repeat(b, 2, 0), 2, 1), 2, 2)
+    return b[d0 % 2:d0 % 2 + cs, h0 % 2:h0 % 2 + cs, w0 % 2:w0 % 2 + cs].mean()
+
 
 class CryoEIPatchDataset(Dataset):
     """Yields ``(evn_patch, odd_patch, tilt_params)`` random cubic crops.
@@ -202,6 +277,8 @@ class CryoEIPatchDataset(Dataset):
         n_crops_per_vol: int = 10,
         normalize: bool = False,
         normalize_crops: bool = False,
+        use_mask: bool = True,
+        mask_frac: float = 0.5,
         tilt_ranges: list[tuple[float, float] | None] | None = None,
         fallback_tilt_min: float = -60.0,
         fallback_tilt_max: float = 60.0,
@@ -213,6 +290,8 @@ class CryoEIPatchDataset(Dataset):
         self.n_crops_per_vol   = n_crops_per_vol
         self.normalize         = normalize
         self.normalize_crops   = normalize_crops
+        self.use_mask          = use_mask
+        self.mask_frac         = mask_frac
         self.fallback_tilt_min = fallback_tilt_min
         self.fallback_tilt_max = fallback_tilt_max
         self._tilt_ranges: list[tuple[float, float] | None] = (
@@ -251,9 +330,15 @@ class CryoEIPatchDataset(Dataset):
 
         D, H, W = evn_vol.shape
         cs = self.crop_size
-        d0 = random.randint(0, max(0, D - cs))
-        h0 = random.randint(0, max(0, H - cs))
-        w0 = random.randint(0, max(0, W - cs))
+        # Retry until the crop is mask_frac inside the specimen; after 100
+        # rejections keep the last draw rather than loop forever.
+        mask = _vol_mask(evn_path, odd_path) if self.use_mask else None
+        for _ in range(100):
+            d0 = random.randint(0, max(0, D - cs))
+            h0 = random.randint(0, max(0, H - cs))
+            w0 = random.randint(0, max(0, W - cs))
+            if mask is None or _mask_crop_mean(mask, d0, h0, w0, cs) >= self.mask_frac:
+                break
 
         # Slicing the memmap triggers OS page faults for only the ~1–3 MB
         # of data covering this crop; np.ascontiguousarray materialises those
@@ -489,6 +574,8 @@ def build_ei_patch_dataloaders(cfg: EIPatchDataConfig, rank: int = 0, world_size
         n_crops_per_vol=int(cfg.n_crops_per_vol),
         normalize=bool(cfg.normalize),
         normalize_crops=bool(cfg.normalize_crops),
+        use_mask=bool(cfg.use_mask),
+        mask_frac=float(cfg.mask_frac),
         fallback_tilt_min=cfg.fallback_tilt_min,
         fallback_tilt_max=cfg.fallback_tilt_max,
     )

@@ -23,10 +23,12 @@ Three methods, selected by `general.preset`:
 # 1. Load the PyTorch module (provides torch, numpy, scipy, etc.)
 module load pytorch-gpu/py3/2.7.0
 
-# 2. Install deepinv from PR #1088 (not the PyPI release):
-#   https://github.com/deepinv/deepinv/pull/1088
-git clone https://github.com/deepinv/deepinv.git
-cd deepinv && git fetch origin pull/1088/head:pr-1088 && git checkout pr-1088
+# 2. Install deepinv from the `ddp-feature` fork branch (not the PyPI release):
+#   https://github.com/bmalezieux/deepinv/tree/ddp-feature
+# It adds the 2-D process topology (`inner_world_size`) that lets DDP data
+# parallelism sit on top of deepinv's distributed tiling.
+git clone https://github.com/bmalezieux/deepinv.git
+cd deepinv && git checkout 9d3afce72f1cee2f68820e24a998a2ee60ec6ec5
 pip install --user -e .
 cd ..
 
@@ -71,8 +73,7 @@ src/
       __init__.py            # one physics builder per preset
     losses/
       losses_equivariant_wedge.py  # ObsLoss, EqLoss (missingwedge_ei, icecream-based)
-      losses_equivariant_tomo.py   # EqLoss (tomo_ei, true physics)
-      losses_unrolled.py           # ObsLoss (unrolled / tomo_ei)
+      losses_equivariant_tomo.py   # ObsLoss, EqLoss (unrolled / tomo_ei, true physics)
     dataset/
       dataset_full.py        # full-volume dataset + dataloaders
       dataset_patch.py       # patch dataset + dataloaders
@@ -100,7 +101,7 @@ Similar to IceCream's patch-based training with a few differences:
 
 ### Full-volume training
 
-Uses deepinv's [distributed tiling framework](https://github.com/deepinv/deepinv/pull/1088) (`deepinv.distributed.distribute`) to run the UNet/drunet on a whole tomogram by splitting it into overlapping 3D tiles, processing each tile on a GPU, and stitching results back — no spatial downsampling.
+Uses deepinv's [distributed tiling framework](https://github.com/bmalezieux/deepinv/tree/ddp-feature) (`deepinv.distributed.distribute`) to run the UNet/drunet on a whole tomogram by splitting it into overlapping 3D tiles, processing each tile on a GPU, and stitching results back — no spatial downsampling.
 
 **Current dataset handling**: the raw EMPIAR-11830 volumes are `1024×1024×512` (D×H×W) and are fed to the trainer at native resolution — no cropping by default (`crop_size: null`). `target_shape` trilinearly downsamples volumes *and* the matching tilt series for local smoke tests. The `unrolled`/`tomo_ei` presets read the measured tilt series instead of FBP volumes (`data_source: measurement`), with the FBP volumes used only as the PGD initialisation.
 

@@ -6,7 +6,7 @@ volumes of a seeded shuffle over ``input_dir``).  Note this split is
 re-derived here, not inherited from the training run: to evaluate the exact
 volumes used for training, list them in ``val_names``.  Per checkpoint, per
 volume, saves (under ``inference_images/<checkpoint_name>/``):
-  vol{i}_methods.png  — EVN | ODD | IsoNet | IceCream | ours
+  vol{i}_methods.png  — EVN | ODD | IsoNet | IceCream | GT | ours
   vol{i}_fsc.png      — FSC curve
   vol{i}_recon.mrc    — reconstructed volume  (save_recon_mrc=True, off by default)
   resolution_histogram.png — per-checkpoint FSC summary
@@ -46,6 +46,7 @@ from ..utils.utils import (
     dump_config_json,
     ensure_dir,
     load_mrc_volume,
+    psnr,
     recon_panels,
     to_canonical_np,
     seed_everything,
@@ -108,6 +109,9 @@ class RunEIFullInferenceConfig(RunEIBaseConfig):
     icecream_glob: str = "vol_*[Ii]cecream*"
     isonet_glob: str = "vol_*[Ii]so[Nn]et*"
     isonet_fallback_glob: str = "vol_*DDW*"
+    # Ground truth, when the dataset ships one (dataset/synthetic). Scored by
+    # PSNR into fsc.csv and results.json, not just drawn.
+    gt_glob: str = "vol_*_[Gg][Tt].mrc"
 
     # ── Output options ───────────────────────────────────────────────────────
     save_recon_mrc: bool = False
@@ -314,9 +318,14 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
                 tomo_dir      = val_ds.evn_paths[vol_idx].parent
                 isonet_path   = _find_mrc(tomo_dir, cfg.isonet_glob, cfg.isonet_fallback_glob)
                 icecream_path = _find_mrc(tomo_dir, cfg.icecream_glob)
+                gt_path       = _find_mrc(tomo_dir, cfg.gt_glob)
 
                 isonet_np: np.ndarray | None = None
                 icecream_np: np.ndarray | None = None
+                gt_np: np.ndarray | None = None
+                # Blank on non-zero ranks, which never load the volumes; only
+                # rank 0 writes the row these land in.
+                psnr_gt = psnr_1pass_gt = ""
                 if rank == 0:
                     if isonet_path is not None:
                         try:
@@ -336,15 +345,32 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
                     else:
                         print(f"  [icecream] not found in {tomo_dir}", flush=True)
 
+                    if gt_path is not None:
+                        try:
+                            gt_np = _load_mrc_vol(gt_path, cfg.target_shape)
+                            print(f"  [gt]       {gt_path.name}", flush=True)
+                        except Exception as exc:
+                            print(f"  [gt]       FAILED to load {gt_path}: {exc}", flush=True)
+                    else:
+                        print(f"  [gt]       not found in {tomo_dir}", flush=True)
+
+                    if gt_np is not None:
+                        # psnr z-normalises both operands, so recon_np goes in raw.
+                        psnr_gt = psnr(recon_np, gt_np)
+                        psnr_1pass_gt = psnr(to_canonical_np(
+                            (0.5 * (f_evn_t + f_odd_t)).squeeze().cpu().numpy(), physics), gt_np)
+                        print(f"  [gt]       PSNR 2-pass={psnr_gt:.2f} dB  "
+                              f"1-pass={psnr_1pass_gt:.2f} dB", flush=True)
+
                 if rank == 0:
-                    # ── Figure: methods — EVN | ODD | IsoNet | IceCream | ours ──
+                    # ── Figure: methods — EVN | ODD | IsoNet | IceCream | GT | ours ──
                     # _znorm(recon_np): save_slice_figure shares one vmin/vmax per row
                     # across all columns, and every other column is already z-scored
                     # (recon_panels / _load_mrc_vol). An un-normalised column would be
                     # rendered with the others' range and come out flat grey. Applied
                     # here, not to recon_np itself — that is also written to MRC below.
-                    methods_cols   = [evn_np, odd_np, isonet_np, icecream_np, _znorm(recon_np)]
-                    methods_labels = [*evn_odd_labels, "IsoNet", "IceCream", "ours"]
+                    methods_cols   = [evn_np, odd_np, isonet_np, icecream_np, gt_np, _znorm(recon_np)]
+                    methods_labels = [*evn_odd_labels, "IsoNet", "IceCream", "GT", "ours"]
                     valid_pairs = [(v, lbl) for v, lbl in zip(methods_cols, methods_labels) if v is not None]
                     valid_cols, valid_labels = zip(*valid_pairs) if valid_pairs else ([], [])
                     save_slice_figure(
@@ -372,6 +398,12 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
                         _save_mrc(recon_mrc_path, recon_np)
                         print(f"  [recon mrc] saved {recon_mrc_path.name}", flush=True)
 
+                        # The 1-pass f(init), before the f(fbp(A(.))) round trip.
+                        p1 = images_dir / f"{tomo_name}_recon_1pass.mrc"
+                        _save_mrc(p1, to_canonical_np(
+                            (0.5 * (f_evn_t + f_odd_t)).squeeze().cpu().numpy(), physics))
+                        print(f"  [recon mrc] saved {p1.name}", flush=True)
+
                 all_rows.append({
                     "checkpoint":       ckpt_name,
                     "vol_idx":          vol_idx,
@@ -379,6 +411,9 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
                     "fsc_shell":        int(k),
                     "fsc_res_angstrom": float(res),
                     "pixel_size":       float(px),
+                    "psnr_gt":          psnr_gt,
+                    "psnr_1pass_gt":    psnr_1pass_gt,
+                    "psnr_ref":         gt_path.name if gt_path is not None else "",
                 })
 
                 if rank == 0:
@@ -388,7 +423,9 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
                                    checkpoint=ckpt_name, vol_idx=vol_idx,
                                    tomo=tomo_name, pixel_size=float(px), n_ref=D,
                                    fsc_threshold=cfg.fsc_threshold,
-                                   fsc_shell=int(k), fsc_res_angstrom=float(res))
+                                   fsc_shell=int(k), fsc_res_angstrom=float(res),
+                                   psnr_gt=psnr_gt, psnr_1pass_gt=psnr_1pass_gt,
+                                   psnr_ref=gt_path.name if gt_path is not None else "")
 
             # ── Per-checkpoint summary ─────────────────────────────────────────
             if rank == 0 and resolutions:

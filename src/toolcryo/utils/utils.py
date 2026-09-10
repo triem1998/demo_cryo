@@ -70,8 +70,27 @@ FSC_CSV_COLUMNS = [
     # only, and only for presets whose recon has a real round trip. Blank
     # elsewhere. Lets one CSV track both numbers per (epoch, volume).
     "fsc_shell_1pass", "fsc_res_1pass_angstrom",
+    # PSNR against a ground-truth volume, written by inference when the tomo
+    # directory ships one (see gt_glob). psnr_ref names the file it scored
+    # against — PSNR to a ground truth and PSNR to icecream are not the same
+    # number, so a row without it cannot be read.
+    "psnr_gt", "psnr_1pass_gt", "psnr_ref",
     "fsc_curve", "fsc_curve_1pass",
 ]
+
+
+def psnr(recon: np.ndarray, ref: np.ndarray) -> float:
+    """PSNR of two volumes, each z-normalised first so neither's scale counts.
+
+    ``data_range`` is the normalised reference's own span. Both operands must
+    already be in the same axis order and shape.
+    """
+    if recon.shape != ref.shape:
+        raise ValueError(f"psnr shape mismatch: {recon.shape} vs {ref.shape}")
+    zn = lambda a: (a - a.mean()) / (a.std() + 1e-8)   # noqa: E731
+    a, b = zn(recon.astype(np.float32)), zn(ref.astype(np.float32))
+    mse = float(((a - b) ** 2).mean())
+    return float(10.0 * np.log10((b.max() - b.min()) ** 2 / max(mse, 1e-12)))
 
 
 def append_fsc_row(path: Path | str, curve=None, curve_1pass=None, **fields) -> None:

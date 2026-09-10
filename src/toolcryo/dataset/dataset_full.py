@@ -161,6 +161,7 @@ class CryoEIFullDataset(Dataset):
             "tilt_min": torch.tensor(tilt_min, dtype=torch.float32),
             "tilt_max": torch.tensor(tilt_max, dtype=torch.float32),
             "vol_shape": torch.tensor(evn.shape[-3:], dtype=torch.int64),
+            "tomo_idx": torch.tensor(idx + self.index_offset),
         }
         return evn, odd, tilt_params
 
@@ -273,11 +274,13 @@ def _make_full_loader(
     dataset: Dataset,
     shuffle: bool,
     cfg: EIFullDataConfig,
+    sampler=None,
 ) -> DataLoader:
     kwargs: dict = dict(
         dataset=dataset,
         batch_size=1,
-        shuffle=shuffle and len(dataset) > 0,
+        sampler=sampler,
+        shuffle=shuffle and sampler is None and len(dataset) > 0,
         drop_last=False,
         num_workers=int(cfg.num_workers),
         pin_memory=bool(cfg.pin_memory),
@@ -288,8 +291,12 @@ def _make_full_loader(
     return DataLoader(**kwargs)
 
 
-def build_ei_full_dataloaders(cfg: EIFullDataConfig) -> EIDataBundle:
-    """Build train / val DataLoaders over full cryo-ET volumes."""
+def build_ei_full_dataloaders(cfg: EIFullDataConfig, ctx=None) -> EIDataBundle:
+    """Build train / val DataLoaders over full cryo-ET volumes.
+
+    ``ctx`` with more than one data-parallel replica shards the train volumes
+    across replicas; every rank in a replica still sees the same volume.
+    """
     input_dir = Path(cfg.input_dir)
     all_evn, all_odd, all_tlt = _discover_pairs(
         input_dir, cfg.evn_glob, cfg.odd_glob
@@ -323,7 +330,11 @@ def build_ei_full_dataloaders(cfg: EIFullDataConfig) -> EIDataBundle:
         f"train_vols={len(train_evn)}  val_vols={len(val_evn)}"
     )
 
+    train_sampler = (ctx.distributed_data_sampler(train_ds, shuffle=True)
+                     if ctx is not None and ctx.dp_world_size > 1 else None)
+
     return EIDataBundle(
-        train_loader = _make_full_loader(train_ds, shuffle=True,  cfg=cfg),
+        train_loader = _make_full_loader(train_ds, shuffle=True,  cfg=cfg, sampler=train_sampler),
         val_loader   = _make_full_loader(val_ds,   shuffle=False, cfg=cfg),
+        train_sampler= train_sampler,
     )

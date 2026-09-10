@@ -1,17 +1,16 @@
 """EI loss-list construction from a run config.
 
-Heavy loss classes live in the sibling modules (``losses_equivariant_wedge.py``,
-``losses_unrolled.py``, ``losses_equivariant_tomo.py``); this ``__init__`` is
-the thin construction layer, one builder per preset.
+One sibling module per physics family, each holding its own Obs/Eq pair:
+``losses_equivariant_wedge.py`` (FFT wedge) and ``losses_equivariant_tomo.py``
+(real tomography). This is the thin construction layer.
 """
 from __future__ import annotations
 
 from ..base_config import RunEIBaseConfig
 from .losses_equivariant_wedge import EqLoss, ObsLoss
-from .losses_unrolled import ObsLoss as UnrolledObsLoss
-from .losses_equivariant_tomo import EqLoss as TomoEqLoss
+from .losses_equivariant_tomo import EqLoss as TomoEqLoss, ObsLoss as TomoObsLoss
 
-__all__ = ["build_ei_losses", "build_tomography_losses", "build_tomo_ei_losses"]
+__all__ = ["build_ei_losses", "build_tomo_losses"]
 
 
 def build_ei_losses(cfg: RunEIBaseConfig, physics, transform) -> list:
@@ -23,19 +22,17 @@ def build_ei_losses(cfg: RunEIBaseConfig, physics, transform) -> list:
     ]
 
 
-def build_tomography_losses(cfg: RunEIBaseConfig, physics=None, transform=None) -> list:
-    """Obs-only cross-half-set consistency loss (no equivariance term)."""
-    return [UnrolledObsLoss(weight=1.0)]
+def build_tomo_losses(cfg: RunEIBaseConfig, physics=None, transform=None) -> list:
+    """Obs, plus Eq when ``eq_weight > 0`` — shared by ``unrolled`` and ``tomo_ei``.
 
-
-def build_tomo_ei_losses(cfg: RunEIBaseConfig, physics=None, transform=None) -> list:
-    """True-physics EI: Obs (reused from the unrolled preset) + optional Eq.
-
-    Eq is skipped entirely (not just zero-weighted) when eq_weight<=0 — each
-    Eq term costs a full A + fbp + denoiser pass per half, unlike the cheap
-    FFT-based EqLoss in build_ei_losses.
+    Eq is skipped, not zero-weighted: it costs an extra pass per half.
+    ``cfg.preset`` only selects how ``EqLoss`` calls the model.
     """
-    losses = [UnrolledObsLoss(weight=1.0)]
+    losses = [TomoObsLoss(weight=1.0, gain=str(cfg.obs_gain),
+                          ramp=bool(cfg.obs_ramp))]
     if float(cfg.eq_weight) > 0.0:
-        losses.append(TomoEqLoss(transform, weight=float(cfg.eq_weight)))
+        losses.append(TomoEqLoss(transform, weight=float(cfg.eq_weight),
+                                 unrolled=str(cfg.preset) == "unrolled",
+                                 noise=float(cfg.eq_noise),
+                                 scale_free=bool(cfg.eq_scale_free)))
     return losses

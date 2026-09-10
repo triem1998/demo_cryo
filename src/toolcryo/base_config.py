@@ -55,8 +55,28 @@ class RunEIBaseConfig(BaseModel):
     wedge_low_support: float = 0.0
     ref_wedge_support: float = 1.0
 
-    # ── EI loss ─────────────────────────────────────────────────────────────
+    # ── loss ─────────────────────────────────────────────────────────────
+    # EqLoss weight. 0 skips the term (it costs an extra pass per half).
     eq_weight: float = 2.0
+    # Rescales a = A(x_net) onto y's scale (they are normalised independently).
+    #   none                = c = 1
+    #   znorm               = z-norm both sides, in-graph
+    #   leastsq_xnet        = <a,y>/<a,a> refit each step; leaves amplitude
+    #                         free, so the model can shrink
+    #   leastsq_xnet_frozen = fit once per tomogram, then held
+    obs_gain: Literal["none", "znorm",
+                      "leastsq_xnet", "leastsq_xnet_frozen"] = "none"
+    # Weight the residual by |k| across the detector, so fine detail counts more
+    # than coarse. Without it blur is cheap. Changes the loss scale.
+    obs_ramp: bool = True
+    # Noise on Eq's simulated measurement, which is otherwise clean while f is
+    # deployed on noisy data. A multiple of the level measured from the EVN/ODD
+    # difference: 0 = clean, 1 = matched. Changes the loss scale.
+    eq_noise: float = 0.0
+    # z-norm both MSE operands, so Eq scores shape and ObsLoss owns amplitude —
+    # Eq's target is the model's own output, so its amplitude means nothing.
+    # Changes the loss scale.
+    eq_scale_free: bool = False
 
     # ── Training ────────────────────────────────────────────────────────────
     learning_rate: float = 1e-4
@@ -103,6 +123,14 @@ class RunEIBaseConfig(BaseModel):
     fsc_threshold: float = 0.143
     pixel_size_angstrom: float | None = None
     save_fsc_curves: bool = True   # write the full per-shell FSC curve, not just the resolution
+    # Reference volume for the val PSNR, globbed inside each tomo_* dir and
+    # tried in order: a ground truth if the dataset ships one, else icecream.
+    # The file actually picked is printed at startup and named in the
+    # psnr_ref column, since PSNR against different references is not
+    # comparable. null (or an empty list) = no PSNR at all.
+    psnr_ref_globs: list[str] | None = ["vol*[Gg]round*[Tt]ruth*.mrc",
+                                        "vol*_[Gg][Tt].mrc",
+                                        "vol*[Ii]cecream*.mrc"]
 
     # ── Pretrained init ──────────────────────────────────────────────────────
     pretrained_ckpt: str | None = None
