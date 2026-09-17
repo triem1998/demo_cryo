@@ -3,12 +3,6 @@ and the ``psnr`` val metric.
 
 Toy linear operators, no astra, no dataset: pure CPU, so this also runs on an
 AMD/ROCm box.
-
-The last section is a report on real data instead of a test — it needs the local
-dataset and skips without it::
-
-    python tests/test_losses.py           # report only
-    pytest tests/test_losses.py -s        # tests, then the report
 """
 from __future__ import annotations
 
@@ -19,24 +13,16 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 import numpy as np
-from deepinv.distributed import DistributedContext
 from deepinv.utils.tensorlist import TensorList
 
-from main import load_config
-from toolcryo.dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
 from toolcryo.losses import build_tomo_losses
 from toolcryo.losses.losses_equivariant_tomo import EqLoss, ObsLoss, _ramp_half
-from toolcryo.models import build_distributed_denoiser
-from toolcryo.registry import get_preset
-from toolcryo.run import RunEIFullConfig
 from toolcryo.transform import Rotate3D
 from toolcryo.utils.utils import psnr
 
-CONFIG = ROOT / "configs" / "conf_tomo_ei_local.yml"
 MSE = torch.nn.MSELoss()
 
 
@@ -449,88 +435,3 @@ def test_psnr_is_scale_free_and_ranks_by_error():
            psnr(ref + 1.0 * g.standard_normal(ref.shape), ref)
     with pytest.raises(ValueError, match="shape mismatch"):
         psnr(ref[:3], ref)
-
-
-# --------------------------------------------------------------------------- #
-# Measured scales on real data — a report, not an assertion
-# --------------------------------------------------------------------------- #
-def _grad_norm(model, term):
-    model.zero_grad(set_to_none=True)
-    term.backward(retain_graph=True)
-    sq = sum(float(p.grad.pow(2).sum()) for p in model.parameters() if p.grad is not None)
-    model.zero_grad(set_to_none=True)
-    return sq ** 0.5
-
-
-def report():
-    """Print each term's raw MSE and ``||d term / d theta||`` on a real tomogram.
-    The gradient norm is the only column comparable across terms."""
-    cfg = RunEIFullConfig.from_yaml(load_config(str(CONFIG)))
-
-    with DistributedContext(seed=int(cfg.seed), seed_offset=False, cleanup=True) as ctx:
-        data_cfg = EIFullDataConfig(
-            input_dir=cfg.input_dir, num_workers=0, pin_memory=False,
-            prefetch_factor=None, persistent_workers=False,
-            max_train_vols=cfg.max_train_vols, max_val_vols=int(cfg.max_val_vols),
-            seed=int(cfg.seed), train_names=cfg.train_names, val_names=cfg.val_names,
-            target_shape=cfg.target_shape,
-            fallback_tilt_min=cfg.tilt_min, fallback_tilt_max=cfg.tilt_max,
-            data_source="measurement", crop_size=cfg.crop_size,
-            normalize_crops=bool(cfg.normalize_crops),
-        )
-        bundle = build_ei_full_dataloaders(data_cfg)
-        train_ds = bundle.train_loader.dataset
-
-        preset = get_preset("tomo_ei")
-        physics = preset["physics"](cfg, train_ds.evn_paths, train_ds.odd_paths,
-                                    ctx.device, ctx)
-        model, info = build_distributed_denoiser(
-            cfg, ctx, int(ctx.rank), None, permute_native_to_astra=False)
-        tr = Rotate3D(n_trans=1, volume_shape=physics.physics_evn.volume_shape)
-
-        x, y, params = next(iter(bundle.train_loader))     # EVN / ODD sinograms
-        x, y = x.to(ctx.device), y.to(ctx.device)
-        physics.update(**{k: v.to(ctx.device) for k, v in params.items()})   # as deepinv does
-        pe, po = physics.physics_evn, physics.physics_odd
-        x_net, y_net = model(physics.init_evn), model(physics.init_odd)
-
-        print(f"\nmodel={info}  (random init: no local pretrained ckpt)")
-        print(f"volume={tuple(physics.init_evn.shape[-3:])}  sinogram={tuple(y.shape)}\n")
-        print("raw scales (std)")
-        for n, t in [("init_evn (data)", physics.init_evn),
-                     ("x_net = f(init_evn)", x_net),
-                     ("y (ODD sinogram)", y),
-                     ("A_odd(x_net)", po.A(x_net)),
-                     ("P_odd(x_net) = fbp(A(.))", po.fbp(po.A(x_net)))]:
-            print(f"  {n:<30} {t.std().item():>9.4f}")
-
-        terms = {
-            "Obs gain=none": ObsLoss(gain="none"),
-            "Obs gain=znorm": ObsLoss(gain="znorm"),
-            "Obs gain=leastsq_xnet": ObsLoss(gain="leastsq_xnet"),
-            "Obs gain=none ramp=True": ObsLoss(gain="none", ramp=True),
-            "Eq cross-coupled": EqLoss(tr, weight=1.0),
-        }
-        print(f"\n  {'term':<30} {'value':>12} {'||grad||':>12}")
-        print("  " + "-" * 56)
-        out = {}
-        for name, crit in terms.items():
-            v = crit(x=x, y=y, x_net=x_net, y_net=y_net, physics=physics, model=model)
-            out[name] = (v.item(), _grad_norm(model, v))
-            print(f"  {name:<30} {out[name][0]:>12.5g} {out[name][1]:>12.4g}")
-
-        eq_v, eq_g = out["Eq cross-coupled"]
-        obs_v, obs_g = out["Obs gain=none"]
-        print(f"\n  Obs/Eq   value = {obs_v / eq_v:8.1f}   grad = {obs_g / eq_g:8.1f}\n")
-        return out
-
-
-def test_report_runs():
-    if not (ROOT / "dataset" / "empiar-11830").exists() or not CONFIG.exists():
-        pytest.skip("local dataset or config not available")
-    out = report()
-    assert all(v > 0 for v, _ in out.values())
-
-
-if __name__ == "__main__":
-    report()
