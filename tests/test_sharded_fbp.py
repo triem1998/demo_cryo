@@ -13,24 +13,26 @@ global for the same reason.
 
 These tests pin that arithmetic directly on the operators, with no deepinv
 distributed machinery involved: pure CPU, no GPU, no astra, no dataset, so they
-also run on an AMD/ROCm box. The collective plumbing that carries these sums
-across ranks is exercised by the ``num_operators`` config runs instead.
+also run on an AMD/ROCm box. The collectives are checked by one 3-process
+gloo test at the end.
 """
 from __future__ import annotations
 
 import inspect
+import socket
 import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+import torch.multiprocessing as mp
 from deepinv.distributed import DistributedContext
 from deepinv.distributed.framework import DistributedDataFidelity
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from toolcryo.physics.tomography_build import (  # noqa: E402
-    build_one_tomography_em, projection_splits, split_sinogram,
+    ShardedTomography, build_one_tomography_em, projection_splits, split_sinogram,
 )
 from toolcryo.physics.tomography_torch import TomographyEMTorch  # noqa: E402
 
@@ -103,7 +105,7 @@ def test_per_shard_centring_is_wrong():
 @pytest.mark.parametrize("n", [1, 2, 3, 5])
 def test_shard_count_invariance(n):
     """Any shard count, including uneven splits (7 angles over 5 shards), gives
-    the same volume — the contract ``normalize_sharded`` already holds to."""
+    the same volume — the contract ``cached_operator_norm`` relies on."""
     y = sinogram()
     assert rel(combine(y, n), make_op(ANGLES).fbp(y)) < 1e-5
 
@@ -140,7 +142,51 @@ def test_shard_count_capped_by_tilt_count(requested, expected):
     ``TomographyEMPair.num_operators`` drives ``split_sinogram`` (forward.py) and
     a mismatch there would hand the operator the wrong number of measurements."""
     with DistributedContext(seed=0, cleanup=True) as ctx:
-        physics, _ = build_one_tomography_em(
+        physics = build_one_tomography_em(
             TOMO_DIR, "split1", FBP_VOL, "cpu", (64, 64, 32), requested, ctx, "torch")
         assert physics.num_operators == expected
         assert min(p.n_angles for p in physics.local_physics) >= 1
+
+
+# --------------------------------------------------------------------------
+# ShardedTomography.A / fbp across real ranks (CPU, gloo).
+# --------------------------------------------------------------------------
+
+WORLD = 3
+
+
+def _sharded_worker(rank, port, n):
+    import os
+    os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank),
+                      WORLD_SIZE=str(WORLD), LOCAL_RANK=str(rank))
+    with DistributedContext(backend="gloo", device_mode="cpu") as ctx:
+        splits = projection_splits(N_ANGLES, n)
+        physics = ShardedTomography(
+            ctx, n, lambda i, dev, shared=None: make_op(ANGLES[slice(*splits[i])]))
+        physics.n_angles_total, physics.volume_shape = N_ANGLES, SHAPE
+        full = make_op(ANGLES)
+        torch.manual_seed(0)
+        x0, w_a = torch.randn(1, 1, *SHAPE), torch.randn(1, 1, SHAPE[0], N_ANGLES, SHAPE[2])
+        w_f = torch.randn(1, 1, *SHAPE)
+
+        def run(physics, x):   # loss touches A(x) and fbp(A(x)), so both backwards run
+            y = physics.A(x)
+            v = physics.fbp(y)
+            y = y if torch.is_tensor(y) else torch.cat(list(y), dim=3)
+            (w_a * y).sum().add((w_f * v).sum()).backward()
+            return y, v
+
+        xs, xf = x0.clone().requires_grad_(), x0.clone().requires_grad_()
+        ys, vs = run(physics, xs)
+        yf, vf = run(full, xf)
+        assert rel(ys, yf) < 1e-5
+        assert rel(vs, vf) < 1e-5
+        assert rel(xs.grad, xf.grad) < 1e-5
+
+
+@pytest.mark.parametrize("n", [5, 3, 2])   # 5: >1 shard per rank; 3: one each, uneven; 2: rank 2 empty
+def test_sharded_matches_unsharded_multiprocess(n):
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_sharded_worker, args=(port, n), nprocs=WORLD)

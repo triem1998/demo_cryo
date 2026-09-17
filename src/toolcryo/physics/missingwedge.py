@@ -203,7 +203,7 @@ class MissingWedge(dinv.physics.LinearPhysics):
         return (self._volume_shape, self._tilt_min, self._tilt_max)
 
     def update_parameters(self, tilt_min=None, tilt_max=None, vol_shape=None,
-                          tomo_idx=None, **kwargs) -> None:
+                          tomo_idx=None, psnr_ref=None, **kwargs) -> None:
         """deepinv hook — called by ``Physics.update(**params)`` each training step.
 
         When the dataloader returns ``(evn, odd, {"tilt_min": t, "tilt_max": t,
@@ -221,6 +221,7 @@ class MissingWedge(dinv.physics.LinearPhysics):
         the union would leak in frequencies with no data for at least one sample,
         producing a wrong training signal (verified in scripts/test_wedge_aggregation.py).
         """
+        self.psnr_ref = psnr_ref
         if tomo_idx is not None:
             self._tomo_idx = int(tomo_idx.flatten()[0]) if hasattr(tomo_idx, "numel") else int(tomo_idx)
         if tilt_min is not None and tilt_max is not None:

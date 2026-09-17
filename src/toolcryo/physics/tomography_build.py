@@ -15,17 +15,21 @@ is the only place ``cfg.tomography_backend`` is read.
 """
 from __future__ import annotations
 
+import fcntl
 import importlib.util
+import os
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from deepinv.distributed.framework import DistributedStackedLinearPhysics
+from deepinv.distributed.framework.distributed_utils import DistributedGradientSync
 from deepinv.utils.tensorlist import TensorList
 
-from ..utils.utils import load_mrc_volume
+from ..utils.utils import _read_mrc_vol_shape
 from .tomography import TomographyEM
 from .tomography_torch import TomographyEMTorch
 
@@ -94,7 +98,23 @@ class ShardedTomography(DistributedStackedLinearPhysics):
     shift-idempotent and so cannot be recovered shard by shard.
     """
 
-    def fbp(self, y, gather: bool = True, reduce_op: str | None = "sum", **kwargs):
+    def A(self, x, gather: bool = True, **kwargs):
+        """``A`` with one padded ``all_gather``: every shape is known from ``projection_splits``."""
+        if not (gather and self.ctx.use_dist) or kwargs:
+            return super().A(x, gather=gather, **kwargs)
+        if x.requires_grad:
+            x = DistributedGradientSync.apply(x, self.ctx)   # same input-grad sum as deepinv
+        splits = projection_splits(self.n_angles_total, self.num_operators)
+        w, n_max = self.ctx.inner_world_size, splits[0][1] - splits[0][0]
+        local = [F.pad(p.A(x), (0, 0, 0, n_max - p.n_angles)) for p in self.local_physics]
+        # zero rows tied to x: an empty rank then picks the same (autograd) collective
+        zero = (0 * x.reshape(-1)[0]).expand(
+            *x.shape[:2], self.volume_shape[0], n_max, self.volume_shape[2])
+        local += [zero] * (-(-self.num_operators // w) - len(local))
+        g = self.ctx.all_gather(torch.stack(local))   # (w, k_max, B, C, V, n_max, N)
+        return TensorList([g[i % w, i // w, ..., :e - s, :] for i, (s, e) in enumerate(splits)])
+
+    def fbp(self, y, gather: bool = True, **kwargs):
         if len(y) != self.num_operators:
             raise ValueError(
                 f"fbp needs the whole sinogram (all {self.num_operators} pieces, as "
@@ -106,10 +126,11 @@ class ShardedTomography(DistributedStackedLinearPhysics):
         # because each shard's fbp_raw divides by its *own* angle count.
         count = sum(t.shape[-3] * t.shape[-2] * t.shape[-1] for t in y)
         mean = sum(t.sum(dim=(-3, -2, -1), keepdim=True) for t in y) / count
-        return self._map_reduce_gather(
-            [y[i] - mean for i in self.local_indexes],
-            lambda p, t, **kw: p.fbp_raw(t) * (p.n_angles / self.n_angles_total),
-            gather=gather, reduce_op=reduce_op, **kwargs)
+        out = sum(p.fbp_raw(y[i] - mean) * (p.n_angles / self.n_angles_total)
+                  for i, p in zip(self.local_indexes, self.local_physics))
+        if not torch.is_tensor(out):   # empty rank: zeros tied to y, same collective choice
+            out = (0 * mean).expand(*mean.shape[:2], *self.volume_shape).contiguous()
+        return self.ctx.all_reduce(out) if gather else out
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +142,7 @@ class ShardedTomography(DistributedStackedLinearPhysics):
 
 # Calibrated for this dataset's acquisition convention (see
 # scripts/test_tomography_em.py) — the tilt sign matches IMOD's convention
-# negated. The tilt axis is Y, which load_fbp_init puts first.
+# negated. The tilt axis is Y, first in astra order.
 _TOMO_ANGLE_SIGN = -1.0
 
 
@@ -135,8 +156,8 @@ class TomographyEMPair:
     """
     physics_evn: "TomographyEM"
     physics_odd: "TomographyEM"
-    init_evn: torch.Tensor
-    init_odd: torch.Tensor
+    init_evn: torch.Tensor | None   # set per batch by update(), from the dataloader
+    init_odd: torch.Tensor | None
     # Full (train + val, concatenated) path lists + build params, kept so
     # ``update()`` can lazily rebuild physics_evn/odd for whichever tomogram
     # the current batch is — see CryoEIFullDataset.index_offset.
@@ -152,17 +173,22 @@ class TomographyEMPair:
     backend: str = "astra"
     ctx: object = None
     _tomo_idx: int = 0
+    psnr_ref: object = None   # this batch's PSNR reference, or None
 
-    def update(self, tomo_idx=None, **kwargs) -> None:
-        """Rebuild physics_evn/odd + their FBP inits for a different tomogram.
+    def update(self, tomo_idx=None, psnr_ref=None, init_evn=None, init_odd=None,
+               **kwargs) -> None:
+        """Store this batch's FBP inits; rebuild physics_evn/odd for a different tomogram.
 
         ``deepinv.Trainer`` calls ``physics.update(**params)`` before every
         forward pass (train and eval) — mirrors how ``MissingWedge`` rebuilds
         its wedge mask per volume (dataset_full.py), except a TomographyEM
         operator is calibrated to one tomogram's actual tilt angles, so a
-        "rebuild" here means re-reading that tomogram's .tlt file + FBP
-        volume, not just recomputing a mask from two floats.
+        "rebuild" here means re-reading that tomogram's .tlt file, not just
+        recomputing a mask from two floats.
         """
+        self.psnr_ref = psnr_ref   # before the early returns
+        if init_evn is not None:
+            self.init_evn, self.init_odd = init_evn, init_odd
         if tomo_idx is None:
             return
         if hasattr(tomo_idx, "numel"):
@@ -170,90 +196,41 @@ class TomographyEMPair:
         if tomo_idx == self._tomo_idx:
             return
         evn_path, odd_path = self.evn_paths[tomo_idx], self.odd_paths[tomo_idx]
-        self.physics_evn, self.init_evn = build_one_tomography_em(
+        self.physics_evn = build_one_tomography_em(
             evn_path.parent, "split1", evn_path, self.device, self.target_shape,
             self.num_operators, self.ctx, self.backend)
-        self.physics_odd, self.init_odd = build_one_tomography_em(
+        self.physics_odd = build_one_tomography_em(
             odd_path.parent, "split2", odd_path, self.device, self.target_shape,
             self.num_operators, self.ctx, self.backend)
-        # A different tomogram means different angles, hence a different global
-        # norm — re-normalise so the sharded operator stays unit-norm per volume.
-        if self.num_operators is not None:
-            normalize_sharded(self.physics_evn, self.init_evn)
-            normalize_sharded(self.physics_odd, self.init_odd)
         self._tomo_idx = tomo_idx
 
 
-def measure_opnorm_sq(physics, init: torch.Tensor) -> float:
-    """``||A^T A||_2`` of a distributed (sharded) operator.
+def cached_operator_norm(vol_path: Path, volume_shape, angles, backend: str, device) -> float:
+    """``||A||`` of the full operator, cached next to the FBP volume.
 
-    Only needed when sharding: the shards are built with ``normalize=False``
-    because each one's own norm is not the full operator's.
-
-    ``local_only=False`` runs the power iteration over the *assembled* operator,
-    communicating at each step. deepinv's default (``True``) only sums the
-    per-shard norms, an upper bound that grows with the shard count — which
-    would make the stepsize, and so the reconstruction, depend on
-    ``num_operators``. Paid once at build time, not per step.
+    Sharding does not change it, so a miss measures it on a local operator: no
+    collective, so one process can measure while the rest wait on the lock.
     """
-    # Full (B, C, D, H, W) init, not the unbatched form deepinv's docstring
-    # suggests: the power iteration feeds x0 straight into A, and astra's
-    # forward unpacks five dims.
-    return float(physics.compute_sqnorm(init, local_only=False, verbose=False))
+    cache = vol_path.with_suffix(f".norm_{backend}_{'x'.join(map(str, volume_shape))}.npy")
+    if not cache.exists():
+        with open(cache.with_suffix(".lock"), "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)   # one process measures, the rest wait
+            if not cache.exists():
+                # own RNG: a miss must not shift the run's random stream vs a hit
+                with torch.random.fork_rng(devices=range(torch.cuda.device_count())):
+                    op = TOMOGRAPHY_BACKENDS[backend](
+                        volume_shape=volume_shape, angles_deg=angles,
+                        angle_sign=_TOMO_ANGLE_SIGN, normalize=True, device=str(device))
+                tmp = cache.with_suffix(f".{os.getpid()}.tmp.npy")
+                np.save(tmp, np.array([float(getattr(op, "xray", op).operator_norm)]))
+                tmp.replace(cache)
+    return float(np.load(cache)[0])
 
 
-def normalize_sharded(physics, init: torch.Tensor) -> float:
-    """Give a sharded operator the unit spectral norm ``normalize=True`` gives
-    the unsharded one, by rescaling every shard with the *global* norm.
-
-    Scaling only the PGD stepsize by :math:`1/\\|A\\|^2` fixes the :math:`A^{T}A` term of the 
-    data-fidelity gradient but leaves the :math:`A^{T}y` term off by one factor of the norm,
-    so the two paths converge to different reconstructions. Normalising the
-    operator itself makes the sharded and unsharded physics identical.
-
-    :return: the measured ``||A^T A||_2`` before normalisation (diagnostic).
-    """
-    sqnorm = measure_opnorm_sq(physics, init)
-    for p in physics.local_physics:
-        # astra holds the two knobs on its wrapper, the torch operator on itself.
-        target = getattr(p, "xray", p)
-        target.operator_norm = sqnorm ** 0.5
-        target.normalize = True
-    return sqnorm
-
-
-def load_fbp_init(
-    path: Path, device, target_shape: tuple[int, int, int] | None,
-) -> torch.Tensor:
-    """Load a precomputed FBP volume as the PGD iteration's ``x_init``.
-
-    Physics rather than dataset code on purpose: set up once alongside the
-    operator, not fetched per batch. Reading and reorienting the MRC is shared —
-    ``utils.utils.load_mrc_volume``.
-
-    The z-normalisation below does **not** put ``A(x)`` on the sinogram's scale:
-    this volume, the sinogram and ``A`` are normalised independently and nothing
-    composes them (measured ``std(A(init)) ~ 0.13`` against ``std(y) ~ 0.92``).
-    ``ObsLoss._gains`` supplies the missing constant.
-    """
-    # (Y, Z, X), no crop — the reorder is a real copy done once here rather than
-    # as a permute inside A()/A_adjoint(); see the TomographyEM docstring.
-    vol_np = load_mrc_volume(path, order="astra")
-    vol = torch.from_numpy(vol_np).unsqueeze(0).unsqueeze(0)  # (1, 1, Y, Z, X)
-    if target_shape is not None:
-        # Local-testing only — pure downsample, no crop, kept consistent with
-        # CryoEIFullDataset._resample_sinogram's matching resample of the tilt
-        # series' (ny, nx).
-        # target_shape is given in the canonical (Y, X, Z) order that every
-        # preset's config uses; permute it to this operator's astra (Y, Z, X).
-        ty, tx, tz = (int(s) for s in target_shape)
-        vol = torch.nn.functional.interpolate(
-            vol, size=(ty, tz, tx), mode="trilinear", align_corners=False,
-        )
-    # Z-normalize (centre + unit std), matching CryoEIFullDataset._load_and_prepare.
-    # Centring matters as much as scaling: a volume with a non-zero mean projects
-    # to a constant offset in A(x) that can never match a centred sinogram.
-    return ((vol - vol.mean()) / (vol.std() + 1e-8)).to(device)
+def _set_norm(ops, norm: float) -> None:
+    for p in ops:
+        t = getattr(p, "xray", p)   # astra holds the knobs on its wrapper
+        t.operator_norm, t.normalize = norm, True
 
 
 def build_one_tomography_em(
@@ -261,7 +238,7 @@ def build_one_tomography_em(
     target_shape: tuple[int, int, int] | None,
     num_operators: int | None = None, ctx=None,
     backend: str = "astra",
-) -> tuple[TomographyEM | TomographyEMTorch, torch.Tensor]:
+) -> TomographyEM | TomographyEMTorch | ShardedTomography:
     """``backend``: a resolved key of ``TOMOGRAPHY_BACKENDS`` — never ``"auto"``,
     which ``resolve_tomography_backend`` has already turned into one of the two.
     Everything below is backend-agnostic; only the class being instantiated moves.
@@ -272,10 +249,10 @@ def build_one_tomography_em(
     An int shards the tilt angles into that many operators and distributes them
     round-robin across ranks (deepinv only parallelises a *collection* of
     operators; it cannot split one, so the split is built here — same recipe as
-    demo_tomo). Shards are built with ``normalize=False``: each shard's own
-    spectral norm differs from the full operator's, so per-shard normalisation
-    would be wrong. The caller (``build_tomography_physics``) measures the global
-    norm once and rescales every shard with it (``normalize_sharded``).
+    demo_tomo).
+
+    Every operator is built with ``normalize=False`` and given the full operator's
+    norm from ``cached_operator_norm`` — a shard's own norm would be wrong.
     """
     ang_matches = sorted(tomo_dir.glob(f"angles_*_{split}.tlt"))
     if ang_matches:
@@ -300,8 +277,10 @@ def build_one_tomography_em(
         # supports empty ranks) but still carry their denoiser tiles.
         num_operators = min(int(num_operators), len(angles))
 
-    init = load_fbp_init(vol_path, device, target_shape)
-    volume_shape = tuple(init.shape[-3:])
+    # canonical (Y, X, Z) -> astra (Y, Z, X); no volume is loaded here
+    ty, tx, tz = target_shape if target_shape is not None else _read_mrc_vol_shape(vol_path)
+    volume_shape = (int(ty), int(tz), int(tx))
+    norm = cached_operator_norm(vol_path, volume_shape, angles, backend, device)
     op_cls = TOMOGRAPHY_BACKENDS[backend]
 
     if num_operators is None:
@@ -309,10 +288,11 @@ def build_one_tomography_em(
             volume_shape=volume_shape,
             angles_deg=angles,
             angle_sign=_TOMO_ANGLE_SIGN,
-            normalize=True,
+            normalize=False,
             device=str(device),
         )
-        return physics, init
+        _set_norm([physics], norm)
+        return physics
 
     splits = projection_splits(len(angles), int(num_operators))
 
@@ -332,4 +312,5 @@ def build_one_tomography_em(
     physics._tilt_min, physics._tilt_max = float(angles.min()), float(angles.max())
     physics.n_angles_total = len(angles)   # fbp's A_i/A reweighting
     physics.volume_shape = volume_shape     # shards share it; Rotate3D reads it (run.py)
-    return physics, init
+    _set_norm(physics.local_physics, norm)
+    return physics

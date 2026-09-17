@@ -21,7 +21,7 @@ from .forward import ei_denoiser_forward
 from .utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
 from .utils.utils import (
     GpuFSC, PerfProbe, append_fsc_row, append_metrics_row, denoise_patches, fsc_resolution, half_set_recon,
-    load_mrc_volume, psnr, recon_panels, to_canonical_np,
+    psnr_zn, recon_panels, to_canonical_np,
 )
 
 
@@ -72,7 +72,6 @@ class BaseTrainer(dinv.Trainer):
         self._val_fsc_epoch = None
         self._fsc_tomo_names: list[str] = []
         self._psnr_refs: list = []          # one Path (or None) per FSC volume
-        self._psnr_cache: dict = {}         # vol_idx -> loaded reference array
         self._val_psnr: list = []           # per-volume (psnr_1, psnr_2, std_ratio)
         # figure tracking
         self._train_slice_epoch = None
@@ -341,33 +340,6 @@ class BaseTrainer(dinv.Trainer):
 class EIFullTrainer(BaseTrainer):
     """Full-volume trainer. Val: FSC(f(EVN), f(ODD)) + figures."""
 
-    def _psnr_ref(self, vol_idx: int, shape):
-        """Reference volume for ``vol_idx``, canonical order, loaded once.
-
-        Resampled to ``shape`` when the run sets ``target_shape``, then
-        z-normalised. A shape that still disagrees means the axis order does, so
-        ``psnr`` raises rather than scoring a transposed volume. Rank 0 only.
-        """
-        if vol_idx in self._psnr_cache:
-            return self._psnr_cache[vol_idx]
-        path = self._psnr_refs[vol_idx] if vol_idx < len(self._psnr_refs) else None
-        ref = None
-        if path is not None:
-            ref = load_mrc_volume(path, order="native")     # (Y, X, Z) = canonical
-            if ref.shape != tuple(shape):
-                t = torch.from_numpy(ref)[None, None]
-                ref = torch.nn.functional.interpolate(
-                    t, size=tuple(shape), mode="trilinear", align_corners=False
-                ).squeeze().numpy()
-            # z-normalised like every other volume, so std_ratio is std(recon)
-            # against a unit-variance reference and 1.0 is the neutral value.
-            # dtype=float32: a float16 accumulator overflows to inf here.
-            mu = float(np.mean(ref, dtype=np.float32))
-            sd = float(np.std(ref, dtype=np.float32))
-            ref = ((ref - mu) / (sd + 1e-8)).astype(np.float16)
-        self._psnr_cache[vol_idx] = ref
-        return ref
-
     @property
     def _is_eval_writer(self) -> bool:
         """Rank that scores this replica's volumes: inner rank 0 of each.
@@ -413,19 +385,18 @@ class EIFullTrainer(BaseTrainer):
             vol_idx = self._eval_vol_idx(physics)
             px      = self._val_pixel_sizes[vol_idx] if vol_idx < len(self._val_pixel_sizes) else 1.0
 
-            with torch.no_grad():
+            with torch.no_grad(), (self._autocast or contextlib.nullcontext()):
                 f_evn_t, f_odd_t = self.forward_pass(x, y, physics, train=False)
             if hasattr(self.device, "type") and self.device.type == "cuda":
                 torch.cuda.synchronize()
 
             # Scored apart by FSC (comparable to patch inference); averaged only for display.
             with torch.no_grad():
-                r_evn, r_odd = self._recon_strategy(self.model, physics, f_evn_t, f_odd_t)
+                r_evn, r_odd = self._recon_strategy(self._amp_model(), physics, f_evn_t, f_odd_t)
 
-            if not hasattr(self, "_gpu_fsc"):
-                self._gpu_fsc = GpuFSC(device=f_evn_t.device)
+            gpu_fsc = GpuFSC(device=f_evn_t.device)   # local: its shell map is 4 GiB
 
-            fsc_curve  = self._gpu_fsc(r_evn, r_odd)
+            fsc_curve  = gpu_fsc(r_evn, r_odd)
             k, res, D  = fsc_resolution(fsc_curve, r_evn.squeeze().shape,
                                         px, self._fsc_threshold)
 
@@ -434,7 +405,7 @@ class EIFullTrainer(BaseTrainer):
             has_round_trip = self._recon_strategy is half_set_recon
             res_1 = k_1 = fsc_curve_1 = None
             if has_round_trip:
-                fsc_curve_1 = self._gpu_fsc(f_evn_t, f_odd_t)
+                fsc_curve_1 = gpu_fsc(f_evn_t, f_odd_t)
                 k_1, res_1, _ = fsc_resolution(fsc_curve_1, f_evn_t.squeeze().shape,
                                                px, self._fsc_threshold)
 
@@ -443,22 +414,19 @@ class EIFullTrainer(BaseTrainer):
 
             recon_2 = 0.5 * (r_evn + r_odd)
             recon_1 = 0.5 * (f_evn_t + f_odd_t) if has_round_trip else None
-            can = lambda t: to_canonical_np(t.squeeze().float().cpu().numpy(), physics)  # noqa: E731
 
             # One rank per replica: its scores are gathered at epoch end, and
             # the other inner ranks hold the same volume, so they would duplicate it.
-            psnr_rec = None
-            if self._is_eval_writer:
-                can_2 = can(recon_2)
-                ref = self._psnr_ref(vol_idx, can_2.shape)
-                if ref is not None:
-                    # dtype: the cached ref is fp16 and its default accumulator
-                    # overflows to inf on a real volume.
-                    psnr_rec = (
-                        psnr(can(recon_1), ref) if recon_1 is not None else None,
-                        psnr(can_2, ref),
-                        float(recon_2.std()) / (float(np.std(ref, dtype=np.float32)) + 1e-12),
-                    )
+            psnr_rec, ref = None, getattr(physics, "psnr_ref", None)
+            if self._is_eval_writer and ref is not None:
+                # fp32: an fp16 std over a full volume overflows; 5-D so a transposed ref fails to broadcast
+                ref = ref.float().reshape(*recon_2.shape[:2], *ref.shape[-3:])
+                psnr_rec = (
+                    float(psnr_zn(recon_1.float(), ref)) if recon_1 is not None else None,
+                    float(psnr_zn(recon_2, ref)),
+                    float(recon_2.std()) / (float(ref.std()) + 1e-12),
+                )
+                physics.psnr_ref = None   # free before the figures
             if self._is_rank0:
                 _p = getattr(physics, "physics_evn", physics)   # TomographyEMPair holds the operator
                 print(f"[physics] {name}  tilt=[{_p._tilt_min:.1f}, {_p._tilt_max:.1f}]°", flush=True)
@@ -516,7 +484,7 @@ class EIFullTrainer(BaseTrainer):
         # All ranks must call the (possibly distributed) model; only rank-0 saves.
         with torch.no_grad():
             r_evn, r_odd = self._recon_strategy(
-                self.model, physics, self._last_train_xnet, self._last_train_ynet)
+                self._amp_model(), physics, self._last_train_xnet, self._last_train_ynet)
         recon_t = 0.5 * (r_evn + r_odd)
         if self._train_images_dir is None:
             return

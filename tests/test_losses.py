@@ -63,9 +63,11 @@ class _ToyPair:
         self.physics_odd = _ToyPhysics(3.0, gain=1.3)
         self.init_evn = torch.randn(shape, generator=g)
         self.init_odd = torch.randn(shape, generator=g)
+        self._tomo_idx = 0
 
     def swap_tomogram(self) -> None:
-        """What ``TomographyEMPair.update()`` does: rebind both init tensors."""
+        """What ``TomographyEMPair.update()`` does: a new index and new init tensors."""
+        self._tomo_idx += 1
         self.init_evn = torch.randn_like(self.init_evn)
         self.init_odd = torch.randn_like(self.init_odd)
 
@@ -96,23 +98,22 @@ def test_none_is_a_true_no_op_and_costs_nothing():
 
 
 def test_frozen_gain_is_held_and_invalidated_on_tomogram_swap():
-    """A frozen ``c`` must be genuinely held, and dropped when the volume changes
-    (``TomographyEMPair.update()`` rebinds ``init_*``)."""
+    """A frozen ``c`` must be held per tomogram, even when the dataloader hands
+    over new ``init_*`` tensors each batch, and fitted anew for another tomogram."""
     physics = _ToyPair()
     x, y, x_net, y_net = _batch()
     crit = ObsLoss(weight=1.0, gain="leastsq_xnet_frozen")
 
     crit(x=x, y=y, x_net=x_net, y_net=y_net, physics=physics)
-    first = crit._gain_cache[2].clone()
+    first = crit._gain_cache[0][0].clone()
+    physics.init_evn = physics.init_evn.clone()   # new tensor, same tomogram
     crit(x=x, y=y, x_net=3.0 * x_net, y_net=3.0 * y_net, physics=physics)
-    assert torch.allclose(crit._gain_cache[2], first)
+    assert torch.allclose(crit._gain_cache[0][0], first)
 
     physics.swap_tomogram()
     crit(x=x, y=y, x_net=x_net, y_net=y_net, physics=physics)
-    # rekeyed to the new tomogram. The VALUE need not move: c is fitted to
-    # A(x_net), and x_net is unchanged here — only the cache key is.
-    assert crit._gain_cache[0] is physics.init_evn
-    assert crit._gain_cache[1] is physics.init_odd
+    # a new entry for the new tomogram; the first one is kept
+    assert set(crit._gain_cache) == {0, 1}
 
 
 def test_live_gain_refits_every_step():
@@ -366,9 +367,8 @@ def test_scale_free_eq_has_zero_gradient_along_the_output_scale():
     assert grad.abs().item() < 1e-5
 
 
-def test_checkpointed_scale_free_matches_the_uncheckpointed_form():
-    """The checkpoint is a pure memory trade. Assert the GRADIENT: checkpointing
-    re-runs the forward, so impurity in the region shows up only there."""
+def test_closed_form_scale_free_matches_autograd():
+    """Closed-form backward must match autograd through the z-norm."""
     x_net, y_net, physics, tr = _eq_fixtures()
     xn = x_net.clone().requires_grad_(True)
     crit = EqLoss(tr, weight=1.0, scale_free=True)
@@ -378,12 +378,13 @@ def test_checkpointed_scale_free_matches_the_uncheckpointed_form():
     a = crit(x_net=xn, **kw)
     ga = torch.autograd.grad(a, xn)[0]
 
-    crit._mse = crit._mse_scale_free          # bypass the checkpoint
+    zn = lambda t: (t - t.mean()) / (t.std() + 1e-8)      # noqa: E731
+    crit._mse = lambda e, t: torch.nn.functional.mse_loss(zn(e), zn(t))
     torch.manual_seed(7)
     b = crit(x_net=xn, **kw)
     gb = torch.autograd.grad(b, xn)[0]
 
-    assert torch.equal(a, b)
+    assert torch.allclose(a, b)
     assert torch.allclose(ga, gb, atol=1e-6)
 
 
@@ -487,8 +488,9 @@ def report():
             cfg, ctx, int(ctx.rank), None, permute_native_to_astra=False)
         tr = Rotate3D(n_trans=1, volume_shape=physics.physics_evn.volume_shape)
 
-        x, y, _ = next(iter(bundle.train_loader))          # EVN / ODD sinograms
+        x, y, params = next(iter(bundle.train_loader))     # EVN / ODD sinograms
         x, y = x.to(ctx.device), y.to(ctx.device)
+        physics.update(**{k: v.to(ctx.device) for k, v in params.items()})   # as deepinv does
         pe, po = physics.physics_evn, physics.physics_odd
         x_net, y_net = model(physics.init_evn), model(physics.init_odd)
 

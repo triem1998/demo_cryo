@@ -100,6 +100,8 @@ class CryoEIFullDataset(Dataset):
     :param float fallback_tilt_max: Used when tilt_ranges[i] is None.
     """
 
+    psnr_ref_paths: list | None = None   # set by run.py on the eval writer rank
+
     def __init__(
         self,
         evn_paths: list[Path],
@@ -145,8 +147,11 @@ class CryoEIFullDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, dict]:
         if self.data_source == "measurement":
             evn_sino, odd_sino = self._load_measurement(idx)
-            tomo_idx = torch.tensor(idx + self.index_offset)
-            return evn_sino, odd_sino, {"tomo_idx": tomo_idx}
+            params = {"tomo_idx": torch.tensor(idx + self.index_offset)}
+            for half, paths in (("evn", self.evn_paths), ("odd", self.odd_paths)):
+                # FBP init in astra (Y, Z, X), for TomographyEMPair.update()
+                params[f"init_{half}"] = self._load_and_prepare(paths[idx]).transpose(2, 3).contiguous()
+            return evn_sino, odd_sino, self._with_ref(idx, params)
 
         evn = self._load_and_prepare(self.evn_paths[idx])   # (1, D, H, W), whole-volume normalised
         odd = self._load_and_prepare(self.odd_paths[idx])
@@ -163,7 +168,17 @@ class CryoEIFullDataset(Dataset):
             "vol_shape": torch.tensor(evn.shape[-3:], dtype=torch.int64),
             "tomo_idx": torch.tensor(idx + self.index_offset),
         }
-        return evn, odd, tilt_params
+        return evn, odd, self._with_ref(idx, tilt_params)
+
+    def _with_ref(self, idx: int, params: dict) -> dict:
+        """Add ``psnr_ref`` (fp16, model-output axis order) when a path is set."""
+        path = self.psnr_ref_paths[idx] if self.psnr_ref_paths else None
+        if path is not None:
+            ref = self._load_and_prepare(path)[0]
+            if self.data_source == "measurement":
+                ref = ref.transpose(1, 2)   # astra (Y, Z, X)
+            params["psnr_ref"] = ref.contiguous().half()
+        return params
 
     # ------------------------------------------------------------------
     # Helpers
@@ -173,9 +188,8 @@ class CryoEIFullDataset(Dataset):
         """Load real split1/split2 tilt series — no crop, no normalise. If
         ``target_shape`` is set (local testing only), each projection is
         resampled to match its (D, H) so the sinogram stays
-        consistent with the correspondingly-resampled FBP-init volume built by
-        ``physics/__init__.py::build_tomography_physics``. Angles and FBP-init
-        volumes are read independently by the physics builder, not here.
+        consistent with the correspondingly-resampled FBP-init volumes loaded in
+        ``__getitem__``. Angles are read by the physics builder, not here.
 
         Returns ``(1, V, A, N)`` tensors — matches ``TomographyEM.A()``'s
         ``(B, C, V, A, N)`` convention (V<-ny, A<-n_angles, N<-nx; see

@@ -16,6 +16,7 @@ from pathlib import Path
 import mrcfile
 import numpy as np
 import torch
+from deepinv.loss.metric import PSNR
 from torch.utils.data import DataLoader
 
 
@@ -91,6 +92,10 @@ def psnr(recon: np.ndarray, ref: np.ndarray) -> float:
     a, b = zn(recon.astype(np.float32)), zn(ref.astype(np.float32))
     mse = float(((a - b) ** 2).mean())
     return float(10.0 * np.log10((b.max() - b.min()) ** 2 / max(mse, 1e-12)))
+
+
+#: GPU twin of :func:`psnr`: standardize + reference span as peak = the same z-normalised PSNR.
+psnr_zn = PSNR(max_pixel=None, min_pixel=None, norm_inputs="standardize")
 
 
 def append_fsc_row(path: Path | str, curve=None, curve_1pass=None, **fields) -> None:

@@ -49,7 +49,7 @@ training:
 # unrolled preset only (PGD unfold) — ignored by missingwedge_ei
 unrolled:
   n_iter: 2                # PGD steps (demo_tomo default)
-  init_stepsize: 0.9       # demo_tomo default; operators are built with
+  init_stepsize: 0.9       # operators are built with
                             # normalize=True (unit spectral norm), so this is
                             # used directly, no per-tomogram rescaling needed
   train_algo_params: false  # learn stepsize (+ g_param for drunet) jointly

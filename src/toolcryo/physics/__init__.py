@@ -22,7 +22,7 @@ from .missingwedge import MissingWedge
 from .tomography import TomographyEM
 from .tomography_build import (
     TOMOGRAPHY_BACKENDS, TomographyEMPair, build_one_tomography_em,
-    normalize_sharded, resolve_tomography_backend, split_sinogram,
+    resolve_tomography_backend, split_sinogram,
 )
 from .tomography_torch import TomographyEMTorch
 
@@ -56,12 +56,11 @@ def build_missingwedge_physics(
 def build_tomography_physics(
     cfg: RunEIBaseConfig, evn_paths: list[Path], odd_paths: list[Path], device, ctx: DistributedContext,
 ) -> TomographyEMPair:
-    """Build a tomogram's EVN/ODD tomography operators and their FBP inits.
+    """Build a tomogram's EVN/ODD tomography operators; the FBP inits arrive per
+    batch from the dataloader (``TomographyEMPair.update()``).
 
-    The operator ends up unit spectral norm either way — ``normalize=True``
-    unsharded, ``normalize_sharded`` when the angles are split — so a
-    z-normalized volume maps onto the z-normalized sinogram's scale and the PGD
-    stepsize needs no rescaling.
+    The operator ends up unit spectral norm, sharded or not (``cached_operator_norm``),
+    so the PGD stepsize needs no rescaling.
 
     ``cfg.num_operators`` shards the tilt angles across ranks (null = one full
     operator per rank, only the denoiser tiled); ``cfg.tomography_backend``
@@ -72,10 +71,9 @@ def build_tomography_physics(
     Only volume 0 (the first training volume) is built eagerly here; the rest
     are built lazily by ``TomographyEMPair.update()`` as each tomogram is
     encountered — its ``tomo_idx`` (from ``CryoEIFullDataset.index_offset``)
-    indexes into these same lists. If ``cfg.target_shape`` is set, both the
-    init volumes here and the sinograms loaded by
-    ``CryoEIFullDataset._load_measurement`` are resampled to match (local
-    testing only — not used for a real training run).
+    indexes into these same lists. If ``cfg.target_shape`` is set, the operator
+    is built at that shape, matching the dataset's resampled inits and sinograms
+    (local testing only — not used for a real training run).
     """
     target_shape = getattr(cfg, "target_shape", None)
 
@@ -95,29 +93,24 @@ def build_tomography_physics(
         print(f"[physics] tomography backend: {backend}", flush=True)
 
     evn_path, odd_path = evn_paths[0], odd_paths[0]
-    physics_evn, init_evn = build_one_tomography_em(
+    physics_evn = build_one_tomography_em(
         evn_path.parent, "split1", evn_path, device, target_shape, n_ops, ctx, backend)
-    physics_odd, init_odd = build_one_tomography_em(
+    physics_odd = build_one_tomography_em(
         odd_path.parent, "split2", odd_path, device, target_shape, n_ops, ctx, backend)
 
-    # Shards are built unnormalised (a shard's own norm is not the operator's),
-    # then all rescaled by the measured global norm — leaving the assembled
-    # operator unit-norm, exactly as normalize=True leaves the unsharded one.
     if n_ops is not None:
         # build_one_tomography_em caps the shard count at the tilt count, so read
         # back what was actually built: TomographyEMPair.num_operators drives
         # split_sinogram (forward.py), which must match the operator exactly.
         requested, n_ops = n_ops, int(physics_evn.num_operators)
-        sq_evn = normalize_sharded(physics_evn, init_evn)
-        normalize_sharded(physics_odd, init_odd)
         if ctx.rank == 0:
             capped = f" (capped from {requested} by the tilt count)" if n_ops != requested else ""
             print(f"[physics] sharded into {n_ops} operator(s) over {ctx.inner_world_size} rank(s)"
-                  f"{capped}  ||A^T A||_2={sq_evn:.4g} -> normalised", flush=True)
+                  f"{capped}", flush=True)
 
     return TomographyEMPair(
         physics_evn=physics_evn, physics_odd=physics_odd,
-        init_evn=init_evn, init_odd=init_odd,
+        init_evn=None, init_odd=None,
         evn_paths=evn_paths, odd_paths=odd_paths, device=device, target_shape=target_shape,
         num_operators=n_ops, backend=backend, ctx=ctx,
     )

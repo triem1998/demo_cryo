@@ -268,8 +268,8 @@ def build_unrolled_model(cfg, physics: TomographyEMPair, ctx: DistributedContext
     trainable_params = (["stepsize"] + (["g_param"] if is_drunet else [])) if train_algo else []
 
     n_iter = int(cfg.n_iter)
-    # Both physics paths end up unit spectral norm — normalize=True when
-    # unsharded, normalize_sharded() when sharded — so init_stepsize is used
+    # Both physics paths end up unit spectral norm (cached_operator_norm),
+    # so init_stepsize is used
     # as-is either way, with no per-tomogram rescaling.
     # A sharded operator's A_adjoint spans ranks, so the data-fidelity gradient
     # needs the matching collective; a plain L2 would silently use only the

@@ -30,7 +30,7 @@ import numpy as np
 import torch
 from deepinv.distributed import DistributedContext
 
-from ..base_config import RunEIBaseConfig
+from ..base_config import RunEIBaseConfig, amp_dtype_from_str
 from ..dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders
 from ..models import build_distributed_denoiser
 from ..registry import get_preset
@@ -55,16 +55,19 @@ from ..utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_
 
 
 class _InferenceModel:
-    """Minimal shim so ``preset["forward"]`` (written for ``dinv.Trainer``)
-    can be called standalone, without a full Trainer instance."""
+    """Trainer-free shim for ``preset["forward"]`` / ``preset["recon"]``, in ``cfg.mixed_precision``."""
 
-    def __init__(self, model) -> None:
-        self.model = model
+    def __init__(self, model, amp_dtype=None) -> None:
+        self.model, self.amp_dtype = model, amp_dtype
+
+    def __call__(self, *args, **kwargs):
+        with torch.no_grad(), torch.autocast("cuda", dtype=self.amp_dtype or torch.float32,
+                                             enabled=self.amp_dtype is not None):
+            return self.model(*args, **kwargs)
 
     def model_inference(self, y, physics, x=None, train=False, **kwargs):
         self.model.eval()
-        with torch.no_grad():
-            return self.model(y, physics, **kwargs)
+        return self(y, physics, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +266,9 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
                 odd = odd.to(ctx.device)
 
                 if is_tomo:
-                    physics.update(tomo_idx=batch_params["tomo_idx"])
+                    physics.update(tomo_idx=batch_params["tomo_idx"],
+                                   init_evn=batch_params["init_evn"].to(ctx.device),
+                                   init_odd=batch_params["init_odd"].to(ctx.device))
                 else:
                     physics.update_parameters(
                         tilt_min=batch_params["tilt_min"],
@@ -278,9 +283,10 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
                             flush=True,
                         )
 
-                f_evn_t, f_odd_t = preset["forward"](_InferenceModel(model), evn, odd, physics, train=False)
+                shim = _InferenceModel(model, amp_dtype_from_str(cfg.mixed_precision))
+                f_evn_t, f_odd_t = preset["forward"](shim, evn, odd, physics, train=False)
                 with torch.no_grad():
-                    r_evn, r_odd = preset["recon"](model, physics, f_evn_t, f_odd_t)
+                    r_evn, r_odd = preset["recon"](shim, physics, f_evn_t, f_odd_t)
                 recon_t = 0.5 * (r_evn + r_odd)
 
                 if hasattr(ctx.device, "type") and ctx.device.type == "cuda":
