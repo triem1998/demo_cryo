@@ -166,15 +166,14 @@ def _sharded_worker(rank, port, n):
         physics.n_angles_total, physics.volume_shape = N_ANGLES, SHAPE
         full = make_op(ANGLES)
         torch.manual_seed(0)
-        x0, w_a = torch.randn(1, 1, *SHAPE), torch.randn(1, 1, SHAPE[0], N_ANGLES, SHAPE[2])
+        x0 = torch.randn(1, 1, *SHAPE)
         w_f = torch.randn(1, 1, *SHAPE)
 
-        def run(physics, x):   # loss touches A(x) and fbp(A(x)), so both backwards run
+        def run(physics, x):   # loss only through fbp(A(x)), as in EqLoss: hangs if an empty rank detaches
             y = physics.A(x)
             v = physics.fbp(y)
-            y = y if torch.is_tensor(y) else torch.cat(list(y), dim=3)
-            (w_a * y).sum().add((w_f * v).sum()).backward()
-            return y, v
+            (w_f * v).sum().backward()
+            return (y if torch.is_tensor(y) else torch.cat(list(y), dim=3)).detach(), v
 
         xs, xf = x0.clone().requires_grad_(), x0.clone().requires_grad_()
         ys, vs = run(physics, xs)

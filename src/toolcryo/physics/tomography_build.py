@@ -108,7 +108,8 @@ class ShardedTomography(DistributedStackedLinearPhysics):
         return self._map_reduce_gather(
             [y[i] - mean for i in self.local_indexes],
             lambda p, t, **kw: p.fbp_raw(t) * (p.n_angles / self.n_angles_total),
-            gather=gather, reduce_op=reduce_op, **kwargs)
+            # anchor on mean: an empty rank stays tied to y, so it joins A's backward collective
+            gather=gather, reduce_op=reduce_op, graph_anchor=mean, **kwargs)
 
 
 # ---------------------------------------------------------------------------
