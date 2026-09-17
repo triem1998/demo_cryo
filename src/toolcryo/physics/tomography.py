@@ -19,7 +19,7 @@ class TomographyEM(dinv.physics.LinearPhysics):
 
     Volumes are expected **already in astra's ``(n_slices, n_rows, n_cols)``
     order**, where ``n_slices`` is the rotation-invariant (tilt) axis — i.e.
-    ``(Y, Z, X)`` for this dataset's MRC files, which ``load_fbp_init``
+    ``(Y, Z, X)`` for this dataset's MRC files, which ``CryoEIFullDataset``
     produces directly. Reordering is done once at load time (a real numpy copy)
     rather than per call, so ``A``/``A_adjoint`` contain no ``permute``: a
     permute is a zero-copy stride relabel whose *backward* hands astra and NCCL

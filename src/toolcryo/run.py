@@ -394,6 +394,7 @@ def run_full(cfg: RunEIFullConfig) -> None:
         trainer._fsc_tomo_names  = [p.parent.name for p in fsc_ds.evn_paths]
         trainer._psnr_refs = [_find_psnr_ref(p.parent, cfg.psnr_ref_globs, rank)
                               for p in fsc_ds.evn_paths]
+        fsc_ds.psnr_ref_paths = trainer._psnr_refs if trainer._is_eval_writer else None
         trainer._fsc_split       = fsc_label
         trainer._save_fsc_curves = bool(cfg.save_fsc_curves)
 
