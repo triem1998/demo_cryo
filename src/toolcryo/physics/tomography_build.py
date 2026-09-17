@@ -24,9 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from deepinv.distributed.framework import DistributedStackedLinearPhysics
-from deepinv.distributed.framework.distributed_utils import DistributedGradientSync
 from deepinv.utils.tensorlist import TensorList
 
 from ..utils.utils import _read_mrc_vol_shape
@@ -98,39 +96,19 @@ class ShardedTomography(DistributedStackedLinearPhysics):
     shift-idempotent and so cannot be recovered shard by shard.
     """
 
-    def A(self, x, gather: bool = True, **kwargs):
-        """``A`` with one padded ``all_gather``: every shape is known from ``projection_splits``."""
-        if not (gather and self.ctx.use_dist) or kwargs:
-            return super().A(x, gather=gather, **kwargs)
-        if x.requires_grad:
-            x = DistributedGradientSync.apply(x, self.ctx)   # same input-grad sum as deepinv
-        splits = projection_splits(self.n_angles_total, self.num_operators)
-        w, n_max = self.ctx.inner_world_size, splits[0][1] - splits[0][0]
-        local = [F.pad(p.A(x), (0, 0, 0, n_max - p.n_angles)) for p in self.local_physics]
-        # zero rows tied to x: an empty rank then picks the same (autograd) collective
-        zero = (0 * x.reshape(-1)[0]).expand(
-            *x.shape[:2], self.volume_shape[0], n_max, self.volume_shape[2])
-        local += [zero] * (-(-self.num_operators // w) - len(local))
-        g = self.ctx.all_gather(torch.stack(local))   # (w, k_max, B, C, V, n_max, N)
-        return TensorList([g[i % w, i // w, ..., :e - s, :] for i, (s, e) in enumerate(splits)])
-
-    def fbp(self, y, gather: bool = True, **kwargs):
+    def fbp(self, y, gather: bool = True, reduce_op: str | None = "sum", **kwargs):
         if len(y) != self.num_operators:
             raise ValueError(
                 f"fbp needs the whole sinogram (all {self.num_operators} pieces, as "
                 f"returned by A(x)), got {len(y)}: the global DC mean cannot be formed "
                 f"from a subset, and centring per shard is not equivalent.")
-        # Every rank holds every piece (A gathers), so the global mean is local
-        # arithmetic — no collective. Summing first and dividing once is the plain
-        # definition of the mean; the A_i/A reweighting below is still needed
-        # because each shard's fbp_raw divides by its *own* angle count.
+        # Every rank holds every piece (A gathers): the global mean needs no collective.
         count = sum(t.shape[-3] * t.shape[-2] * t.shape[-1] for t in y)
         mean = sum(t.sum(dim=(-3, -2, -1), keepdim=True) for t in y) / count
-        out = sum(p.fbp_raw(y[i] - mean) * (p.n_angles / self.n_angles_total)
-                  for i, p in zip(self.local_indexes, self.local_physics))
-        if not torch.is_tensor(out):   # empty rank: zeros tied to y, same collective choice
-            out = (0 * mean).expand(*mean.shape[:2], *self.volume_shape).contiguous()
-        return self.ctx.all_reduce(out) if gather else out
+        return self._map_reduce_gather(
+            [y[i] - mean for i in self.local_indexes],
+            lambda p, t, **kw: p.fbp_raw(t) * (p.n_angles / self.n_angles_total),
+            gather=gather, reduce_op=reduce_op, **kwargs)
 
 
 # ---------------------------------------------------------------------------
