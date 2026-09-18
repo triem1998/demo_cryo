@@ -212,14 +212,18 @@ class BaseTrainer(dinv.Trainer):
     # ------------------------------------------------------------------
 
     def log_metrics_mlops(self, logs: dict, step: int, train: bool = True) -> None:  # type: ignore[override]
+        # Average the losses over ranks: with data-parallel replicas each rank
+        # sees a different subset, so its local value covers one replica only.
+        # Collective — every rank must reach it, before the rank0 return below.
+        names = [type(l).__name__ for l in self.losses] if len(self.losses) > 1 else []
+        keys = [k for k in names + ["TotalLoss"] if k in logs]
+        if torch.distributed.is_initialized() and keys:
+            t = torch.tensor([float(logs[k]) for k in keys], device=self.device)
+            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.AVG)
+            logs.update(zip(keys, t.tolist()))
+
         if train and self._plateau_scheduler is not None and "TotalLoss" in logs:
-            # All-reduce first: each rank has its own optimizer, and a per-rank
-            # local loss could trigger LR drops on different epochs per rank,
-            # desyncing the model replicas. Must run before the rank0 return below.
-            loss_t = torch.tensor(float(logs["TotalLoss"]), device=self.device)
-            if torch.distributed.is_initialized():
-                torch.distributed.all_reduce(loss_t, op=torch.distributed.ReduceOp.AVG)
-            self._plateau_scheduler.step(loss_t.item())
+            self._plateau_scheduler.step(float(logs["TotalLoss"]))
 
         if not self._is_rank0:
             return
