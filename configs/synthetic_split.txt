@@ -1,0 +1,34 @@
+# Synthetic split for make_synthetic_tomo.py --list.
+# <src relative to --src-root>  [<out name>]; the out name must start with tomo_
+# for _discover_pairs. 11058 is renamed: 11830 has its own tomo_004 / tomo_008.
+
+# train: similar volumes
+empiar-11830/tomo_030
+empiar-11830/tomo_038
+empiar-11830/tomo_043
+empiar-11830/tomo_057
+empiar-11830/tomo_068
+empiar-11830/tomo_102
+empiar-11830/tomo_105
+empiar-11830/tomo_132
+empiar-11830/tomo_214
+empiar-11830/tomo_218
+empiar-11830/tomo_222
+empiar-11830/tomo_310
+
+# test, easy: similar
+empiar-11830/tomo_125
+
+# test, hard: similar but difficult for DDW / IsoNet
+empiar-11830/tomo_213
+empiar-11830/tomo_232
+
+# test, OOD: different volumes
+empiar-11830/tomo_215
+empiar-11830/tomo_224
+empiar-11830/tomo_301
+empiar-11830/tomo_317
+# Excluded: 11058's split1/split2 are the even/odd tilts, not a dose split, so
+# the half-set noise estimate does not apply.
+# empiar-11058/tomo_004  tomo_11058_004
+# empiar-11058/tomo_008  tomo_11058_008

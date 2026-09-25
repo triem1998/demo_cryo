@@ -78,7 +78,7 @@ distributed:
   # Angle-sharded tomography physics (unrolled / tomo_ei only). null = one full
   # operator per rank, no collective (default); "auto" = one per rank; int = that
   # many. Capped at the tilt-angle count, so "auto" on 64 ranks builds 41.
-  num_operators: null
+  num_operators: auto
   # Tomography operator backend: auto | astra | torch | torch_exact. auto =
   # astra where its CUDA kernels can run, else the pure-torch operator (CPU /
   # AMD-ROCm capable). torch matches astra's adjoint; torch_exact is the true

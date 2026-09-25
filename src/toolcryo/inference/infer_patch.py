@@ -294,7 +294,7 @@ def _infer_one_volume(
         crop_size=int(cfg.crop_size), stride=stride,
         infer_batch_size=int(cfg.infer_batch_size),
         device=device, pre_pad=bool(cfg.pre_pad),
-        return_1pass=bool(cfg.save_recon_mrc),
+        return_1pass=True,
         amp_dtype=amp_dtype_from_str(cfg.mixed_precision),
     )
     print("  running inference on EVN ...", flush=True)
@@ -302,10 +302,8 @@ def _infer_one_volume(
     print("  running inference on ODD ...", flush=True)
     recon_odd = patch_inference(odd_vol, **infer_kw)
 
-    recon_evn_1 = recon_odd_1 = None
-    if cfg.save_recon_mrc:                      # patch_inference returned tuples
-        recon_evn, recon_evn_1 = recon_evn
-        recon_odd, recon_odd_1 = recon_odd
+    recon_evn, recon_evn_1 = recon_evn
+    recon_odd, recon_odd_1 = recon_odd
 
     recon_np = 0.5 * (recon_evn + recon_odd)
 

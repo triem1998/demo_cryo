@@ -127,10 +127,12 @@ class RunEIBaseConfig(BaseModel):
     # tried in order: a ground truth if the dataset ships one, else icecream.
     # The file actually picked is printed at startup and named in the
     # psnr_ref column, since PSNR against different references is not
-    # comparable. null (or an empty list) = no PSNR at all.
+    # comparable. null (or an empty list) = no PSNR at all. EMPIAR-11058
+    # ships its MRC volumes with a .tlt extension, hence the last entry.
     psnr_ref_globs: list[str] | None = ["vol*[Gg]round*[Tt]ruth*.mrc",
                                         "vol*_[Gg][Tt].mrc",
-                                        "vol*[Ii]cecream*.mrc"]
+                                        "vol*[Ii]cecream*.mrc",
+                                        "vol*[Ii]cecream*.tlt"]
 
     # ── Pretrained init ──────────────────────────────────────────────────────
     pretrained_ckpt: str | None = None
