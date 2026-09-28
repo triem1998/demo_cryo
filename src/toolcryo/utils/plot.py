@@ -48,8 +48,9 @@ def plot_metrics(run_dir: Path, save: Path | str | None = None) -> None:
         and "fsc" not in c.lower()
         and not train_df.empty
     ]
-    # Layout: [losses (total + components) | FSC or supervised PSNR | ref PSNR]
-    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
+    # Layout: [losses | FSC or supervised PSNR] / [ref PSNR | sharpness]
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+    axes = axes.flat
     fig.suptitle("Training summary", fontsize=13)
 
     # ── Train losses (total + components) in log scale ──────────────────────
@@ -120,7 +121,7 @@ def plot_metrics(run_dir: Path, save: Path | str | None = None) -> None:
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # ── PSNR against the reference volume, + the amplitude ratio ────────────
+    # ── PSNR against the reference volume ──────────────────────────────────
     ax = axes[2]
     have = [c for c in REF_PSNR if c in val_df.columns] if not val_df.empty else []
     if have:
@@ -129,17 +130,7 @@ def plot_metrics(run_dir: Path, save: Path | str | None = None) -> None:
             if col in have:
                 ax.plot(val_df["epoch"], val_df[col], style, color=color, label=col)
         ax.set_ylabel("PSNR (dB)  ↑ better")
-        ref = next((r for r in val_df.get("psnr_ref", []) if isinstance(r, str) and r), "")
-        ax.set_title(f"Val PSNR vs {ref or 'reference'}", fontsize=10)
-        if "std_ratio" in val_df.columns:
-            # PSNR z-normalises, so it cannot see the output amplitude drifting.
-            ax2 = ax.twinx()
-            ax2.plot(val_df["epoch"], val_df["std_ratio"], ":", color="crimson",
-                     linewidth=1.5, label="std_ratio")
-            ax2.axhline(1.0, color="crimson", alpha=0.25, linewidth=1)
-            ax2.set_ylabel("std(recon)/std(ref)", color="crimson")
-            ax2.tick_params(axis="y", labelcolor="crimson")
-            ax2.legend(loc="lower right", fontsize=8)
+        ax.set_title("Val PSNR vs GT (mean over volumes)")
     else:
         ax.text(0.5, 0.5, "No reference PSNR", ha="center", va="center",
                 transform=ax.transAxes, color="gray")
@@ -147,6 +138,18 @@ def plot_metrics(run_dir: Path, save: Path | str | None = None) -> None:
     ax.set_xlabel("Epoch")
     if have:
         ax.legend(loc="lower left", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    # ── SharpnessIndex: needs no reference, so it is there on real data too ─
+    ax = axes[3]
+    if not val_df.empty and "sharpness" in val_df.columns:
+        ax.plot(val_df["epoch"], val_df["sharpness"], "s-", color="slateblue")
+        ax.set_ylabel("SharpnessIndex  ↑ more structure")
+    else:
+        ax.text(0.5, 0.5, "No sharpness", ha="center", va="center",
+                transform=ax.transAxes, color="gray")
+    ax.set_title("Val sharpness (mean over volumes)")
+    ax.set_xlabel("Epoch")
     ax.grid(True, alpha=0.3)
 
     fig.tight_layout()

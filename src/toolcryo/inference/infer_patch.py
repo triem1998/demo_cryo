@@ -9,9 +9,10 @@ Matches icecream's inference_util.inference exactly:
 """
 from __future__ import annotations
 
-import csv
+import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -35,9 +36,10 @@ from ..utils.utils import (
     ensure_dir,
     load_mrc_volume,
     psnr,
+    sharpness_3d,
     seed_everything,
 )
-from ..utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
+from ..utils.plot import save_fsc_figure, save_slice_figure
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +67,7 @@ class RunEIPatchInferenceConfig(RunEIBaseConfig):
     isonet_glob: str = "vol_*[Ii]so[Nn]et*"
     isonet_fallback_glob: str = "vol_*DDW*"
     # Ground truth, when the dataset ships one (dataset/synthetic). Scored by
-    # PSNR into fsc.csv, not just drawn — the point of a synthetic tomogram.
+    # PSNR into fsc_rank*.csv, not just drawn — the point of a synthetic tomogram.
     gt_glob: str = "vol_*_[Gg][Tt].mrc"
 
     # ── Output ───────────────────────────────────────────────────────────────
@@ -238,158 +240,6 @@ def _find_gt(tomo_dir: Path, glob: str, shape) -> tuple[np.ndarray | None, str]:
 
 
 # ---------------------------------------------------------------------------
-# Per-volume inference  (function scope = automatic memory cleanup on return)
-# ---------------------------------------------------------------------------
-
-def _infer_one_volume(
-    vol_idx: int,
-    evn_path: Path,
-    odd_path: Path | None,
-    tilt_range: tuple[float, float] | None,
-    model: nn.Module,
-    cfg: RunEIPatchInferenceConfig,
-    device: torch.device,
-    stride: int,
-    images_dir: Path,
-    infer_downsample: int = 1,
-    metrics_dir: Path | None = None,
-    checkpoint: str = "",
-) -> dict:
-    tomo_dir  = evn_path.parent
-    tomo_name = tomo_dir.name
-    tilt_min, tilt_max = tilt_range if tilt_range is not None else (cfg.tilt_min, cfg.tilt_max)
-
-    print(
-        f"[patch-infer] vol{vol_idx:02d} ({tomo_name})  tilt=[{tilt_min:.1f}, {tilt_max:.1f}]°",
-        flush=True,
-    )
-
-    physics = MissingWedge(
-        tilt_max=float(tilt_max), tilt_min=float(tilt_min),
-        crop_size=int(cfg.crop_size),
-        use_spherical_support=bool(cfg.use_spherical_support),
-        wedge_double_size=bool(cfg.wedge_double_size),
-        wedge_low_support=float(cfg.wedge_low_support),
-        ref_wedge_support=float(cfg.ref_wedge_support),
-        device="cpu",
-    )
-    wedge_input = _symmetrize_and_binarize(physics.mask[:-1, :-1, :-1]).cpu()
-
-    evn_vol = _load_vol_normalized(evn_path, cfg.normalize)
-    odd_vol = _load_vol_normalized(odd_path, cfg.normalize) if odd_path is not None else evn_vol
-
-    if infer_downsample > 1:
-        evn_vol = torch.nn.functional.avg_pool3d(
-            evn_vol.unsqueeze(0).unsqueeze(0).float(),
-            kernel_size=infer_downsample, stride=infer_downsample,
-        ).squeeze()
-        odd_vol = torch.nn.functional.avg_pool3d(
-            odd_vol.unsqueeze(0).unsqueeze(0).float(),
-            kernel_size=infer_downsample, stride=infer_downsample,
-        ).squeeze()
-        print(f"  downsampled ×{infer_downsample} → {tuple(evn_vol.shape)}", flush=True)
-
-    infer_kw = dict(
-        model=model, wedge=wedge_input,
-        crop_size=int(cfg.crop_size), stride=stride,
-        infer_batch_size=int(cfg.infer_batch_size),
-        device=device, pre_pad=bool(cfg.pre_pad),
-        return_1pass=True,
-        amp_dtype=amp_dtype_from_str(cfg.mixed_precision),
-    )
-    print("  running inference on EVN ...", flush=True)
-    recon_evn = patch_inference(evn_vol, **infer_kw)
-    print("  running inference on ODD ...", flush=True)
-    recon_odd = patch_inference(odd_vol, **infer_kw)
-
-    recon_evn, recon_evn_1 = recon_evn
-    recon_odd, recon_odd_1 = recon_odd
-
-    recon_np = 0.5 * (recon_evn + recon_odd)
-
-    # FSC between half-reconstructions
-    evn_t = torch.from_numpy(recon_evn).unsqueeze(0).unsqueeze(0).to(device)
-    odd_t = torch.from_numpy(recon_odd).unsqueeze(0).unsqueeze(0).to(device)
-    fsc_curve = GpuFSC(device=device)(evn_t, odd_t)
-    px  = _read_pixel_sizes([evn_path], cfg.pixel_size_angstrom)[0]
-    k, res, D = fsc_resolution(fsc_curve, recon_evn.shape, px, cfg.fsc_threshold)
-    fsc_str = f"FSC@{cfg.fsc_threshold}={res:.1f} Å (shell {k})"
-    print(f"  {fsc_str}", flush=True)
-
-    # Loaded before the row is written, not with the other comparison volumes
-    # below, because its PSNR goes into that row.
-    gt_np, gt_name = _find_gt(tomo_dir, cfg.gt_glob, recon_np.shape)
-    psnr_gt = psnr(recon_np, gt_np) if gt_np is not None else ""
-    psnr_1p = (psnr(0.5 * (recon_evn_1 + recon_odd_1), gt_np)
-               if gt_np is not None and recon_evn_1 is not None else "")
-    if gt_np is not None:
-        print(f"  PSNR vs {gt_name} = {psnr_gt:.2f} dB", flush=True)
-
-    if metrics_dir is not None:
-        append_fsc_row(metrics_dir / "fsc.csv",
-                       curve=fsc_curve if cfg.save_fsc_curves else None,
-                       mode="inference", regime="patch", split="val",
-                       checkpoint=checkpoint, vol_idx=vol_idx, tomo=tomo_name,
-                       pixel_size=float(px), n_ref=D,
-                       fsc_threshold=cfg.fsc_threshold,
-                       fsc_shell=int(k), fsc_res_angstrom=float(res),
-                       psnr_gt=psnr_gt, psnr_1pass_gt=psnr_1p, psnr_ref=gt_name)
-
-    evn_np      = evn_vol.numpy()
-    odd_np      = odd_vol.numpy()
-    isonet_np   = _load_comparison(_find_mrc(tomo_dir, cfg.isonet_glob, cfg.isonet_fallback_glob))
-    icecream_np = _load_comparison(_find_mrc(tomo_dir, cfg.icecream_glob))
-
-    # save_slice_figure shares one vmin/vmax across every column, so they must be
-    # on a common scale: the raw model output has a far smaller std than the
-    # on-disk volumes and would otherwise render as flat grey.
-    # Column order matches full inference / training: EVN, ODD, comparisons, ours last.
-    cols   = [_znorm(evn_np), _znorm(odd_np)]
-    labels = ["EVN", "ODD"]
-    if isonet_np is not None:
-        cols.append(_znorm(isonet_np))
-        labels.append("IsoNet")
-    if icecream_np is not None:
-        cols.append(_znorm(icecream_np))
-        labels.append("IceCream")
-    if gt_np is not None:
-        cols.append(_znorm(gt_np))
-        labels.append("GT")
-    cols.append(_znorm(recon_np))
-    labels.append("ours")
-
-    save_slice_figure(
-        images_dir, epoch=0, vol_idx=vol_idx,
-        cols=cols, labels=labels,
-        title=f"{tomo_name} | method comparison | {fsc_str}",
-        subdir=".", fname=f"{tomo_name}_methods.png",
-    )
-
-    save_fsc_figure(
-        images_dir, epoch=0, fname=f"{tomo_name}_fsc.png",
-        fsc_curve=fsc_curve, res_shell=k, res_angstrom=res,
-        title=f"{tomo_name} | FSC {res:.1f} Å",
-        threshold=cfg.fsc_threshold, vol_size=D, pixel_size=px,
-    )
-
-    if cfg.save_recon_mrc:
-        mrc_path = images_dir / f"{tomo_name}_recon.mrc"
-        _save_mrc(mrc_path, recon_np)
-        print(f"  saved {mrc_path.name}", flush=True)
-
-        # The 1-pass f(.), matching what infer_full writes for the full path.
-        p1 = images_dir / f"{tomo_name}_recon_1pass.mrc"
-        _save_mrc(p1, 0.5 * (recon_evn_1 + recon_odd_1))
-        print(f"  saved {p1.name}", flush=True)
-
-    return {
-        "vol_idx": vol_idx, "tomo": tomo_name,
-        "fsc_shell": int(k), "fsc_res_angstrom": float(res), "pixel_size": float(px),
-        "psnr_gt": psnr_gt, "psnr_1pass_gt": psnr_1p, "psnr_ref": gt_name,
-    }
-
-
-# ---------------------------------------------------------------------------
 # Post-training inference  (called from run_patch after training)
 # ---------------------------------------------------------------------------
 
@@ -416,9 +266,12 @@ def run_post_training_inference(
     save_mrc: bool = False,
     save_fsc_curves: bool = True,
     amp_dtype: torch.dtype | None = None,
+    checkpoint: str = "",
+    mode: str = "train",
 ) -> None:
-    """Sliding-window EVN+ODD inference over (train, val) datasets post-training.
+    """Sliding-window EVN+ODD inference over (train, val) datasets.
 
+    Called post-training and, once per checkpoint, by standalone ``run_inference``.
     Distributes volumes across DDP ranks: each rank processes every world_size-th volume.
     """
     rank       = int(ctx.rank)
@@ -426,7 +279,7 @@ def run_post_training_inference(
     device     = ctx.device
 
     wedge_cpu  = _symmetrize_and_binarize(physics.mask[:-1, :-1, :-1]).cpu()
-    images_dir = ensure_dir(output_dir / "inference_images")
+    images_dir = ensure_dir(output_dir / "inference_images" / checkpoint)
     recon_dir  = ensure_dir(output_dir / "reconstructions") if save_mrc else None
     _gpu_fsc   = GpuFSC(device=device)
     raw_model.eval()
@@ -476,7 +329,8 @@ def run_post_training_inference(
 
             infer_kw = dict(model=raw_model, wedge=wedge_i, crop_size=crop_size,
                             stride=stride, infer_batch_size=infer_batch_size,
-                            device=device, pre_pad=True, amp_dtype=amp_dtype)
+                            device=device, pre_pad=True, amp_dtype=amp_dtype,
+                            return_1pass=True)
 
             t0 = time.perf_counter()
             print(f"  [{tomo_name}] EVN inference ...", flush=True)
@@ -490,7 +344,10 @@ def run_post_training_inference(
             print(f"  [{tomo_name}] done  EVN={t_evn:.1f}s  ODD={t_odd:.1f}s  "
                   f"total={t_evn+t_odd:.1f}s", flush=True)
 
-            recon = 0.5 * (recon_evn + recon_odd)
+            (recon_evn, recon_evn_1), (recon_odd, recon_odd_1) = recon_evn, recon_odd
+            recon   = 0.5 * (recon_evn + recon_odd)
+            recon_1 = 0.5 * (recon_evn_1 + recon_odd_1)
+            del recon_evn_1, recon_odd_1
 
             recon_evn_t = torch.from_numpy(recon_evn).to(device)
             recon_odd_t = torch.from_numpy(recon_odd).to(device)
@@ -503,21 +360,24 @@ def run_post_training_inference(
             fsc_str = f"FSC@{fsc_threshold}={res_i:.1f} Å (shell {k_i})"
             print(f"  [{tomo_name}] {fsc_str}", flush=True)
 
-            # Before the row is written, since its PSNR goes into that row. No
-            # 1-pass here: this path runs the two-pass recon only.
+            # Before the row is written, since its PSNR goes into that row.
             gt_np, gt_name = _find_gt(ds.evn_paths[i].parent, gt_glob, recon.shape)
             psnr_gt = psnr(recon, gt_np) if gt_np is not None else ""
+            psnr_1p = psnr(recon_1, gt_np) if gt_np is not None else ""
+            del recon_1
             if gt_np is not None:
                 print(f"  [{tomo_name}] PSNR vs {gt_name} = {psnr_gt:.2f} dB", flush=True)
 
             # Volumes are sharded across ranks, so each rank writes its own file.
             append_fsc_row(output_dir / "metrics" / f"fsc_rank{rank}.csv",
                            curve=fsc_curve_i if save_fsc_curves else None,
-                           mode="train", regime="patch", split=split_label,
+                           mode=mode, regime="patch", split=split_label,
+                           checkpoint=checkpoint,
                            vol_idx=i, tomo=tomo_name, pixel_size=px_i, n_ref=D_i,
                            fsc_threshold=fsc_threshold,
                            fsc_shell=int(k_i), fsc_res_angstrom=float(res_i),
-                           psnr_gt=psnr_gt, psnr_ref=gt_name)
+                           psnr_gt=psnr_gt, psnr_1pass_gt=psnr_1p, psnr_ref=gt_name,
+                           sharpness=sharpness_3d(torch.from_numpy(recon).to(device)))
 
             save_fsc_figure(
                 images_dir, epoch=0,
@@ -584,8 +444,20 @@ def run_post_training_inference(
 def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
     seed_everything(int(cfg.seed))
 
+    # No process group: each rank takes every world_size-th volume and writes
+    # its own fsc_rank{r}.csv. submitit exports these; unset = single GPU.
+    rank, local_rank = int(os.environ.get("RANK", 0)), int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
+    ctx = SimpleNamespace(rank=rank, world_size=world_size, device=device)
+
     output_dir = ensure_dir(cfg.output_dir)
-    dump_config_json(output_dir / "config.json", cfg.model_dump())
+    if rank == 0:
+        dump_config_json(output_dir / "config.json", cfg.model_dump())
 
     if not cfg.checkpoint_paths:
         raise ValueError("checkpoint_paths must be set.")
@@ -597,11 +469,10 @@ def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
             flush=True,
         )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[patch-infer] device={device}", flush=True)
+    print(f"[patch-infer] rank {rank}/{world_size}  device={device}", flush=True)
 
     # Only the dataset's path lists are used below; the DataLoader is never
-    # iterated (volumes are read directly in _infer_one_volume), so the
+    # iterated (volumes are read in run_post_training_inference), so the
     # DataLoader knobs are left at their defaults.
     data_cfg = EIPatchDataConfig(
         input_dir=cfg.input_dir,
@@ -629,12 +500,17 @@ def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
     )
 
     stride = int(cfg.stride) if cfg.stride > 0 else cfg.crop_size // 2
+    physics = MissingWedge(
+        tilt_max=float(cfg.tilt_max), tilt_min=float(cfg.tilt_min),
+        crop_size=int(cfg.crop_size),
+        use_spherical_support=bool(cfg.use_spherical_support),
+        wedge_double_size=bool(cfg.wedge_double_size),
+        wedge_low_support=float(cfg.wedge_low_support),
+        ref_wedge_support=float(cfg.ref_wedge_support),
+        device="cpu",
+    )
 
-    rows = []
     for ckpt_path in cfg.checkpoint_paths:
-        ckpt_name = Path(ckpt_path).stem
-        images_dir = ensure_dir(output_dir / "inference_images" / ckpt_name)
-
         # map to CPU: the file also carries optimizer state (~2x the weights) that
         # inference never uses, and load_state_dict copies CPU->GPU params directly.
         ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
@@ -647,54 +523,35 @@ def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
         model.eval()
         del ckpt, state
 
-        print(
-            f"\n[patch-infer] loaded {Path(ckpt_path).name}  "
-            f"model={model_info}  params={sum(p.numel() for p in model.parameters()):,}",
-            flush=True,
-        )
-
-        results = []
-        for vol_idx in range(len(val_ds.evn_paths)):
-            result = _infer_one_volume(
-                vol_idx,
-                val_ds.evn_paths[vol_idx],
-                val_ds.odd_paths[vol_idx],
-                val_ds._tilt_ranges[vol_idx],
-                model, cfg, device, stride, images_dir,
-                infer_downsample=int(cfg.infer_downsample),
-                metrics_dir=output_dir / "metrics", checkpoint=ckpt_name,
-            )
-            results.append(result)
-            rows.append({"checkpoint": ckpt_name, **result})
-            torch.cuda.empty_cache()
-
-        resolutions = [r["fsc_res_angstrom"] for r in results]
-        if resolutions:
-            res_arr = np.array(resolutions)
-            mean_res, median_res = float(np.mean(res_arr)), float(np.median(res_arr))
-            q1_res, q3_res = float(np.percentile(res_arr, 25)), float(np.percentile(res_arr, 75))
-
-            save_resolution_histogram(
-                images_dir, epoch=0, resolutions_angstrom=resolutions,
-                mean_res=mean_res, median_res=median_res,
-                q1_res=q1_res, q3_res=q3_res,
-                threshold_label=str(cfg.fsc_threshold),
-            )
+        if ctx.rank == 0:
             print(
-                f"[patch-infer] {ckpt_name}  n={len(resolutions)}  "
-                f"mean={mean_res:.1f} Å  median={median_res:.1f} Å  (lower=better)",
+                f"\n[patch-infer] loaded {Path(ckpt_path).name}  "
+                f"model={model_info}  params={sum(p.numel() for p in model.parameters()):,}",
                 flush=True,
             )
 
-    if rows:
-        csv_path = output_dir / "results.csv"
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-            writer.writeheader()
-            writer.writerows(rows)
-
-        print(
-            f"\n[patch-infer] DONE  {len(cfg.checkpoint_paths)} checkpoint(s)  "
-            f"{len(rows)} row(s) -> {csv_path}",
-            flush=True,
+        run_post_training_inference(
+            [("val", val_ds)], model, physics, ctx, output_dir,
+            crop_size=int(cfg.crop_size),
+            stride=stride,
+            infer_batch_size=int(cfg.infer_batch_size),
+            infer_downsample=int(cfg.infer_downsample),
+            tilt_min=float(cfg.tilt_min),
+            tilt_max=float(cfg.tilt_max),
+            use_spherical_support=bool(cfg.use_spherical_support),
+            wedge_double_size=bool(cfg.wedge_double_size),
+            wedge_low_support=float(cfg.wedge_low_support),
+            ref_wedge_support=float(cfg.ref_wedge_support),
+            fsc_threshold=float(cfg.fsc_threshold),
+            pixel_size_angstrom=cfg.pixel_size_angstrom,
+            gt_glob=cfg.gt_glob,
+            save_mrc=bool(cfg.save_recon_mrc),
+            save_fsc_curves=bool(cfg.save_fsc_curves),
+            amp_dtype=amp_dtype_from_str(cfg.mixed_precision),
+            checkpoint=Path(ckpt_path).stem,
+            mode="inference",
         )
+
+    if ctx.rank == 0:
+        print(f"\n[patch-infer] DONE  {len(cfg.checkpoint_paths)} checkpoint(s) -> "
+              f"{output_dir / 'metrics'}/fsc_rank*.csv", flush=True)

@@ -21,7 +21,7 @@ from .forward import ei_denoiser_forward
 from .utils.plot import save_fsc_figure, save_resolution_histogram, save_slice_figure
 from .utils.utils import (
     GpuFSC, PerfProbe, append_fsc_row, append_metrics_row, denoise_patches, fsc_resolution, half_set_recon,
-    psnr_zn, recon_panels, to_canonical_np,
+    psnr_zn, recon_panels, sharpness_3d, to_canonical_np,
 )
 
 
@@ -436,7 +436,7 @@ class EIFullTrainer(BaseTrainer):
                 print(f"[physics] {name}  tilt=[{_p._tilt_min:.1f}, {_p._tilt_max:.1f}]°", flush=True)
             if self._is_eval_writer:
                 self._val_records.append(dict(
-                    vol_idx=vol_idx, res=float(res), psnr=psnr_rec,
+                    vol_idx=vol_idx, res=float(res), psnr=psnr_rec, sharp=sharpness_3d(recon_2),
                     row=dict(curve=fsc_curve if self._save_fsc_curves else None,
                              curve_1pass=fsc_curve_1 if self._save_fsc_curves else None,
                              mode="train", regime="full", split=self._fsc_split,
@@ -506,9 +506,17 @@ class EIFullTrainer(BaseTrainer):
             recs = sorted(self._gather_val_records(), key=lambda r: r["vol_idx"])
             self._val_resolutions = [r["res"] for r in recs]
             self._val_psnr = [r["psnr"] for r in recs if r["psnr"] is not None]
+            if recs:
+                logs.update(sharpness=float(np.mean([r["sharp"] for r in recs])))
             if self._is_rank0 and self._metrics_dir is not None:
                 for r in recs:
                     append_fsc_row(self._metrics_dir / "fsc_per_volume.csv", **r["row"])
+                    # One row per (epoch, volume); PSNR fields blank without a GT.
+                    p, ref = r["psnr"] or (None, "", ""), self._psnr_refs[r["vol_idx"]]
+                    append_metrics_row(self._metrics_dir / "quality_per_volume.csv", dict(
+                        epoch=r["row"]["epoch"], vol_idx=r["vol_idx"], tomo=r["row"]["tomo"],
+                        psnr_1pass="" if p[0] is None else p[0], psnr_2pass=p[1], std_ratio=p[2],
+                        sharpness=r["sharp"], psnr_ref=ref.name if ref else ""))
 
         if not train and self._val_resolutions:
             res_arr    = np.array(self._val_resolutions)
@@ -534,8 +542,7 @@ class EIFullTrainer(BaseTrainer):
             p1 = [v[0] for v in self._val_psnr if v[0] is not None]
             logs.update(psnr_2pass=float(np.mean([v[1] for v in self._val_psnr])),
                         std_ratio=float(np.mean([v[2] for v in self._val_psnr])),
-                        psnr_ref=(self._psnr_refs[0].name if self._psnr_refs
-                                  and self._psnr_refs[0] else ""))
+                        psnr_ref="per-volume GT, see quality_per_volume.csv")
             if p1:
                 logs.update(psnr_1pass=float(np.mean(p1)))
             if self.verbose:

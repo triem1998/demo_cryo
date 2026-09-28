@@ -87,11 +87,10 @@ class MissingWedge(dinv.physics.LinearPhysics):
         self._tilt_min = float(tilt_min)
         self._tilt_max = float(tilt_max)
 
-        # Small cache of built (mask, mask_ref) pairs keyed by (shape, tilt_min,
-        # tilt_max) — bounds memory to a couple of entries (e.g. the training
-        # crop shape and the full-volume eval shape) instead of growing per
-        # distinct tilt range/volume seen over a run.
+        # Cache of built (mask, mask_ref) pairs keyed by (shape, tilt_min, tilt_max).
+        # Sized to hold one entry per training tilt range, so mixed batches reuse them.
         self._mask_cache: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.mask_batch = self.mask_ref_batch = self.batch_ranges = None
 
         mask, mask_ref = self._get_or_build_masks(
             self._volume_shape, tilt_max, tilt_min, torch.device(device))
@@ -108,7 +107,7 @@ class MissingWedge(dinv.physics.LinearPhysics):
             return cached
         masks = self._build_masks(volume_shape, tilt_max, tilt_min, device)
         self._mask_cache[key] = masks
-        if len(self._mask_cache) > 2:
+        if len(self._mask_cache) > 16:
             del self._mask_cache[next(iter(self._mask_cache))]
         return masks
 
@@ -212,31 +211,34 @@ class MissingWedge(dinv.physics.LinearPhysics):
         the loss is computed — this is how full-volume eval (whole tomogram,
         no crop) switches the wedge shape without a second physics object.
 
-        With batch_size > 1 (patch training), the DataLoader collates scalar tensors
-        into shape (B,). All patches in a batch share one physics, so we reduce to a
-        scalar by taking the *intersection* of the per-sample tilt ranges (max of
-        tilt_min, min of tilt_max) — the widest cone contained in every sample's own
-        wedge. This guarantees the shared wedge never marks a frequency "measured"
-        that some sample in the batch never actually measured; averaging or taking
-        the union would leak in frequencies with no data for at least one sample,
-        producing a wrong training signal (verified in scripts/test_wedge_aggregation.py).
+        With batch_size > 1 the tilt ranges arrive as (B,) tensors. If they differ
+        (mix_volumes), ``mask_batch`` / ``mask_ref_batch`` hold each crop's exact
+        wedge, stacked; otherwise they are None and ``mask`` is the shared wedge.
         """
         self.psnr_ref = psnr_ref
         if tomo_idx is not None:
             self._tomo_idx = int(tomo_idx.flatten()[0]) if hasattr(tomo_idx, "numel") else int(tomo_idx)
-        if tilt_min is not None and tilt_max is not None:
-            if hasattr(tilt_min, "numel") and tilt_min.numel() > 1:
-                tilt_min = tilt_min.float().max()
-                tilt_max = tilt_max.float().min()
-            tilt_min, tilt_max = float(tilt_min), float(tilt_max)
-        else:
-            tilt_min, tilt_max = self._tilt_min, self._tilt_max
 
         volume_shape = self._volume_shape
         if vol_shape is not None:
             if hasattr(vol_shape, "reshape"):  # (3,) or batch-of-1 (1, 3) tensor
                 vol_shape = vol_shape.reshape(-1).tolist()
             volume_shape = tuple(int(v) for v in vol_shape)
+
+        self.mask_batch = self.mask_ref_batch = self.batch_ranges = None
+        if tilt_min is not None and tilt_max is not None:
+            if hasattr(tilt_min, "numel") and tilt_min.numel() > 1:
+                ranges = list(zip(tilt_min.float().tolist(), tilt_max.float().tolist()))
+                if len(set(ranges)) > 1:
+                    masks = [self._get_or_build_masks(volume_shape, hi, lo, self.mask.device)
+                             for lo, hi in ranges]
+                    self.mask_batch = torch.stack([m for m, _ in masks])
+                    self.mask_ref_batch = torch.stack([r for _, r in masks])
+                    self.batch_ranges = ranges
+                tilt_min, tilt_max = ranges[0]
+            tilt_min, tilt_max = float(tilt_min), float(tilt_max)
+        else:
+            tilt_min, tilt_max = self._tilt_min, self._tilt_max
 
         self.update_angles(tilt_min, tilt_max, volume_shape)
 
