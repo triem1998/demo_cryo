@@ -49,8 +49,8 @@ class EIPatchDataConfig:
     batch_size: int = 4
     # False = icecream's convention: every optimizer step draws its crops from a
     # single volume, so the step uses that volume's exact wedge. True (default)
-    # lets a batch mix volumes, and the shared wedge becomes the intersection of
-    # their tilt ranges (see MissingWedge.update_parameters).
+    # lets a batch mix volumes; each crop still uses its own exact wedge
+    # (see MissingWedge.update_parameters).
     mix_volumes: bool = True
     num_workers: int = 1
     pin_memory: bool = True

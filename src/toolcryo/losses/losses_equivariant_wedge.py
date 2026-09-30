@@ -31,6 +31,7 @@ from ..icecream_orig.utils.utils import (
     fourier_loss as _ic_fourier_loss,
     fourier_loss_batch as _ic_fourier_loss_batch,
     get_measurement as _ic_get_measurement,
+    get_measurement_multi_wedge as _ic_get_measurement_multi_wedge,
 )
 
 
@@ -99,12 +100,13 @@ def _apply_wedge(x: torch.Tensor, wedge: torch.Tensor) -> torch.Tensor:
     Handles (B, C, D, H, W) by reshaping to (B*C, D, H, W) and restoring shape.
 
     :param x:     (B, [C,] D, H, W)
-    :param wedge: (M, M, M)
+    :param wedge: (M, M, M), or (B, M, M, M) for one wedge per sample
     :return: same shape as x
     """
     shape = x.shape
     x_4d = x.reshape(-1, *shape[-3:])
-    out = _ic_get_measurement(x_4d, wedge)
+    measure = _ic_get_measurement if wedge.dim() == 3 else _ic_get_measurement_multi_wedge
+    out = measure(x_4d, wedge)
     return out.reshape(*shape[:-3], *out.shape[-3:])
 
 
@@ -115,10 +117,17 @@ def _apply_wedge(x: torch.Tensor, wedge: torch.Tensor) -> torch.Tensor:
 def _symmetrize_and_binarize(w: torch.Tensor) -> torch.Tensor:
     """Matches icecream's get_real_binary_filter: symmetrize_3D + average + binarize."""
     from ..icecream_orig.utils.utils import symmetrize_3D
+    if w.dim() == 4:  # one wedge per sample
+        return torch.stack([_symmetrize_and_binarize(wi) for wi in w])
     w_sym = symmetrize_3D(w)
     w = (w + w_sym) / 2.0
     w[w > 0.1] = 1.0
     return w
+
+
+def _mask_full(physics) -> torch.Tensor:
+    """Per-crop (B, M+1, M+1, M+1) masks for a mixed batch, else the shared one."""
+    return physics.mask if physics.mask_batch is None else physics.mask_batch
 
 
 def _rotate_wedge(wedge: torch.Tensor, kx: int, ky: int, kz: int, axis: int) -> torch.Tensor:
@@ -163,8 +172,9 @@ class ObsLoss(Loss):
 
     @property
     def _wedge_input(self) -> torch.Tensor:
-        """(mask_size)³ wedge — matches icecream's get_real_binary_filter(wedge_full[:-1,:-1,:-1])."""
-        return _symmetrize_and_binarize(self._physics.mask[:-1, :-1, :-1])
+        """(mask_size)³ wedge, or (B, ...) per crop for a mixed batch — matches
+        icecream's get_real_binary_filter(wedge_full[:-1,:-1,:-1])."""
+        return _symmetrize_and_binarize(_mask_full(self._physics)[..., :-1, :-1, :-1])
 
     @property
     def _window(self) -> torch.Tensor | None:
@@ -191,11 +201,12 @@ class ObsLoss(Loss):
         if est_odd is None:
             est_odd = model(y)
 
+        fourier_loss = _fourier_loss if wedge.dim() == 3 else _fourier_loss_batch
         loss = (
-            _fourier_loss(y, est_evn, wedge, self._criteria, window=window,
-                          use_fourier=self.use_fourier, view_as_real=self.view_as_real)
-            + _fourier_loss(x, est_odd, wedge, self._criteria, window=window,
-                            use_fourier=self.use_fourier, view_as_real=self.view_as_real)
+            fourier_loss(y, est_evn, wedge, self._criteria, window=window,
+                         use_fourier=self.use_fourier, view_as_real=self.view_as_real)
+            + fourier_loss(x, est_odd, wedge, self._criteria, window=window,
+                           use_fourier=self.use_fourier, view_as_real=self.view_as_real)
         )
         return self.weight * loss
 
@@ -240,15 +251,17 @@ class EqLoss(Loss):
         self._criteria     = nn.MSELoss(reduction="mean")
         self._min_distance = min_distance
         self._valid_k_sets = self._compute_valid_k_sets(min_distance)
+        self._k_cache: dict[tuple, list[int]] = {}   # tilt range -> valid k (mixed batches)
 
-    def _compute_valid_k_sets(self, min_distance: float) -> list[int]:
+    def _compute_valid_k_sets(self, min_distance: float, wedge=None) -> list[int]:
         """Return indices into ``Rotate3D._KSET`` where the rotated wedge differs
         from the original by ``distance > min_distance``.
 
         Mirrors icecream's ``generate_all_cube_symmetries_torch`` filter.
         Volumes are always cubic so all 40 rotations are shape-preserving.
+        ``wedge`` defaults to the shared ``physics.mask``.
         """
-        wedge = self._physics.mask[:-1, :-1, :-1].float()
+        wedge = (self._physics.mask if wedge is None else wedge)[:-1, :-1, :-1].float()
         norm_w = torch.linalg.norm(wedge)
         valid = []
         for i, (kx, ky, kz, axis) in enumerate(Rotate3D._KSET):
@@ -258,20 +271,22 @@ class EqLoss(Loss):
                 valid.append(i)
         return valid if valid else list(range(len(Rotate3D._KSET)))
 
+    # The three wedges below are (B, ...) per crop for a mixed batch.
     @property
     def _wedge_full(self) -> torch.Tensor:
         """Full (mask_size)³ wedge — used for rotation."""
-        return self._physics.mask
+        return _mask_full(self._physics)
 
     @property
     def _wedge_input(self) -> torch.Tensor:
         """(mask_size)³ wedge — matches icecream's get_real_binary_filter(wedge_full[:-1,:-1,:-1])."""
-        return _symmetrize_and_binarize(self._physics.mask[:-1, :-1, :-1])
+        return _symmetrize_and_binarize(self._wedge_full[..., :-1, :-1, :-1])
 
     @property
     def _wedge_ref(self) -> torch.Tensor:
         """(D,H,W) wedge at native volume resolution — matches icecream's ``wedge_ref`` for A_ref."""
-        return self._physics.mask_ref
+        p = self._physics
+        return p.mask_ref if p.mask_ref_batch is None else p.mask_ref_batch
 
     @property
     def _window(self) -> torch.Tensor | None:
@@ -299,7 +314,8 @@ class EqLoss(Loss):
         w_batch = []
         for i in range(k_indices.shape[0]):
             kx, ky, kz, axis = Rotate3D._KSET[int(k_indices[i].item())]
-            w_rot = _rotate_wedge(wedge_full, kx, ky, kz, axis)
+            w = wedge_full if wedge_full.dim() == 3 else wedge_full[i]
+            w_rot = _rotate_wedge(w, kx, ky, kz, axis)
             w_rot = w_rot[:-1, :-1, :-1]
             w_rot = _symmetrize_and_binarize(w_rot)
             w_batch.append(w_rot)
@@ -358,22 +374,33 @@ class EqLoss(Loss):
         model: nn.Module,
         **kwargs,
     ) -> torch.Tensor:
-        # Lazily refresh rotation-index cache when physics angles change.
-        current_key = getattr(physics, "tilt_key", None)
-        if current_key != getattr(self, "_last_tilt_key", None):
-            self._valid_k_sets = self._compute_valid_k_sets(self._min_distance)
-            self._last_tilt_key = current_key
-
         wedge_full  = self._wedge_full.to(x.device)
         wedge_ref   = self._wedge_ref.to(x.device)
         wedge_input = self._wedge_input.to(x.device)
         _w = self._window
         window      = _w.to(x.device) if _w is not None else None
 
-        pool = self._valid_k_sets
-        bsz = x.shape[0]
-        rand_idx = torch.randint(len(pool), (bsz,), device=x.device)
-        k_indices = torch.tensor([pool[int(i.item())] for i in rand_idx], device=x.device)
+        ranges = self._physics.batch_ranges
+        if ranges is None:
+            # Lazily refresh rotation-index cache when physics angles change.
+            current_key = getattr(physics, "tilt_key", None)
+            if current_key != getattr(self, "_last_tilt_key", None):
+                self._valid_k_sets = self._compute_valid_k_sets(self._min_distance)
+                self._last_tilt_key = current_key
+
+            pool = self._valid_k_sets
+            bsz = x.shape[0]
+            rand_idx = torch.randint(len(pool), (bsz,), device=x.device)
+            k_indices = torch.tensor([pool[int(i.item())] for i in rand_idx], device=x.device)
+        else:
+            # Mixed batch: each crop draws k from its own wedge's valid set.
+            pools = []
+            for r, w in zip(ranges, wedge_full):
+                if r not in self._k_cache:
+                    self._k_cache[r] = self._compute_valid_k_sets(self._min_distance, w)
+                pools.append(self._k_cache[r])
+            k_indices = torch.tensor([p[int(torch.randint(len(p), (1,)))] for p in pools],
+                                     device=x.device)
 
         est_evn = x_net                          # f(EVN)
         est_odd = kwargs.get("y_net")            # f(ODD)

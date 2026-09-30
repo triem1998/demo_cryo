@@ -47,6 +47,7 @@ from ..utils.utils import (
     ensure_dir,
     load_mrc_volume,
     psnr,
+    sharpness_3d,
     recon_panels,
     to_canonical_np,
     seed_everything,
@@ -431,7 +432,8 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
                                    fsc_threshold=cfg.fsc_threshold,
                                    fsc_shell=int(k), fsc_res_angstrom=float(res),
                                    psnr_gt=psnr_gt, psnr_1pass_gt=psnr_1pass_gt,
-                                   psnr_ref=gt_path.name if gt_path is not None else "")
+                                   psnr_ref=gt_path.name if gt_path is not None else "",
+                                   sharpness=sharpness_3d(recon_t))
 
             # ── Per-checkpoint summary ─────────────────────────────────────────
             if rank == 0 and resolutions:

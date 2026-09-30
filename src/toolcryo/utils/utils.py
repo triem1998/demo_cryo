@@ -16,7 +16,7 @@ from pathlib import Path
 import mrcfile
 import numpy as np
 import torch
-from deepinv.loss.metric import PSNR
+from deepinv.loss.metric import PSNR, SharpnessIndex
 from torch.utils.data import DataLoader
 
 
@@ -76,6 +76,7 @@ FSC_CSV_COLUMNS = [
     # against — PSNR to a ground truth and PSNR to icecream are not the same
     # number, so a row without it cannot be read.
     "psnr_gt", "psnr_1pass_gt", "psnr_ref",
+    "sharpness",   # sharpness_3d of the recon; needs no reference
     "fsc_curve", "fsc_curve_1pass",
 ]
 
@@ -96,6 +97,19 @@ def psnr(recon: np.ndarray, ref: np.ndarray) -> float:
 
 #: GPU twin of :func:`psnr`: standardize + reference span as peak = the same z-normalised PSNR.
 psnr_zn = PSNR(max_pixel=None, min_pixel=None, norm_inputs="standardize")
+
+_sharpness = SharpnessIndex()
+
+
+def sharpness_3d(vol, n: int = 16) -> float:
+    """SharpnessIndex (higher = more structure, ~0 = pure noise), mean over n slices
+    per plane (XY/XZ/YZ, central 80%). Scale-free but size-dependent: compare same-size volumes."""
+    v = torch.as_tensor(vol).detach().reshape(vol.shape[-3:]).float()
+    scores = []
+    for s in (v, v.permute(1, 0, 2), v.permute(2, 0, 1)):
+        idx = torch.linspace(0.1 * (s.shape[0] - 1), 0.9 * (s.shape[0] - 1), n, device=s.device).long()
+        scores.append(_sharpness(s[idx].unsqueeze(1)).mean())
+    return float(torch.stack(scores).mean())
 
 
 def append_fsc_row(path: Path | str, curve=None, curve_1pass=None, **fields) -> None:
