@@ -71,6 +71,7 @@ class BaseTrainer(dinv.Trainer):
         self._val_vol_idx: int = 0
         self._val_fsc_epoch = None
         self._fsc_tomo_names: list[str] = []
+        self._train_tomo_names: list[str] = []
         self._psnr_refs: list = []          # one Path (or None) per FSC volume
         self._val_psnr: list = []           # per-volume (psnr_1, psnr_2, std_ratio)
         # figure tracking
@@ -473,8 +474,8 @@ class EIFullTrainer(BaseTrainer):
         return super().compute_loss(physics, x, y, train=True, epoch=epoch, step=step)
 
     def _save_train_figures(self, x, y, epoch, physics) -> None:
-        if self._fsc_split == "train" and self._val_pixel_sizes:
-            return  # FSC eval already reconstructs + plots these same volumes
+        if self._val_pixel_sizes:
+            return  # FSC eval already reconstructs + plots the eval volumes; a train recon doubles the cost
         if epoch != self._train_slice_epoch:
             self._train_slice_epoch = epoch
             self._train_vol_idx = 0
@@ -483,6 +484,8 @@ class EIFullTrainer(BaseTrainer):
         gid = getattr(physics, "_tomo_idx", None)
         vol_idx = self._train_vol_idx if gid is None else int(gid)
         self._train_vol_idx += 1
+        name = (self._train_tomo_names[vol_idx] if vol_idx < len(self._train_tomo_names)
+                else f"vol{vol_idx:02d}")
         if epoch % self.eval_interval != 0:
             return
         # All ranks must call the (possibly distributed) model; only rank-0 saves.
@@ -497,8 +500,8 @@ class EIFullTrainer(BaseTrainer):
             self._train_images_dir, epoch, vol_idx,
             [pa, pb, _znorm_np(to_canonical_np(recon_t.squeeze().cpu().numpy(), physics))],
             labels=[*pl, "recon"],
-            title=f"Train Epoch {epoch} | Vol {vol_idx} — inference recon",
-            fname=f"vol{vol_idx:02d}_recon.png",
+            title=f"Train Epoch {epoch} | {name} — inference recon",
+            fname=f"{name}_recon.png",
         )
 
     def log_metrics_mlops(self, logs: dict, step: int, train: bool = True) -> None:  # type: ignore[override]

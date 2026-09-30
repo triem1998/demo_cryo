@@ -368,7 +368,7 @@ def run_full(cfg: RunEIFullConfig) -> None:
             fsc_loader = _make_full_loader(
                 fsc_ds, shuffle=False, cfg=data_cfg,
                 sampler=ctx.distributed_data_sampler(fsc_ds, shuffle=False))
-        eval_dataloader = fsc_loader if n_paired_fsc > 0 else None
+        eval_dataloader = fsc_loader if cfg.eval_fsc and n_paired_fsc > 0 else None
 
         trainer = EIFullTrainer(
             model=model, physics=physics, optimizer=optimizer,
@@ -392,6 +392,7 @@ def run_full(cfg: RunEIFullConfig) -> None:
         trainer._post_optimizer_step = lambda: preset["post_optimizer_step"](core)
         trainer._recon_strategy      = preset["recon"]
         trainer._fsc_tomo_names  = [p.parent.name for p in fsc_ds.evn_paths]
+        trainer._train_tomo_names = [p.parent.name for p in train_ds.evn_paths]
         trainer._psnr_refs = [_find_psnr_ref(p.parent, cfg.psnr_ref_globs, rank)
                               for p in fsc_ds.evn_paths]
         fsc_ds.psnr_ref_paths = trainer._psnr_refs if trainer._is_eval_writer else None

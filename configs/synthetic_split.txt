@@ -28,6 +28,8 @@ empiar-11830/tomo_215
 empiar-11830/tomo_224
 empiar-11830/tomo_301
 empiar-11830/tomo_317
+empiar-11830/tomo_002
+
 # Excluded: 11058's split1/split2 are the even/odd tilts, not a dose split, so
 # the half-set noise estimate does not apply.
 # empiar-11058/tomo_004  tomo_11058_004
