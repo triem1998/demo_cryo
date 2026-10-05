@@ -113,4 +113,5 @@ def build_tomography_physics(
         init_evn=None, init_odd=None,
         evn_paths=evn_paths, odd_paths=odd_paths, device=device, target_shape=target_shape,
         num_operators=n_ops, backend=backend, ctx=ctx,
+        init_source=getattr(cfg, "init_source", "file"),
     )

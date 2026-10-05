@@ -10,6 +10,18 @@ def ei_denoiser_forward(trainer, x, y, physics, train):
     return x_net, y_net
 
 
+def _inits(physics, x, y):
+    """EVN/ODD start volumes: the files, or ``g * fbp(y)`` (``init_source: fbp_calibrated``).
+
+    The calibrated one is the file rescaled by its cached ``s``, so no ``fbp``
+    runs per batch. Takes the whole sinograms (``calibrate_fbp`` splits them).
+    """
+    if physics.init_source != "fbp_calibrated":
+        return physics.init_evn, physics.init_odd
+    s_evn, s_odd = physics.calibrate_fbp(x, y)
+    return s_evn * physics.init_evn, s_odd * physics.init_odd
+
+
 def tomo_ei_forward(trainer, x, y, physics, train):
     """True-physics EI: denoise each half's FBP volume directly (no unfolding).
 
@@ -18,8 +30,9 @@ def tomo_ei_forward(trainer, x, y, physics, train):
     denoiser's input, matching missingwedge_ei's ei_denoiser_forward but with
     the wedge-crop replaced by a real FBP reconstruction per half.
     """
-    x_net = trainer.model_inference(y=physics.init_evn, physics=physics.physics_evn, train=train)
-    y_net = trainer.model_inference(y=physics.init_odd, physics=physics.physics_odd, train=train)
+    init_evn, init_odd = _inits(physics, x, y)
+    x_net = trainer.model_inference(y=init_evn, physics=physics.physics_evn, train=train)
+    y_net = trainer.model_inference(y=init_odd, physics=physics.physics_odd, train=train)
     return x_net, y_net
 
 
@@ -34,11 +47,12 @@ def unrolled_forward(trainer, x, y, physics, train):
     sinogram (see physics/tomography_build.py::split_sinogram). Both paths end
     up unit spectral norm, so the stepsize is the same either way.
     """
+    init_evn, init_odd = _inits(physics, x, y)
     if physics.num_operators is not None:
         x = split_sinogram(x, physics.num_operators)
         y = split_sinogram(y, physics.num_operators)
     x_net = trainer.model_inference(
-        y=x, physics=physics.physics_evn, init=physics.init_evn, train=train)
+        y=x, physics=physics.physics_evn, init=init_evn, train=train)
     y_net = trainer.model_inference(
-        y=y, physics=physics.physics_odd, init=physics.init_odd, train=train)
+        y=y, physics=physics.physics_odd, init=init_odd, train=train)
     return x_net, y_net

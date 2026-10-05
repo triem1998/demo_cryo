@@ -153,6 +153,57 @@ class TomographyEMPair:
     ctx: object = None
     _tomo_idx: int = 0
     psnr_ref: object = None   # this batch's PSNR reference, or None
+    init_source: str = "file"
+    _fbp_gains: dict | None = None   # (tomo_idx, half) -> g
+
+    def as_measurement(self, y):
+        """The sinogram in the form ``fbp`` takes: split when the angles are sharded."""
+        return y if self.num_operators is None else split_sinogram(y, self.num_operators)
+
+    def calibrate_fbp(self, x, y) -> tuple[float, float]:
+        """Scale each half's ``fbp`` by ``g = <A fbp y, y> / ||A fbp y||^2``.
+
+        Also fits ``s`` with ``g * fbp(y) ~ s * init`` (the file start volume),
+        so the caller can use ``s * init`` instead of an ``fbp`` per batch.
+        ``update()`` rebuilds the operators per tomogram, so ``(g, s)`` is cached
+        by tomogram and re-attached. Every rank holds every sinogram piece, so
+        both are identical across ranks without a collective. Returns the
+        ``(s_evn, s_odd)``.
+        """
+        if self._fbp_gains is None:
+            self._fbp_gains = {}
+        out = []
+        for half, op, sino, init in (("evn", self.physics_evn, x, self.init_evn),
+                                     ("odd", self.physics_odd, y, self.init_odd)):
+            key = (self._tomo_idx, half)
+            if key not in self._fbp_gains:
+                with torch.no_grad(), torch.autocast(sino.device.type, enabled=False):
+                    m = self.as_measurement(sino.float())
+                    v = op.fbp(m)
+                    a = op.A(v)
+                    pairs = zip(a, m) if isinstance(m, TensorList) else [(a, m)]
+                    num = den = 0.0
+                    for ai, mi in pairs:
+                        ai = ai.float()
+                        num += float((ai * mi).sum())
+                        den += float((ai * ai).sum())
+                    g, v = num / den, (num / den) * v.float()
+                    i = init.to(v.device, torch.float32).reshape(v.shape)
+                    s = float((v * i).sum() / (i * i).sum())
+                    res = float((v - s * i).norm() / v.norm())
+                self._fbp_gains[key] = (g, s)
+                print(f"[physics] tomo {self._tomo_idx} {half}: fbp_gain={g:.4g}  "
+                      f"init_scale={s:.4g}  fit residual={res:.2e}", flush=True)
+                if res > 0.1:
+                    print(f"[physics] WARNING: the init file is not a scaled fbp(y) "
+                          f"(residual {res:.2f}); init_source=fbp_calibrated assumes it is.", flush=True)
+            g, s = self._fbp_gains[key]
+            if getattr(op, "fbp_gain", None) is None:
+                raw = op.fbp
+                op.fbp = lambda t, _raw=raw, _g=g, **kw: _g * _raw(t, **kw)
+                op.fbp_gain = g
+            out.append(s)
+        return tuple(out)
 
     def update(self, tomo_idx=None, psnr_ref=None, init_evn=None, init_odd=None,
                **kwargs) -> None:
