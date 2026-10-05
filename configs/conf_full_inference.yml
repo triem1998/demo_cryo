@@ -61,6 +61,9 @@ inference:
   # Output
   save_recon_mrc: false
 
+  # Must match the training run: file | fbp_calibrated (see conf_full_eq_tomo.yml).
+  init_source: file
+
 # missingwedge_ei preset only — ignored by unrolled/tomo_ei (both read real
 # angles from each tomogram's own .tlt files instead). Must match the
 # training config's physics.

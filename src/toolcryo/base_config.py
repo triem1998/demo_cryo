@@ -77,10 +77,12 @@ class RunEIBaseConfig(BaseModel):
     # Eq's target is the model's own output, so its amplitude means nothing.
     # Changes the loss scale.
     eq_scale_free: bool = False
-    # tomo_ei input. "file" = the z-normed FBP volume on disk. "fbp_calibrated"
-    # = g * fbp(y), g = <A fbp y, y> / ||A fbp y||^2 per half and tomogram; the
-    # same g scales every fbp call (EqLoss, 2-pass eval, inference). Pair with
-    # obs_gain: none. 
+    # Start volume x0 (tomo_ei / unrolled):
+    #   "file"           : x0 = znorm(FBP file)
+    #   "fbp_calibrated" : x0 = g * fbp(y),  g = argmin_g ||A(g fbp(y)) - y||^2
+    #                      = <A fbp y, y> / ||A fbp y||^2, per tomogram and half,
+    #                      so A(x0) ~ y. Every fbp call (EqLoss, 2-pass) uses g * fbp.
+    # Pair fbp_calibrated with obs_gain: none and eq_scale_free: true.
     init_source: Literal["file", "fbp_calibrated"] = "file"
 
     # ── Training ────────────────────────────────────────────────────────────
