@@ -1,8 +1,9 @@
 method: equivariant_full   # routes to run_full; `general.preset` below selects the actual method
 
 general:
-  input_dir: /lustre/fswork/projects/rech/fio/commun/cryolithe/empiar-11830
-  output_root: ./runs
+  cluster: jeanzay   # site in configs/clusters.yml: jeanzay | adastra
+  input_dir: "{data_root}/empiar-11830"
+  output_root: "{output_root}"
   run_name: tomo_ei
   execution_mode: submitit   # change to 'local' to run without SLURM
   train_names: ["tomo_001"]   # empty = random split by max_train_vols
@@ -37,7 +38,7 @@ training:
   unet_dropout: 0.0
   # drunet params
   drunet_sigma: 0.0
-  pretrained_ckpt: /lustre/fswork/projects/rech/fio/commun/Results_cryo/runs/demo-cryo-ei-patch_20260715-212312_40000_epochs_unet/slurm-1885787/checkpoints/ckp_final.pth
+  pretrained_ckpt: "{results_root}/runs/demo-cryo-ei-patch_20260715-212312_40000_epochs_unet/slurm-1885787/checkpoints/ckp_final.pth"
   # pretrained_ckpt above is a raw patch checkpoint (native axis order) —
   # permute its conv kernels to astra order. Flip to false if pretrained_ckpt
   # is ever pointed at a tomo_ei/unrolled checkpoint instead (already astra-order).
@@ -141,9 +142,3 @@ slurm:
   constraint: "h100"
   qos: "qos_gpu_h100-dev"
   stderr_to_stdout: true
-  setup:
-    - "module purge"
-    - "module load arch/h100"
-    - "module load pytorch-gpu/py3/2.7.0"
-    - "export NCCL_DEBUG=INFO"
-    - "export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"

@@ -1,8 +1,9 @@
 method: ei_patch_inference
 
 general:
-  input_dir: /lustre/fswork/projects/rech/fio/commun/cryolithe/empiar-11830
-  output_root: ./runs
+  cluster: jeanzay   # site in configs/clusters.yml: jeanzay | adastra
+  input_dir: "{data_root}/empiar-11830"
+  output_root: "{output_root}"
   run_name: demo-cryo-ei-patch-inference
   execution_mode: submitit
   max_infer_vols: 1
@@ -12,8 +13,8 @@ general:
 inference:
   # required: one or more .pth checkpoints; each is evaluated in turn
   checkpoint_paths:
-    - /lustre/fswork/projects/rech/fio/commun/Results_cryo/runs/demo-cryo-ei-patch_4_samples_2000_epochs_unet/slurm-662139/checkpoints/ckp_0000.pth 
-    - /lustre/fswork/projects/rech/fio/commun/Results_cryo/runs/demo-cryo-ei-patch_4_samples_2000_epochs_unet/slurm-662139/checkpoints/ckp_final.pth
+    - "{results_root}/runs/demo-cryo-ei-patch_4_samples_2000_epochs_unet/slurm-662139/checkpoints/ckp_0000.pth"
+    - "{results_root}/runs/demo-cryo-ei-patch_4_samples_2000_epochs_unet/slurm-662139/checkpoints/ckp_final.pth"
 
   normalize: true          # must match training config
 
@@ -62,8 +63,3 @@ slurm:
   constraint: "h100"
   qos: "qos_gpu_h100-dev"
   stderr_to_stdout: true
-  setup:
-    - "module purge"
-    - "module load arch/h100"
-    - "module load pytorch-gpu/py3/2.7.0"
-    - "export NCCL_DEBUG=INFO"

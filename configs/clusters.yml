@@ -1,0 +1,33 @@
+# Per-site settings shared by every job. The paths fill {data_root},
+# {results_root} and {output_root} in the job configs; `setup` runs before the
+# job's own slurm.setup lines, `teardown` after the job.
+jeanzay:
+  data_root:    /lustre/fswork/projects/rech/fio/commun/cryolithe
+  results_root: /lustre/fswork/projects/rech/fio/commun/Results_cryo
+  output_root:  ./runs
+  setup:
+    - module purge
+    - module load arch/{constraint}      # from the job's slurm.constraint (h100, a100)
+    - module load pytorch-gpu/py3/2.7.0
+    - export NCCL_DEBUG=INFO
+    - export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+adastra:
+  data_root:    $SHAREDSCRATCHDIR/datasets/cryolithe
+  results_root: $SHAREDWORKDIR/results_cryo
+  output_root:  ./runs
+  slurm:
+    hint: nomultithread   # cpus_per_task counts physical cores (24 per MI300A APU)
+  setup:
+    - source $SHAREDWORKDIR/env_cryo/.venv/bin/activate.poverlay
+    - export PYTHONPATH={repo_root}/src
+    # MIOpen kernel cache: seeded on every node's /tmp, saved back in teardown.
+    - export MIOPEN_CACHE_STORE=$SHAREDWORKDIR/miopen_cache
+    - export MIOPEN_USER_DB_PATH=/tmp/${USER}-miopen-cache-${SLURM_JOB_ID}
+    - export MIOPEN_CUSTOM_CACHE_DIR=$MIOPEN_USER_DB_PATH
+    - srun --nodes=$SLURM_NNODES --ntasks=$SLURM_NNODES --ntasks-per-node=1 --cpus-per-task=1 bash -c 'mkdir -p $MIOPEN_USER_DB_PATH && cp -a $MIOPEN_CACHE_STORE/. $MIOPEN_USER_DB_PATH/'
+    - export HSA_NO_SCRATCH_RECLAIM=1
+    - export NCCL_DEBUG=INFO
+    - export PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+  teardown:
+    - cp -a $MIOPEN_USER_DB_PATH/. $MIOPEN_CACHE_STORE/

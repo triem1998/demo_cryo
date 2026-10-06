@@ -3,8 +3,9 @@ method: ei_inference
 
 general:
   execution_mode: submitit
-  input_dir: /lustre/fswork/projects/rech/fio/commun/cryolithe/empiar-11830
-  output_root: ./runs
+  cluster: jeanzay   # site in configs/clusters.yml: jeanzay | adastra
+  input_dir: "{data_root}/empiar-11830"
+  output_root: "{output_root}"
   run_name: demo-cryo-inference
   val_names: ["tomo_001"]   # volumes to evaluate; empty = first max_infer_vols of a seeded shuffle
   max_infer_vols: 1
@@ -29,7 +30,7 @@ distributed:
 
 # Shared by all three presets — checkpoint/model architecture, FSC, output.
 inference:
-  checkpoint_paths: [/lustre/fswork/projects/rech/fio/commun/Results_cryo/runs/tomo_ei_200_epochs/slurm-471044/checkpoints/ckp_final.pth]
+  checkpoint_paths: ["{results_root}/runs/tomo_ei_200_epochs/slurm-471044/checkpoints/ckp_final.pth"]
   # This is a raw patch checkpoint (native axis order), not one produced by a
   # tomo_ei/unrolled run — must permute its conv kernels to astra order. Set
   # to false once checkpoint_paths points at an actual tomo_ei checkpoint.
@@ -96,9 +97,4 @@ slurm:
   constraint: "h100"
   qos: "qos_gpu_h100-dev"
   stderr_to_stdout: true
-  setup:
-    - "module purge"
-    - "module load arch/h100"
-    - "module load pytorch-gpu/py3/2.7.0"
-    - "export NCCL_DEBUG=INFO"
 

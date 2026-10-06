@@ -14,6 +14,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import yaml
 import submitit
@@ -119,6 +120,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Force local mode regardless of general.execution_mode in config.",
     )
+    parser.add_argument(
+        "--cluster",
+        default=None,
+        help="Site in configs/clusters.yml (default: general.cluster).",
+    )
     return parser.parse_args()
 
 
@@ -153,6 +159,37 @@ def load_config(path: str | Path) -> dict:
     return conf
 
 
+def apply_cluster(conf: dict, cluster: str | None) -> dict:
+    """Fill the site paths of configs/clusters.yml into the config and prepend
+    the site's slurm setup to the job's own. No site selected: unchanged."""
+    name = cluster or conf["general"].get("cluster")
+    if not name:
+        return conf
+    with (ROOT / "configs/clusters.yml").open(encoding="utf-8") as f:
+        site = yaml.safe_load(f)[name]
+    # Paths are expanded here, on the login node; setup lines keep their $VARS
+    # for the job's shell.
+    keys = {k: os.path.expandvars(site[k]) for k in ("data_root", "results_root", "output_root")}
+    keys |= {"repo_root": str(ROOT), "constraint": str(conf["slurm"].get("constraint", ""))}
+
+    def fill(v):
+        if isinstance(v, str):
+            for k, x in keys.items():
+                v = v.replace("{" + k + "}", x)  # not str.format: setup lines contain ${USER}
+            return v
+        if isinstance(v, dict):
+            return {k: fill(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [fill(x) for x in v]
+        return v
+
+    conf = fill(conf)
+    conf["slurm"] = {**site.get("slurm", {}), **conf["slurm"]}  # job keys win
+    conf["slurm"]["setup"] = fill(site.get("setup", [])) + conf["slurm"].get("setup", [])
+    conf["slurm"]["teardown"] = site.get("teardown", [])
+    return conf
+
+
 def build_run_config(conf: dict):
     method = str(conf.get("method", "equivariant_full")).lower()
     if method not in _METHODS:
@@ -178,6 +215,7 @@ def submit_job(method: str, cfg, slurm: dict) -> None:
         ("account",         "account"),
         ("constraint",      "constraint"),
         ("qos",             "qos"),
+        ("hint",            "hint"),
     ]:
         if src_key in slurm:
             additional_params[dst_key] = slurm[src_key]
@@ -190,6 +228,7 @@ def submit_job(method: str, cfg, slurm: dict) -> None:
         slurm_stderr_to_stdout=bool(slurm.get("stderr_to_stdout", True)),
         slurm_additional_parameters=additional_params,
         slurm_setup=list(slurm.get("setup", [])),
+        slurm_teardown=list(slurm.get("teardown", [])),
     )
 
     job = executor.submit(CryoTrainingJob(method, cfg.model_dump()))
@@ -203,7 +242,7 @@ def submit_job(method: str, cfg, slurm: dict) -> None:
 
 def main() -> None:
     args = parse_args()
-    conf = load_config(args.config)
+    conf = apply_cluster(load_config(args.config), args.cluster)
     general = _require_section(conf, "general")
     slurm   = _require_section(conf, "slurm")
 
