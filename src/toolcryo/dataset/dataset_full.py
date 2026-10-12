@@ -131,6 +131,7 @@ class CryoEIFullDataset(Dataset):
         self._tilt_ranges: list[tuple[float, float] | None] = (
             tilt_ranges if tilt_ranges is not None else [None] * len(evn_paths)
         )
+        self._stats: dict[Path, tuple] = {}  # file -> (mean, std): files never change, computed once
 
         n_tlt = sum(t is not None for t in self._tilt_ranges)
         print(
@@ -150,7 +151,7 @@ class CryoEIFullDataset(Dataset):
             params = {"tomo_idx": torch.tensor(idx + self.index_offset)}
             for half, paths in (("evn", self.evn_paths), ("odd", self.odd_paths)):
                 # FBP init in astra (Y, Z, X), for TomographyEMPair.update()
-                params[f"init_{half}"] = self._load_and_prepare(paths[idx]).transpose(2, 3).contiguous()
+                params[f"init_{half}"] = self._load_and_prepare(paths[idx], order="astra")
             return evn_sino, odd_sino, self._with_ref(idx, params)
 
         evn = self._load_and_prepare(self.evn_paths[idx])   # (1, D, H, W), whole-volume normalised
@@ -174,9 +175,7 @@ class CryoEIFullDataset(Dataset):
         """Add ``psnr_ref`` (fp16, model-output axis order) when a path is set."""
         path = self.psnr_ref_paths[idx] if self.psnr_ref_paths else None
         if path is not None:
-            ref = self._load_and_prepare(path)[0]
-            if self.data_source == "measurement":
-                ref = ref.transpose(1, 2)   # astra (Y, Z, X)
+            ref = self._load_and_prepare(path, "astra" if self.data_source == "measurement" else "native")[0]
             params["psnr_ref"] = ref.contiguous().half()
         return params
 
@@ -230,29 +229,30 @@ class CryoEIFullDataset(Dataset):
         )
         return sino.permute(1, 2, 0, 3).contiguous()  # (C, ny, A, nx)
 
-    def _load_and_prepare(self, path: Path) -> torch.Tensor:
-        """Load MRC, reorder axes, optional resample, normalise → (1, D, H, W).
+    def _load_and_prepare(self, path: Path, order: str = "native") -> torch.Tensor:
+        """Load MRC in ``order`` (see ``load_mrc_volume``), optional resample, normalise → (1, ...).
 
         Normalisation is whole-volume (icecream's ``load_volume`` /
         ``normalize_volume``), applied before any cropping — see
         ``_crop_pair`` for the crop step.
         """
-        vol = torch.from_numpy(load_mrc_volume(path, order="native"))  # (Y, X, Z) = (D, H, W)
+        vol = torch.from_numpy(load_mrc_volume(path, order=order))  # native (Y, X, Z), astra (Y, Z, X)
 
         if self.target_shape is not None:
+            # target_shape is native (Y, X, Z)
+            size = self.target_shape if order == "native" else [self.target_shape[i] for i in (0, 2, 1)]
             # interpolate expects (B, C, D, H, W)
             vol = torch.nn.functional.interpolate(
                 vol.unsqueeze(0).unsqueeze(0),
-                size=self.target_shape,
+                size=size,
                 mode="trilinear",
                 align_corners=False,
-            ).squeeze(0).squeeze(0)  # back to (D, H, W)
+            ).squeeze(0).squeeze(0)
 
-        mu = vol.mean()
-        sigma = vol.std()
-        vol = (vol - mu) / (sigma + 1e-8)
-
-        return vol.unsqueeze(0)  # (1, D, H, W)
+        if path not in self._stats:
+            self._stats[path] = (vol.mean(), vol.std())
+        mu, sigma = self._stats[path]
+        return vol.sub_(mu).div_(sigma + 1e-8).unsqueeze(0)  # in place: vol is our own copy
 
     def _crop_pair(self, evn: torch.Tensor, odd: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Crop EVN/ODD at one shared random origin (icecream's ``get_random_crop``).

@@ -11,6 +11,7 @@ jeanzay:
     - module load pytorch-gpu/py3/2.7.0
     - export NCCL_DEBUG=INFO
     - export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    - df -h /dev/shm; ls -lS /dev/shm | head   # free shared memory at start (DataLoader bus errors)
 
 adastra:
   data_root:    $SHAREDSCRATCHDIR/datasets/cryolithe
