@@ -12,7 +12,9 @@ general:
   seed: 0
   target_shape: null
   # ── THE SWITCH ──────────────────────────────────────────────────────────
-  preset: tomo_ei   # "missingwedge_ei" | "unrolled" | "tomo_ei" 
+  preset: tomo_ei   # "missingwedge_ei" | "unrolled" | "tomo_ei"
+  # ranktrace profiler: null = off, e.g. {mode: torch, wait: 5, warmup: 1, active: 2, stats: true} (mode: torch | nvtx)
+  profiler: null
 
 training:
   num_epochs: 10

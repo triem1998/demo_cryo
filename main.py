@@ -206,7 +206,14 @@ def submit_job(method: str, cfg, slurm: dict) -> None:
     submitit_folder = Path(cfg.output_dir) / "submitit_logs"
     submitit_folder.mkdir(parents=True, exist_ok=True)
 
-    executor = submitit.AutoExecutor(folder=str(submitit_folder), slurm_python="python")
+    # slurm.python wraps each task, e.g. for nsys (with profiler mode nvtx):
+    #   "nsys profile -t cuda,nvtx --capture-range=cudaProfilerApi --capture-range-end=stop
+    #    -o {output_dir}/traces/rank%q{SLURM_PROCID} python"
+    python = str(slurm.get("python", "python"))
+    if "{output_dir}" in python:
+        (Path(cfg.output_dir) / "traces").mkdir(parents=True, exist_ok=True)  # nsys won't create it
+        python = python.replace("{output_dir}", str(Path(cfg.output_dir).resolve()))
+    executor = submitit.AutoExecutor(folder=str(submitit_folder), slurm_python=python)
     gpus_per_node = int(slurm.get("gpus_per_node", 1))
     additional_params = dict(slurm.get("additional_parameters", {}))
     for src_key, dst_key in [

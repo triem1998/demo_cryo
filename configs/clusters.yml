@@ -22,6 +22,7 @@ adastra:
   setup:
     - source $SHAREDWORKDIR/env_cryo/.venv/bin/activate.poverlay
     - export PYTHONPATH={repo_root}/src
+    - unset ROCPROFILER_REGISTER_LIBRARY   # set by `import torch` in the submitting process; blinds torch.profiler
     # MIOpen kernel cache: seeded on every node's /tmp, saved back in teardown.
     - export MIOPEN_CACHE_STORE=$SHAREDWORKDIR/miopen_cache
     - export MIOPEN_USER_DB_PATH=/tmp/${USER}-miopen-cache-${SLURM_JOB_ID}

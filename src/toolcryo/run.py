@@ -7,6 +7,7 @@ from typing import Literal
 
 import torch
 from deepinv.distributed import DistributedContext
+from ranktrace import make_profiler
 
 from .base_config import RunEIBaseConfig, amp_dtype_from_str
 from .dataset.dataset_full import EIFullDataConfig, build_ei_full_dataloaders, _make_full_loader
@@ -223,6 +224,11 @@ def _configure_trainer(
     trainer._ckpt_dir           = ensure_dir(output_dir / "checkpoints") if rank == 0 else None
     trainer._grad_accum_steps   = max(1, int(cfg.grad_accumulation_steps))
     trainer.ckp_interval        = int(cfg.ckp_interval)
+    trainer._prof               = make_profiler(**{"trace_dir": str(output_dir / "traces"), **(cfg.profiler or {})})
+    p, a = trainer._prof, trainer._grad_accum_steps
+    if p.mode and rank == 0 and (p.wait + p.warmup + p.active) % a:
+        print(f"[profiler] WARNING: wait+warmup+active={p.wait + p.warmup + p.active} is not a multiple of "
+              f"grad_accumulation_steps={a}: the trace will miss the optimizer step", flush=True)
     # "off" leaves the trainer untouched: _autocast/_amp_dtype/_scaler all stay
     # None, which every AMP site below treats as "do nothing".
     if cfg.mixed_precision != "off":
@@ -415,7 +421,8 @@ def run_full(cfg: RunEIFullConfig) -> None:
                 msg = "disabled (eval_fsc=False)" if not cfg.eval_fsc else f"disabled — no paired ODD {fsc_label} volumes"
                 print(f"[fsc-eval] {msg}", flush=True)
 
-        trainer.train()
+        with trainer._prof:
+            trainer.train()
 
         if rank == 0 and trainer._ckpt_dir is not None:
             ckpt_path = Path(trainer._ckpt_dir) / "ckp_final.pth"
@@ -561,7 +568,8 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
                 print(f"[ei-patch] patch probe: {len(probes)} tomo(s) × "
                       f"{len(positions)} position(s)", flush=True)
 
-        trainer.train()
+        with trainer._prof:
+            trainer.train()
 
         raw_model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
         if rank == 0 and trainer._ckpt_dir is not None:

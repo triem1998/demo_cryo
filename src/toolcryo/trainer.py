@@ -15,6 +15,7 @@ import deepinv as dinv
 import numpy as np
 import torch
 import torch.nn as nn
+from ranktrace import Profiler
 
 from .base_config import amp_dtype_from_str
 from .forward import ei_denoiser_forward
@@ -47,6 +48,7 @@ class BaseTrainer(dinv.Trainer):
         self._scaler = None
         self._autocast = None
         self._amp_dtype = None
+        self._prof: Profiler = Profiler()
         # per-step counters
         self._accum_count: int = 0
         self._current_train_epoch = None
@@ -205,6 +207,7 @@ class BaseTrainer(dinv.Trainer):
             self._save_train_figures(x, y, epoch, physics)
             self._last_train_xnet = self._last_train_ynet = None
             logs.setdefault("gradient_norm", "")
+            self._prof.step()
 
         return loss_total, x_net, logs
 
