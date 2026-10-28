@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch._dynamo
 import yaml
 from deepinv.distributed import AutoTuner, DistributedContext
 from deepinv.models.base import Denoiser
@@ -43,18 +44,19 @@ from toolcryo.transform import Rotate3D  # noqa: E402
 
 
 class AutocastDenoiser(Denoiser):
-    """Runs the denoiser under the job's autocast, so the tile probe sees bf16/fp16 activations."""
+    """Runs the denoiser under the job's autocast (none if `dtype` is None). Also the Denoiser the
+    tuner finds and patches, so a compiled denoiser inside it is probed as the job runs it."""
 
-    def __init__(self, denoiser: torch.nn.Module, dtype: torch.dtype) -> None:
+    def __init__(self, denoiser: torch.nn.Module, dtype: torch.dtype | None) -> None:
         super().__init__()
         self.denoiser, self.dtype = denoiser, dtype
 
     def forward(self, x, *args, **kwargs):
-        with torch.autocast("cuda", dtype=self.dtype):
+        with torch.autocast("cuda", dtype=self.dtype, enabled=self.dtype is not None):
             return self.denoiser(x, *args, **kwargs)
 
 
-def load_cfg(path: Path, preset: str, target_shape) -> RunEIFullConfig:
+def load_cfg(path: Path, preset: str, target_shape, compile_: bool = True) -> RunEIFullConfig:
     conf = yaml.safe_load(path.read_text())
     if conf.get("method") != "equivariant_full":
         raise ValueError(f"{path}: method must be equivariant_full, got {conf.get('method')!r}")
@@ -62,8 +64,8 @@ def load_cfg(path: Path, preset: str, target_shape) -> RunEIFullConfig:
     if target_shape is not None:
         conf["general"]["target_shape"] = list(target_shape)
     cfg = RunEIFullConfig.from_yaml(conf)
-    # weights do not change memory or time; compile would hide the denoiser from the probe
-    return cfg.model_copy(update={"pretrained_ckpt": None, "compile": False})
+    # weights do not change memory or time; compile does (fusion): keep the job's
+    return cfg.model_copy(update={"pretrained_ckpt": None, "compile": cfg.compile and compile_})
 
 
 def load_batch(cfg: RunEIFullConfig, device):
@@ -95,12 +97,11 @@ def build_model(cfg: RunEIFullConfig, make_physics, device):
     else:
         model, _ = build_distributed_denoiser(cfg, ctx, 0, None)
         model = model.processor
-    if cfg.mixed_precision != "off":
-        dtype = torch.bfloat16 if cfg.mixed_precision == "bf16" else torch.float16
-        if cfg.preset == "unrolled":
-            model.prior[0].denoiser = AutocastDenoiser(model.prior[0].denoiser, dtype)
-        else:
-            model = AutocastDenoiser(model, dtype)
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(cfg.mixed_precision)
+    if cfg.preset == "unrolled":
+        model.prior[0].denoiser = AutocastDenoiser(model.prior[0].denoiser, dtype)
+    else:
+        model = AutocastDenoiser(model, dtype)
     return model.to(device)
 
 
@@ -187,6 +188,7 @@ def tune(cfg: RunEIFullConfig, args, device) -> dict:
         gpu_memory_gb=args.gpu_memory_gb, patch_sizes=args.patch_sizes,
         memory_fraction=args.memory_fraction,
         physics_scales=cfg.num_operators is not None,
+        warmup=args.warmup, repeats=args.repeats,
     )
 
     t0 = time.perf_counter()
@@ -200,13 +202,15 @@ def tune(cfg: RunEIFullConfig, args, device) -> dict:
         volume_shape=list(params["init_evn"].shape[-3:]), sinogram_shape=list(x.shape[-3:]),
         target_shape=cfg.target_shape, num_operators=cfg.num_operators,
         n_iter=cfg.n_iter if cfg.preset == "unrolled" else None,
-        eq_weight=cfg.eq_weight, mixed_precision=cfg.mixed_precision,
+        eq_weight=cfg.eq_weight, mixed_precision=cfg.mixed_precision, compile=cfg.compile,
         probe_gpu=torch.cuda.get_device_name(device),
         gpu_memory_gb=args.gpu_memory_gb, memory_fraction=tuner.memory_fraction,
         budget_mb=tuner.budget / 2**20, probe_s=probe_s,
         min_gpus={"always": p_always, "never": p_never},
         physics_runs={p: r and {**dataclasses.asdict(r), "m_phys": r.m_phys / 2**20, "at_call": r.at_call / 2**20}
                       for p, r in sorted(tuner._runs.items())},
+        tiles=[{**dataclasses.asdict(t), **{k: getattr(t, k) / 2**20 for k in ("vpad", "win", "peak_inf", "held", "peak_train")}}
+               for t in tuner.tiles or []],
         best_single={n: as_dict(c) for n, c in single.items()},
         best_multi={n: as_dict(c) for n, c in multi.items()},
         yaml_single={n: yaml_block(c) for n, c in single.items()},
@@ -216,7 +220,7 @@ def tune(cfg: RunEIFullConfig, args, device) -> dict:
 
 def summarize(r: dict) -> str:
     lines = [f"[autotune] {r['preset']}  {r['tomogram']}  vol={r['volume_shape']}  "
-             f"budget={r['budget_mb']:.0f} MiB  probes={r['probe_s']:.1f}s",
+             f"budget={r['budget_mb']:.0f} MiB  probes={r['probe_s']:.1f}s  compile={r['compile']}",
              f"  min GPUs/image: always={r['min_gpus']['always']}  never={r['min_gpus']['never']}"]
     for kind in ("best_single", "best_multi"):
         for n, c in r[kind].items():
@@ -240,15 +244,22 @@ def main() -> None:
     p.add_argument("--gpu-memory-gb", type=float, default=None, help="target GPU memory (default: this GPU)")
     p.add_argument("--memory-fraction", type=float, default=None)
     p.add_argument("--patch-sizes", type=int, nargs="+", default=None)
+    p.add_argument("--warmup", type=int, default=2, help="untimed calls per tile probe")
+    p.add_argument("--repeats", type=int, default=3, help="timed calls per tile probe (median kept)")
     p.add_argument("--target-shape", type=int, nargs=3, default=None, help="override general.target_shape")
+    p.add_argument("--no-compile", action="store_true", help="probe eager even if the config compiles")
     p.add_argument("--out", type=Path, default=None, help="default: runs/autotune/<config stem>")
     args = p.parse_args()
+    # every patch candidate is a new shape: compile each one static, as the job does,
+    # and do not fall back to eager after 8 recompiles (no-grad + train per candidate)
+    torch._dynamo.config.automatic_dynamic_shapes = False
+    torch._dynamo.config.recompile_limit = 64
 
     device = torch.device("cuda", torch.cuda.current_device())
     out = args.out or ROOT / "runs" / "autotune" / args.config.stem
     out.mkdir(parents=True, exist_ok=True)
     for preset in args.preset:
-        r = tune(load_cfg(args.config, preset, args.target_shape), args, device)
+        r = tune(load_cfg(args.config, preset, args.target_shape, not args.no_compile), args, device)
         print(summarize(r), flush=True)
         path = out / f"autotune_{preset}.json"
         path.write_text(json.dumps(r, indent=2, default=str))
