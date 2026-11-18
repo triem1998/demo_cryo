@@ -113,9 +113,6 @@ class RunEIFullInferenceConfig(RunEIBaseConfig):
     icecream_glob: str = "vol_*[Ii]cecream*"
     isonet_glob: str = "vol_*[Ii]so[Nn]et*"
     isonet_fallback_glob: str = "vol_*DDW*"
-    # Ground truth, when the dataset ships one (dataset/synthetic). Scored by
-    # PSNR into fsc.csv and results.json, not just drawn.
-    gt_glob: str = "vol_*_[Gg][Tt].mrc"
 
     # ── Output options ───────────────────────────────────────────────────────
     save_recon_mrc: bool = False
@@ -325,7 +322,7 @@ def run_inference(cfg: RunEIFullInferenceConfig) -> None:
                 tomo_dir      = val_ds.evn_paths[vol_idx].parent
                 isonet_path   = _find_mrc(tomo_dir, cfg.isonet_glob, cfg.isonet_fallback_glob)
                 icecream_path = _find_mrc(tomo_dir, cfg.icecream_glob)
-                gt_path       = _find_mrc(tomo_dir, cfg.gt_glob)
+                gt_path       = _find_mrc(tomo_dir, *(cfg.psnr_ref_globs or []))
 
                 isonet_np: np.ndarray | None = None
                 icecream_np: np.ndarray | None = None

@@ -130,8 +130,9 @@ class RunEIBaseConfig(BaseModel):
     fsc_threshold: float = 0.143
     pixel_size_angstrom: float | None = None
     save_fsc_curves: bool = True   # write the full per-shell FSC curve, not just the resolution
-    # Reference volume for the val PSNR, globbed inside each tomo_* dir and
-    # tried in order: a ground truth if the dataset ships one, else icecream.
+    # Reference volume for PSNR (training and inference, patch and full),
+    # globbed inside each tomo_* dir and tried in order: a ground truth if the
+    # dataset ships one, else icecream.
     # The file actually picked is printed at startup and named in the
     # psnr_ref column, since PSNR against different references is not
     # comparable. null (or an empty list) = no PSNR at all. EMPIAR-11058

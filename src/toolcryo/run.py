@@ -88,7 +88,7 @@ class RunEIPatchConfig(RunEIBaseConfig):
     n_crops_per_vol: int = 10
     batch_size: int = 4
     # False = icecream: one volume per optimizer step, using its exact wedge.
-    # True = a batch may mix volumes and shares the intersected wedge.
+    # True = a batch may mix volumes; each crop still uses its own exact wedge.
     mix_volumes: bool = True
     num_workers: int = 1
     prefetch_factor: int = 1
@@ -606,6 +606,7 @@ def run_patch(cfg: RunEIPatchConfig) -> None:
             ref_wedge_support=float(cfg.ref_wedge_support),
             fsc_threshold=float(cfg.fsc_threshold),
             pixel_size_angstrom=cfg.pixel_size_angstrom,
+            psnr_ref_globs=cfg.psnr_ref_globs,
             save_mrc=bool(cfg.save_mrc),
             save_fsc_curves=bool(cfg.save_fsc_curves),
             # Infer in the dtype the model was trained in — and in fp32 when

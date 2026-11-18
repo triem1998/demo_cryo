@@ -66,9 +66,6 @@ class RunEIPatchInferenceConfig(RunEIBaseConfig):
     icecream_glob: str = "vol_*[Ii]cecream*"
     isonet_glob: str = "vol_*[Ii]so[Nn]et*"
     isonet_fallback_glob: str = "vol_*DDW*"
-    # Ground truth, when the dataset ships one (dataset/synthetic). Scored by
-    # PSNR into fsc_rank*.csv, not just drawn — the point of a synthetic tomogram.
-    gt_glob: str = "vol_*_[Gg][Tt].mrc"
 
     # ── Output ───────────────────────────────────────────────────────────────
     save_recon_mrc: bool = False
@@ -223,14 +220,14 @@ def _load_comparison(path: Path | None) -> np.ndarray | None:
         return None
 
 
-def _find_gt(tomo_dir: Path, glob: str, shape) -> tuple[np.ndarray | None, str]:
-    """Ground-truth volume resampled to ``shape``, and the file name it came from.
+def _find_gt(tomo_dir: Path, globs, shape) -> tuple[np.ndarray | None, str]:
+    """PSNR reference (first match of ``globs``) resampled to ``shape``, and its file name.
 
     The resample is not cosmetic: ``psnr`` raises on a shape mismatch, so a
     downsampled or cropped inference run would lose the score entirely rather
     than report it against a stretched reference.
     """
-    path = _find_mrc(tomo_dir, glob)
+    path = _find_mrc(tomo_dir, *(globs or []))
     gt = _load_comparison(path)
     if gt is not None and gt.shape != tuple(shape):
         gt = nn.functional.interpolate(
@@ -262,7 +259,7 @@ def run_post_training_inference(
     ref_wedge_support: float = 1.0,
     fsc_threshold: float = 0.143,
     pixel_size_angstrom: float | None = None,
-    gt_glob: str = "vol_*_[Gg][Tt].mrc",
+    psnr_ref_globs: list[str] | None = None,
     save_mrc: bool = False,
     save_fsc_curves: bool = True,
     amp_dtype: torch.dtype | None = None,
@@ -361,7 +358,7 @@ def run_post_training_inference(
             print(f"  [{tomo_name}] {fsc_str}", flush=True)
 
             # Before the row is written, since its PSNR goes into that row.
-            gt_np, gt_name = _find_gt(ds.evn_paths[i].parent, gt_glob, recon.shape)
+            gt_np, gt_name = _find_gt(ds.evn_paths[i].parent, psnr_ref_globs, recon.shape)
             psnr_gt = psnr(recon, gt_np) if gt_np is not None else ""
             psnr_1p = psnr(recon_1, gt_np) if gt_np is not None else ""
             del recon_1
@@ -544,7 +541,7 @@ def run_inference(cfg: RunEIPatchInferenceConfig) -> None:
             ref_wedge_support=float(cfg.ref_wedge_support),
             fsc_threshold=float(cfg.fsc_threshold),
             pixel_size_angstrom=cfg.pixel_size_angstrom,
-            gt_glob=cfg.gt_glob,
+            psnr_ref_globs=cfg.psnr_ref_globs,
             save_mrc=bool(cfg.save_recon_mrc),
             save_fsc_curves=bool(cfg.save_fsc_curves),
             amp_dtype=amp_dtype_from_str(cfg.mixed_precision),
